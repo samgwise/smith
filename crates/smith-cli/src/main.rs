@@ -24,11 +24,25 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
     println!("session: {}", logger.path.display());
     let session_label = logger.meta.id.chars().take(8).collect::<String>();
 
+    // MCP servers: connected for the whole TUI session, tools added to the
+    // registry once (cache-stable), shut down when the session ends.
+    let mut mcp_session = {
+        let mut mcp_config = config.mcp.clone();
+        match smith_mcp::McpConfig::load_workspace(&workspace_canon) {
+            Ok(ws) => mcp_config = mcp_config.merged(ws),
+            Err(e) => tracing::warn!("could not load workspace MCP config: {e:#}"),
+        }
+        smith_mcp::McpSession::connect(&mcp_config).await
+    };
+    let mcp_status = mcp_session.status_lines();
+    let mut tools = smith_core::builtin_tools();
+    tools.extend(mcp_session.take_tools());
+
     let provider = run::build_provider(config)?;
     let mut agent = Agent::new(
         provider,
         std::sync::Arc::new(executor),
-        smith_core::builtin_tools(),
+        tools,
         std::sync::Arc::new(smith_tui::TuiGate::new(gate_tx)),
         Some(std::sync::Arc::new(logger)),
     );
@@ -67,9 +81,11 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
         provider_name,
         model_name,
         build_provider,
+        mcp_status,
     };
 
     let result = smith_tui::App::new(params).run().await;
+    mcp_session.shutdown().await;
 
     println!("\nsession container {container} is still running; remove it with `smith clean`");
     result

@@ -86,12 +86,16 @@ pub async fn run_headless(
     println!("session: {}", session_path.display());
 
     let workspace_canon = executor.session().workspace_host.clone();
+    let mut mcp_session = connect_mcp(config, &workspace_canon).await;
+    let mut tools = smith_core::builtin_tools();
+    tools.extend(mcp_session.take_tools());
+
     let provider = build_provider(config)?;
     let executor: Arc<dyn ToolExecutor> = Arc::new(executor);
     let mut agent = Agent::new(
         provider,
         Arc::clone(&executor),
-        smith_core::builtin_tools(),
+        tools,
         Arc::new(AutoAllowGate),
         Some(Arc::new(logger)),
     );
@@ -114,6 +118,7 @@ pub async fn run_headless(
         verify_gate(&agent, &mut history, &executor, &config.verify, &cancel).await?;
     }
     sig_task.abort();
+    mcp_session.shutdown().await;
 
     if keep_container {
         println!("keeping container {container} (remove later with `smith clean`)");
@@ -180,12 +185,16 @@ pub async fn resume_headless(
     println!("resumed session {} ({})", meta.id, path.display());
 
     let workspace_canon = executor.session().workspace_host.clone();
+    let mut mcp_session = connect_mcp(config, &workspace_canon).await;
+    let mut tools = smith_core::builtin_tools();
+    tools.extend(mcp_session.take_tools());
+
     let provider = build_provider(config)?;
     let executor: Arc<dyn ToolExecutor> = Arc::new(executor);
     let mut agent = Agent::new(
         provider,
         Arc::clone(&executor),
-        smith_core::builtin_tools(),
+        tools,
         Arc::new(AutoAllowGate),
         Some(Arc::new(logger)),
     );
@@ -228,11 +237,22 @@ pub async fn resume_headless(
         };
         sandbox.stop_session(&session).await?;
     }
+    mcp_session.shutdown().await;
 
     Ok(RunOutcome {
         session_path: path,
         container,
     })
+}
+
+/// Load layered MCP config (user + workspace) and connect; never fatal.
+async fn connect_mcp(config: &Config, workspace_canon: &Path) -> smith_mcp::McpSession {
+    let mut mcp_config = config.mcp.clone();
+    match smith_mcp::McpConfig::load_workspace(workspace_canon) {
+        Ok(workspace_config) => mcp_config = mcp_config.merged(workspace_config),
+        Err(e) => tracing::warn!("could not load workspace MCP config: {e:#}"),
+    }
+    smith_mcp::McpSession::connect(&mcp_config).await
 }
 
 /// Run one turn with the live event printer attached.

@@ -48,6 +48,8 @@ pub struct AppParams {
     pub provider_name: String,
     pub model_name: String,
     pub build_provider: ProviderFactory,
+    /// Snapshot of MCP server status taken at session start.
+    pub mcp_status: Vec<String>,
 }
 
 pub struct App {
@@ -77,6 +79,7 @@ pub struct App {
     provider_name: String,
     model_name: String,
     build_provider: ProviderFactory,
+    mcp_status: Vec<String>,
     /// Last Ctrl+C while busy (quit-with-second-press flow).
     last_ctrl_c: Option<Instant>,
     status_note: String,
@@ -108,6 +111,7 @@ impl App {
             provider_name: params.provider_name,
             model_name: params.model_name,
             build_provider: params.build_provider,
+            mcp_status: params.mcp_status,
             last_ctrl_c: None,
             status_note: String::new(),
             should_quit: false,
@@ -338,6 +342,7 @@ impl App {
                     "/provider <name>   switch provider (ollama|openai)",
                     "/diff              show git diff of the workspace",
                     "/sessions          list saved sessions",
+                    "/mcp               list MCP servers and status",
                     "/resume <id>       continue a saved session",
                     "/help              this list",
                     "/quit              exit smith",
@@ -409,6 +414,17 @@ impl App {
                 }
                 Err(e) => self.push_line(format!("[error] {e:#}")),
             },
+            Ok(Some(Slash::Mcp)) => {
+                let status = self.mcp_status.clone();
+                if status.is_empty() {
+                    self.push_line("[no MCP servers configured]".into());
+                } else {
+                    for line in status {
+                        self.push_line(line);
+                    }
+                }
+                self.transcript.push(Line::from(""));
+            }
             Ok(Some(Slash::Resume(prefix))) => {
                 if self.busy {
                     self.push_line("[error] cannot resume while a turn is running".into());
@@ -617,6 +633,7 @@ pub enum Slash {
     Diff,
     Sessions,
     Resume(String),
+    Mcp,
     Help,
     Quit,
 }
@@ -638,6 +655,7 @@ pub fn parse_slash(rest: &str) -> Result<Option<Slash>, String> {
         },
         "diff" => Ok(Some(Slash::Diff)),
         "sessions" => Ok(Some(Slash::Sessions)),
+        "mcp" => Ok(Some(Slash::Mcp)),
         "resume" => tail
             .map(|t| Ok(Some(Slash::Resume(t))))
             .unwrap_or(Err("/resume requires a session id (see /sessions)".into())),

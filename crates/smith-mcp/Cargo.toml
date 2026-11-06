@@ -1,0 +1,27 @@
+[package]
+name = "smith-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP client: stdio servers exposed as smith tools"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+rmcp = { version = "3.9", features = [
+    "client",
+    "transport-child-process",
+    "transport-io",
+    "server",
+    "macros",
+] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+smith-core.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "mcp-echo"
+path = "src/bin/mcp_echo.rs"

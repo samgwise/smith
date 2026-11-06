@@ -38,6 +38,31 @@ loaded once per session into the system prompt. The file is read at session
 start only, keeping the prompt prefix byte-stable so provider prompt caches
 keep hitting.
 
+## MCP servers
+
+smith connects to stdio MCP servers and exposes their tools to the agent as
+`mcp_<server>_<tool>`. Global servers live in `~/.smith/config.toml`:
+
+```toml
+[mcp.servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }   # expanded from your environment
+approval = "ask"                             # or "allow" to pre-approve all
+                                             # tools from this server
+timeout_secs = 60
+```
+
+Project-scoped servers go in `.smith/mcp.toml` at the workspace root (same
+shape, `[servers.<name>]`, wins over user config on name collisions).
+
+Security notes: servers run **host-side** with only the explicitly configured
+environment (plus PATH) — never your full environment — so the sandbox is not
+a boundary for them; that is why `approval = "ask"` is the default and routes
+every call through the same modal as shell commands. Servers are connected at
+session start and their tool list is fixed for the session (prompt-cache
+friendly); a server that fails to start is reported by `/mcp` and skipped.
+
 ## Verify gate (headless)
 
 Give headless runs a finish line in `~/.smith/config.toml`:

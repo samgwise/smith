@@ -17,6 +17,7 @@ dunce.workspace = true
 futures.workspace = true
 serde.workspace = true
 smith-core.workspace = true
+smith-mcp.workspace = true
 smith-providers.workspace = true
 smith-sandbox.workspace = true
 smith-tui.workspace = true

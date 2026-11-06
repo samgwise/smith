@@ -23,6 +23,7 @@ pub struct Config {
     pub openai: OpenAiConfig,
     pub sandbox: SandboxSection,
     pub verify: VerifyConfig,
+    pub mcp: smith_mcp::McpConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -79,6 +80,7 @@ impl Default for Config {
             openai: OpenAiConfig::default(),
             sandbox: SandboxSection::default(),
             verify: VerifyConfig::default(),
+            mcp: Default::default(),
         }
     }
 }
@@ -201,7 +203,15 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              # headless gate: command run after each task; failures are fed\
                back to the agent for fixing (max_rounds times)\n\
              command = \"\"           # e.g. \"cargo test -q\"\n\
-             max_rounds = 2\n"
+             max_rounds = 2\n\
+             \n\
+             # MCP servers (stdio); workspace-level servers go in .smith/mcp.toml\n\
+             # [mcp.servers.github]\n\
+             # command = \"npx\"\n\
+             # args = [\"-y\", \"@modelcontextprotocol/server-github\"]\n\
+             # env = {{ GITHUB_TOKEN = \"${{GITHUB_TOKEN}}\" }}\n\
+             # approval = \"ask\"    # or \"allow\"\n\
+             # timeout_secs = 60\n"
         ),
     )?;
     Ok(())
