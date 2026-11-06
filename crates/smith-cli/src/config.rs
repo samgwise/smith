@@ -72,6 +72,9 @@ pub struct SandboxSection {
     /// Destinations the agent container may reach in `proxy` mode;
     /// empty = built-in defaults (crates.io, npm, pypi, ubuntu/debian, github).
     pub egress_allowlist: Vec<String>,
+    /// Enforce the allowlist with nftables inside the podman machine
+    /// (fail closed on installation failure). Proxy mode only.
+    pub egress_enforce: bool,
 }
 
 impl Default for Config {
@@ -116,6 +119,7 @@ impl Default for SandboxSection {
             exec_timeout_secs: d.exec_timeout.as_secs(),
             translate_paths: d.translate_paths,
             egress_allowlist: vec![],
+            egress_enforce: d.egress_enforce,
         }
     }
 }
@@ -157,6 +161,7 @@ impl Config {
             exec_timeout: std::time::Duration::from_secs(s.exec_timeout_secs.max(1)),
             translate_paths: s.translate_paths,
             egress_allowlist: s.egress_allowlist.clone(),
+            egress_enforce: s.egress_enforce,
         })
     }
 }
@@ -204,6 +209,7 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              [sandbox]
              network = \"proxy\"     # none | proxy | open; proxy filters by allowlist\n\
              # egress_allowlist = [\"crates.io\", \"registry.npmjs.org\"]  # replaces defaults\n\
+             egress_enforce = true  # nftables default-deny in the machine; fail closed\n
              image = \"docker.io/library/ubuntu:24.04\"\n\
              memory = \"4g\"\n\
              cpus = \"2\"\n\

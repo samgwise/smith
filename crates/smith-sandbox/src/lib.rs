@@ -12,6 +12,8 @@ use anyhow::{Context, bail};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+pub mod enforce;
+
 /// How the container is allowed to talk to the network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkMode {
@@ -60,6 +62,9 @@ pub struct SandboxConfig {
     pub translate_paths: bool,
     /// Destination allowlist for proxy mode; empty = built-in defaults.
     pub egress_allowlist: Vec<String>,
+    /// Enforce the allowlist with nftables inside the podman machine
+    /// (fail closed when installation fails). Proxy mode only.
+    pub egress_enforce: bool,
 }
 
 impl Default for SandboxConfig {
@@ -73,6 +78,7 @@ impl Default for SandboxConfig {
             exec_timeout: Duration::from_secs(120),
             translate_paths: false,
             egress_allowlist: vec![],
+            egress_enforce: true,
         }
     }
 }
@@ -134,21 +140,17 @@ impl Sandbox {
         }
 
         // On Windows, the podman machine (WSL VM) may exist but not be running.
-        let list = self
-            .run_podman(&["machine", "list", "--format", "{{.Name}} {{.State}}"])
-            .await?;
-        let listing = String::from_utf8_lossy(&list.stdout);
-        tracing::info!("podman machine list: {}", listing.trim());
-
-        if listing.contains("Running") {
+        // podman 5.x list reporters have no State field; LastUp reads
+        // "Currently running" when the machine is up.
+        let machines = self.machine_listing().await?;
+        if machines.iter().any(|(_, running)| *running) {
             // Machine is running; the earlier info failure was something else.
             anyhow::bail!(
-                "podman machine is running but `podman info` failed: {}",
-                String::from_utf8_lossy(&list.stderr)
+                "podman machine is running but `podman info` failed; check your podman setup"
             );
         }
 
-        if listing.trim().is_empty() {
+        if machines.is_empty() {
             bail!("no podman machine exists; run `podman machine init` first");
         }
 
@@ -227,6 +229,11 @@ impl Sandbox {
         if self.config.network == NetworkMode::Proxy {
             self.ensure_egress_network().await?;
             self.ensure_sidecar().await?;
+            if self.config.egress_enforce {
+                self.enforce_install().await?;
+            } else {
+                tracing::warn!("egress enforcement is disabled; the allowlist is cooperative only");
+            }
             let proxy_url = format!("http://{EGRESS_SIDECAR}:{PROXY_PORT}");
             // Both cases: curl honours either, apt honours lowercase.
             for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
@@ -302,22 +309,47 @@ impl Sandbox {
         })
     }
 
-    /// Create the dedicated egress network if it does not exist yet.
+    /// Create the dedicated egress network with the pinned subnet if it does
+    /// not exist yet; recreate it if the subnet drifted from the pinned one.
     async fn ensure_egress_network(&self) -> anyhow::Result<()> {
         let exists = self
             .run_podman(&["network", "exists", EGRESS_NETWORK])
             .await?;
-        if !exists.status.success() {
-            tracing::info!("creating podman network {EGRESS_NETWORK}");
-            let out = self
-                .run_podman(&["network", "create", EGRESS_NETWORK])
+        if exists.status.success() {
+            let current = self
+                .run_podman(&[
+                    "network",
+                    "inspect",
+                    "-f",
+                    "{{(index .Subnets 0).Subnet}}",
+                    EGRESS_NETWORK,
+                ])
                 .await?;
-            if !out.status.success() {
-                anyhow::bail!(
-                    "failed to create network {EGRESS_NETWORK}: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
+            if String::from_utf8_lossy(&current.stdout).trim() == enforce::EGRESS_SUBNET {
+                return Ok(());
             }
+            // Wrong subnet (e.g. created by an older smith): recreate.
+            tracing::info!("egress network subnet mismatch; recreating");
+            self.stop_egress_sidecar().await?;
+            let _ = self
+                .run_podman(&["network", "rm", "-f", EGRESS_NETWORK])
+                .await?;
+        }
+        tracing::info!("creating podman network {EGRESS_NETWORK}");
+        let out = self
+            .run_podman(&[
+                "network",
+                "create",
+                "--subnet",
+                enforce::EGRESS_SUBNET,
+                EGRESS_NETWORK,
+            ])
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "failed to create network {EGRESS_NETWORK}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         Ok(())
     }
@@ -377,6 +409,8 @@ impl Sandbox {
                 EGRESS_SIDECAR,
                 "--network",
                 EGRESS_NETWORK,
+                "--ip",
+                enforce::EGRESS_PROXY_IP,
                 "-e",
                 &format!("EGRESS_ALLOWLIST={allowlist}"),
                 EGRESS_IMAGE,
@@ -484,7 +518,7 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Remove the egress proxy sidecar (kept across sessions otherwise).
+    /// Remove the egress proxy sidecar and the enforcement table.
     pub async fn stop_egress_sidecar(&self) -> anyhow::Result<()> {
         let exists = self
             .run_podman(&["container", "exists", EGRESS_SIDECAR])
@@ -492,10 +526,104 @@ impl Sandbox {
         if exists.status.success() {
             let _ = self.run_podman(&["rm", "-f", EGRESS_SIDECAR]).await?;
         }
+        self.enforce_remove().await;
         Ok(())
     }
 
-    /// Remove every container from every smith session (running or not).
+    /// `(name, running?)` for every podman machine. The list reporter has no
+    /// State field in podman 5.x; LastUp reads "Currently running" when up.
+    async fn machine_listing(&self) -> anyhow::Result<Vec<(String, bool)>> {
+        let list = self
+            .run_podman(&["machine", "list", "--format", "{{.Name}}|{{.LastUp}}"])
+            .await?;
+        let text = String::from_utf8_lossy(&list.stdout).into_owned();
+        Ok(text
+            .lines()
+            .filter_map(|l| l.trim().split_once('|'))
+            .map(|(name, last_up)| (name.to_string(), last_up.contains("Currently running")))
+            .collect())
+    }
+
+    /// Name of the first Running podman machine, if any.
+    async fn running_machine(&self) -> anyhow::Result<String> {
+        self.machine_listing()
+            .await?
+            .into_iter()
+            .find(|(_, running)| *running)
+            .map(|(name, _)| name)
+            .context("no running podman machine")
+    }
+
+    /// Run a shell command inside the podman machine VM (as root).
+    ///
+    /// `podman machine ssh` joins its arguments with spaces and runs the
+    /// result through the remote shell, so pipes inside `command` must be
+    /// protected by quoting the whole thing as one remote argument.
+    async fn machine_ssh(&self, command: &str) -> anyhow::Result<std::process::Output> {
+        let machine = self.running_machine().await?;
+        let remote = format!("sudo sh -c \"{command}\"");
+        Command::new(&self.podman)
+            .args(["machine", "ssh", &machine, "--", &remote])
+            .output()
+            .await
+            .context("failed to run `podman machine ssh`")
+    }
+
+    /// Install the enforcement ruleset into the machine VM. Fails closed:
+    /// a failed install is a hard error for proxy-mode session start.
+    async fn enforce_install(&self) -> anyhow::Result<()> {
+        let bridge = self
+            .run_podman(&[
+                "network",
+                "inspect",
+                "-f",
+                "{{.NetworkInterface}}",
+                EGRESS_NETWORK,
+            ])
+            .await?;
+        let bridge = String::from_utf8_lossy(&bridge.stdout).trim().to_string();
+        if bridge.is_empty() {
+            bail!("could not resolve the bridge interface for {EGRESS_NETWORK}");
+        }
+        let ruleset = enforce::ruleset(&bridge, enforce::EGRESS_PROXY_IP);
+        let payload = enforce::encode_payload(&ruleset);
+        let shell = format!("echo {payload} | base64 -d | nft -f /dev/stdin",);
+        let out = self.machine_ssh(&shell).await?;
+        if !out.status.success() {
+            bail!(
+                "failed to install egress enforcement (nft) in the podman machine: {}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        // Verify the table actually exists — a silent no-op (e.g. empty
+        // ruleset input) must fail closed too.
+        let verify = self
+            .machine_ssh(&format!("nft list table inet {}", enforce::EGRESS_TABLE))
+            .await?;
+        if !verify.status.success() {
+            bail!("egress enforcement table missing after install");
+        }
+        tracing::info!("egress enforcement installed on bridge {bridge}");
+        Ok(())
+    }
+
+    /// Best-effort removal of the enforcement table.
+    async fn enforce_remove(&self) {
+        let out = self.machine_ssh(&enforce::delete_command()).await;
+        match out {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => tracing::debug!(
+                "enforcement table removal: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => tracing::debug!("enforcement table removal unavailable: {e:#}"),
+        }
+    }
+
+    /// Remove every container from every smith session (running or not),
+    /// plus the proxy sidecar and its enforcement table.
     pub async fn clean_all(&self) -> anyhow::Result<usize> {
         let out = self
             .run_podman(&[
@@ -515,6 +643,7 @@ impl Sandbox {
                 count += 1;
             }
         }
+        self.stop_egress_sidecar().await?;
         Ok(count)
     }
 

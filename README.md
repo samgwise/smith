@@ -42,13 +42,17 @@ stop retrying and wait.
   pypi.org, ubuntu/debian repos, github.com + release downloads.
   Override with `egress_allowlist`.
 - `none` — no network at all (`--network=none`).
-- `open` — unrestricted (the old default; `enabled` accepted as an alias).
+- `open` — unrestricted; `enabled` accepted as an alias.
 
-Known limitation: proxy env vars are cooperative. A program that ignores them
-and dials IP literals directly bypasses the filter. Closing that gap is the
-next milestone: an nftables default-deny ruleset inside the podman machine
-scoping container egress to the proxy + DNS only. `smith clean` also removes
-the proxy sidecar.
+In `proxy` mode the allowlist is **enforced**, not just cooperative: an
+nftables default-deny ruleset is installed inside the podman machine
+(forward hook scoped to the egress bridge only — the machine's own networking
+is untouched). Only the proxy's pinned IP and the network gateway (DNS) may
+leave the bridge, so a program that ignores the proxy env and dials IP
+literals is dropped at the packet level. Installation is fail-closed: if the
+ruleset cannot be installed, the session refuses to start (escape hatch:
+`egress_enforce = false`). Machine reboots clear the rules; the next session
+reinstalls them. `smith clean` removes the sidecar and the table.
 
 ## Project instructions
 
