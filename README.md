@@ -25,7 +25,32 @@ code only ever runs in the container, never on your host.
 5. Every tool call is logged to the session JSONL file.
 
 In the TUI, shell commands ask first: `y` once, `a` for the session,
-`n` to refuse. Headless `smith run` auto-approves (sandbox is the boundary).
+`n` to refuse. Risky commands (`git push`, `git reset`, `rm`, `curl`, `wget`,
+`sudo`, `dd`, `chmod 777`) always re-prompt — "a" binds to the exact command,
+never the prefix. Headless `smith run` auto-approves (the sandbox is the
+boundary), and repeated denials escalate: after three, the agent is told to
+stop retrying and wait.
+
+## Project instructions
+
+If the workspace root contains `AGENTS.md` (or `CLAUDE.md`), its contents are
+loaded once per session into the system prompt. The file is read at session
+start only, keeping the prompt prefix byte-stable so provider prompt caches
+keep hitting.
+
+## Verify gate (headless)
+
+Give headless runs a finish line in `~/.smith/config.toml`:
+
+```toml
+[verify]
+command = "cargo test -q"   # run in the sandbox after each task
+max_rounds = 2              # fix-and-retry rounds on failure
+```
+
+After the agent finishes a task, smith runs the command in the container; if
+it fails, the output is fed back for a fixing turn (up to `max_rounds`).
+Interactive TUI sessions are gate-free — you verify by eye.
 
 ## Requirements
 

@@ -36,14 +36,34 @@ impl ExecResult {
     }
 }
 
+/// Paged file content returned by `read_file`.
+#[derive(Clone, Debug)]
+pub struct FileContents {
+    /// The requested page of the file, lines joined with `\n`.
+    pub text: String,
+    /// 1-based line number of the first returned line.
+    pub start_line: u64,
+    /// Total number of lines in the file.
+    pub total_lines: u64,
+    /// Whether lines were cut off after the returned page.
+    pub truncated: bool,
+}
+
 /// Backend that tools run against: a local sandbox, or (later) a remote one.
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     /// Run a shell command in the workspace. Relative to the workspace root.
     async fn exec_shell(&self, command: &str, timeout: Duration) -> anyhow::Result<ExecResult>;
 
-    /// Read a workspace-relative file.
-    async fn read_file(&self, path: &str) -> anyhow::Result<String>;
+    /// Read a page of a workspace-relative file. `offset` is 1-based;
+    /// `None`/`1` starts at the first line. `limit` caps the number of lines
+    /// returned (implementations apply their own default when absent).
+    async fn read_file(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> anyhow::Result<FileContents>;
 
     /// Write (create or overwrite) a workspace-relative file.
     async fn write_file(&self, path: &str, contents: &str) -> anyhow::Result<()>;

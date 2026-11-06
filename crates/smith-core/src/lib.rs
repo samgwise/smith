@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod compaction;
 pub mod executor;
+pub mod instructions;
 pub mod model;
 pub mod provider;
 pub mod session;
@@ -17,7 +18,7 @@ pub use agent::{
     call_detail,
 };
 pub use compaction::{Compactor, ProviderCompactor, SharedProvider};
-pub use executor::{ExecResult, ToolExecutor, clamp_output};
+pub use executor::{ExecResult, FileContents, ToolExecutor, clamp_output};
 pub use model::{FinishReason, Message, ProviderEvent, Role, ToolCall, ToolDef, Usage};
 pub use provider::{LlmProvider, ProviderStream};
 pub use session::{

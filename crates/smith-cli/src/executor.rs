@@ -8,11 +8,14 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use smith_core::{ExecResult, ToolExecutor};
+use smith_core::{ExecResult, FileContents, ToolExecutor};
 use smith_sandbox::{Sandbox, Session};
 
-/// Files larger than this are refused by `read_file` (use shell + grep).
-const MAX_READ_BYTES: u64 = 1024 * 1024;
+/// Files larger than this are refused by `read_file` (pathological sizes;
+/// normal large files are paged instead).
+const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+/// Lines returned per page when `limit` is not given.
+const DEFAULT_PAGE_LINES: u64 = 2000;
 
 pub struct LocalExecutor {
     sandbox: Arc<Sandbox>,
@@ -97,16 +100,43 @@ impl ToolExecutor for LocalExecutor {
         })
     }
 
-    async fn read_file(&self, path: &str) -> anyhow::Result<String> {
+    async fn read_file(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> anyhow::Result<FileContents> {
+        use std::io::BufRead;
         let host = self.resolve(path)?;
         let meta = std::fs::metadata(&host).with_context(|| format!("stat {path}"))?;
         if meta.is_dir() {
             bail!("{path} is a directory; use list_dir");
         }
         if meta.len() > MAX_READ_BYTES {
-            bail!("{path} is larger than 1 MiB; use the shell tool (grep/sed) instead");
+            bail!("{path} is larger than 16 MiB; use the shell tool (grep/sed) instead");
         }
-        std::fs::read_to_string(&host).with_context(|| format!("reading {path}"))
+
+        let file = std::fs::File::open(&host).with_context(|| format!("opening {path}"))?;
+        let start = offset.unwrap_or(1).max(1);
+        let page = limit.unwrap_or(DEFAULT_PAGE_LINES).max(1);
+
+        let mut total_lines = 0u64;
+        let mut page_lines: Vec<String> = vec![];
+        for (idx, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let n = (idx + 1) as u64; // 1-based
+            total_lines = n;
+            if n >= start && n < start + page {
+                page_lines.push(line.with_context(|| format!("reading {path} line {n}"))?);
+            }
+        }
+
+        let truncated = start + page_lines.len() as u64 <= total_lines;
+        Ok(FileContents {
+            text: page_lines.join("\n"),
+            start_line: start,
+            total_lines,
+            truncated,
+        })
     }
 
     async fn write_file(&self, path: &str, contents: &str) -> anyhow::Result<()> {
@@ -141,5 +171,71 @@ impl ToolExecutor for LocalExecutor {
 
     fn workspace_root(&self) -> &str {
         self.session.workspace_container
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executor_for(tmp: &std::path::Path) -> LocalExecutor {
+        let session = Session {
+            name: "test".into(),
+            workspace_host: tmp.to_path_buf(),
+            workspace_container: "/workspace",
+        };
+        LocalExecutor::new(Arc::new(Sandbox::new(Default::default())), session)
+    }
+
+    #[tokio::test]
+    async fn read_file_pages_with_offset_and_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(tmp.path().join("fixture.txt"), body).unwrap();
+        let exec = executor_for(tmp.path());
+        let exec: &dyn ToolExecutor = &exec;
+
+        // Default page: everything (file smaller than the default).
+        let all = exec.read_file("fixture.txt", None, None).await.unwrap();
+        assert_eq!(all.total_lines, 50);
+        assert_eq!(all.start_line, 1);
+        assert!(!all.truncated);
+        assert!(all.text.starts_with("line 1"));
+        assert!(all.text.ends_with("line 50"));
+
+        // Offset into the middle.
+        let page = exec
+            .read_file("fixture.txt", Some(10), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(page.start_line, 10);
+        assert_eq!(page.total_lines, 50);
+        assert!(page.truncated);
+        assert_eq!(page.text, "line 10\nline 11\nline 12");
+
+        // Last page: not truncated.
+        let tail = exec
+            .read_file("fixture.txt", Some(48), Some(10))
+            .await
+            .unwrap();
+        assert!(!tail.truncated);
+        assert_eq!(tail.text, "line 48\nline 49\nline 50");
+
+        // Offset past the end: empty page.
+        let past = exec
+            .read_file("fixture.txt", Some(999), Some(10))
+            .await
+            .unwrap();
+        assert!(past.text.is_empty());
+        assert!(!past.truncated);
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_paths_outside_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = executor_for(tmp.path());
+        let exec: &dyn ToolExecutor = &exec;
+        assert!(exec.read_file("../outside.txt", None, None).await.is_err());
+        assert!(exec.read_file("/etc/hosts", None, None).await.is_err());
     }
 }

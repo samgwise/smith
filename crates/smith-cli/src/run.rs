@@ -6,15 +6,17 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use smith_core::{
     Agent, ApprovalDecision, ApprovalGate, ApprovalRequest, CoreEvent, Message, SessionLogger,
+    ToolExecutor, clamp_output,
 };
 use smith_sandbox::{Sandbox, Session};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use crate::config::{Config, VerifyConfig};
 use crate::executor::LocalExecutor;
 
 struct AutoAllowGate;
@@ -83,27 +85,23 @@ pub async fn run_headless(
     let session_path = logger.path.clone();
     println!("session: {}", session_path.display());
 
+    let workspace_canon = executor.session().workspace_host.clone();
     let provider = build_provider(config)?;
-    let agent = Agent::new(
+    let executor: Arc<dyn ToolExecutor> = Arc::new(executor);
+    let mut agent = Agent::new(
         provider,
-        Arc::new(executor),
+        Arc::clone(&executor),
         smith_core::builtin_tools(),
         Arc::new(AutoAllowGate),
         Some(Arc::new(logger)),
     );
+    agent.project_instructions =
+        smith_core::instructions::load_project_instructions(&workspace_canon);
 
     let mut history = vec![Message::system(agent.system_prompt())];
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
 
-    // Live event printer.
-    let printer = tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            print_event(&ev);
-        }
-    });
-
-    // Ctrl+C cancels the current turn.
+    // Ctrl+C cancels the current turn (and any gate rounds).
     let cancel_for_signal = cancel.clone();
     let sig_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -111,13 +109,11 @@ pub async fn run_headless(
         }
     });
 
-    let turn = agent.run_turn(&mut history, task, tx, cancel);
-    let turn = tokio::select! {
-        _ = sig_task => anyhow::bail!("interrupted"),
-        result = turn => result,
-    };
-    turn?;
-    printer.await.ok();
+    run_turn_with_printer(&agent, &mut history, task, &cancel).await?;
+    if !cancel.is_cancelled() {
+        verify_gate(&agent, &mut history, &executor, &config.verify, &cancel).await?;
+    }
+    sig_task.abort();
 
     if keep_container {
         println!("keeping container {container} (remove later with `smith clean`)");
@@ -183,14 +179,18 @@ pub async fn resume_headless(
     let logger = smith_core::SessionLogger::open_for_append(&path)?;
     println!("resumed session {} ({})", meta.id, path.display());
 
+    let workspace_canon = executor.session().workspace_host.clone();
     let provider = build_provider(config)?;
-    let agent = Agent::new(
+    let executor: Arc<dyn ToolExecutor> = Arc::new(executor);
+    let mut agent = Agent::new(
         provider,
-        Arc::new(executor),
+        Arc::clone(&executor),
         smith_core::builtin_tools(),
         Arc::new(AutoAllowGate),
         Some(Arc::new(logger)),
     );
+    agent.project_instructions =
+        smith_core::instructions::load_project_instructions(&workspace_canon);
     let (_, mut history) = smith_core::load_history(&path)?;
     if !history
         .first()
@@ -200,17 +200,12 @@ pub async fn resume_headless(
     }
 
     let cancel = CancellationToken::new();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let printer = tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            print_event(&ev);
-        }
-    });
-
     match task {
         Some(task) => {
-            agent.run_turn(&mut history, task, tx, cancel).await?;
-            printer.await.ok();
+            run_turn_with_printer(&agent, &mut history, task, &cancel).await?;
+            if !cancel.is_cancelled() {
+                verify_gate(&agent, &mut history, &executor, &config.verify, &cancel).await?;
+            }
         }
         None => {
             let recap = history
@@ -220,8 +215,6 @@ pub async fn resume_headless(
                 .map(|m| m.content.clone())
                 .unwrap_or_else(|| "(no assistant messages yet)".into());
             println!("recap: {}", recap.trim());
-            let _ = tx; // closes the printer on drop
-            printer.await.ok();
         }
     }
 
@@ -240,6 +233,71 @@ pub async fn resume_headless(
         session_path: path,
         container,
     })
+}
+
+/// Run one turn with the live event printer attached.
+async fn run_turn_with_printer(
+    agent: &Agent,
+    history: &mut Vec<Message>,
+    task: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let printer = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            print_event(&ev);
+        }
+    });
+    let result = agent.run_turn(history, task, tx, cancel.clone()).await;
+    printer.await.ok();
+    result
+}
+
+/// Headless verify gate: run the configured command after the agent's turn;
+/// feed failures back as fixing turns, up to `max_rounds` total runs.
+async fn verify_gate(
+    agent: &Agent,
+    history: &mut Vec<Message>,
+    executor: &Arc<dyn ToolExecutor>,
+    verify: &VerifyConfig,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let command = verify.command.trim().to_string();
+    if command.is_empty() {
+        return Ok(());
+    }
+    let rounds = verify.max_rounds.max(1);
+    for round in 0..rounds {
+        println!("[verify] round {}: running `{command}`", round + 1);
+        let res = executor
+            .exec_shell(&command, Duration::from_secs(600))
+            .await?;
+        if res.exit_code == 0 {
+            println!("[verify] passed");
+            return Ok(());
+        }
+        if round + 1 >= rounds {
+            println!("[verify] still failing after {rounds} round(s)");
+            return Ok(());
+        }
+        println!(
+            "[verify] failed (exit {}); asking the agent to fix it",
+            res.exit_code
+        );
+        run_turn_with_printer(
+            agent,
+            history,
+            &format!(
+                "The verification command `{command}` failed with exit code {}:\n{}\n\n\
+                 Fix the issue so the verification command passes.",
+                res.exit_code,
+                clamp_output(res.render(), 6000)
+            ),
+            cancel,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn print_event(ev: &CoreEvent) {

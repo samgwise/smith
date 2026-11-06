@@ -121,8 +121,37 @@ pub struct Agent {
     pub limits: Limits,
     pub logger: Option<Arc<SessionLogger>>,
     pub compactor: Option<Arc<dyn Compactor>>,
-    /// Command prefixes approved for the rest of the session.
+    /// Project instructions (AGENTS.md) injected into the system prompt.
+    pub project_instructions: Option<String>,
+    /// Approvals for the rest of the session: first-word prefixes for normal
+    /// commands, exact normalised commands for risky ones.
     allowed_prefixes: Mutex<Vec<String>>,
+    /// Total denials this session (drives escalation).
+    denials: Mutex<usize>,
+}
+
+/// Commands that must never be covered by a broad allow-always prefix: each
+/// risky call re-prompts, and "always" binds to the exact command.
+const RISKY_PREFIXES: [&str; 8] = [
+    "git push",
+    "git reset",
+    "rm",
+    "curl",
+    "wget",
+    "sudo",
+    "dd",
+    "chmod 777",
+];
+
+fn normalise_command(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_risky(command: &str) -> bool {
+    let norm = normalise_command(command);
+    RISKY_PREFIXES
+        .iter()
+        .any(|p| norm == *p || norm.starts_with(&format!("{p} ")))
 }
 
 impl Agent {
@@ -143,7 +172,9 @@ impl Agent {
             limits: Limits::default(),
             logger,
             compactor: Some(compactor),
+            project_instructions: None,
             allowed_prefixes: Mutex::new(vec![]),
+            denials: Mutex::new(0),
         }
     }
 
@@ -166,9 +197,11 @@ impl Agent {
         self.tools.iter().map(|t| t.def()).collect()
     }
 
-    /// Build the v1 system prompt from the executor's workspace view.
+    /// Build the v1 system prompt from the executor's workspace view plus
+    /// the project instruction file, if any. Called once per session; the
+    /// result must stay byte-stable so provider prompt caches keep hitting.
     pub fn system_prompt(&self) -> String {
-        format!(
+        let mut prompt = format!(
             "You are smith, a pragmatic coding agent working inside a sandboxed \
 container with the user's project mounted at /workspace.\n\
 Workspace root: {root}\n\n\
@@ -179,7 +212,12 @@ Rules:\n\
 - Keep going until the task is done, then summarise what changed.\n\
 - If a command fails, read the error and adapt rather than repeating it.",
             root = self.executor.workspace_root()
-        )
+        );
+        if let Some(instructions) = &self.project_instructions {
+            prompt.push_str("\n\nProject instructions (from the repository):\n");
+            prompt.push_str(instructions);
+        }
+        prompt
     }
 
     /// Run one user turn: append the input, stream, execute tools, repeat until
@@ -327,30 +365,39 @@ Rules:\n\
 
         if tool.needs_approval(&call.arguments) {
             let detail = call_detail(call);
-            // Already-approved prefixes run straight through.
-            if !self.prefix_allowed(&detail) {
+            // Already-approved commands run straight through (exact match for
+            // risky commands, first-word prefix for normal ones).
+            if !self.approval_cached(&detail) {
                 let _ = events.send(CoreEvent::ApprovalRequested {
                     call_id: call.id.clone(),
                     detail: detail.clone(),
                 });
                 let decision = tokio::select! {
                     _ = cancel.cancelled() => return (false, "cancelled by user".into()),
-                    decision = self.gate.decide(ApprovalRequest {
-                        tool: call.name.clone(),
-                        detail,
-                    }) => decision,
+                    decision = self
+                        .gate
+                        .decide(ApprovalRequest {
+                            tool: call.name.clone(),
+                            detail: detail.clone(),
+                        })
+                        => decision,
                 };
                 match decision {
                     ApprovalDecision::Deny => {
-                        return (
-                            false,
-                            "The user denied this command. Explain what you were trying to \
-                             do or try a different approach."
-                                .into(),
-                        );
+                        let count = self.record_denial();
+                        let mut message = "The user denied this command. Explain what you were \
+                             trying to do or try a different approach."
+                            .to_string();
+                        if count >= 3 {
+                            message.push_str(&format!(
+                                " (Note: {count} commands have been denied this session; \
+                                 stop retrying similar commands and wait for the user's input.)"
+                            ));
+                        }
+                        return (false, message);
                     }
                     ApprovalDecision::AllowAlways => {
-                        self.remember_prefix(call);
+                        self.remember_approval(&detail);
                     }
                     ApprovalDecision::AllowOnce => {}
                 }
@@ -371,23 +418,48 @@ Rules:\n\
             .join(", ")
     }
 
-    fn prefix_allowed(&self, command: &str) -> bool {
+    /// Whether this command is already covered by a session approval:
+    /// exact match for risky commands, first-word prefix otherwise.
+    fn approval_cached(&self, command: &str) -> bool {
+        let norm = normalise_command(command);
+        let risky = is_risky(&norm);
         self.allowed_prefixes
             .lock()
             .expect("approval mutex poisoned")
             .iter()
-            .any(|p| command.starts_with(p.as_str()))
+            .any(|p| {
+                if risky {
+                    norm == *p
+                } else {
+                    norm.starts_with(p.as_str())
+                }
+            })
     }
 
-    /// Remember the first word of an always-approved command as its prefix.
-    fn remember_prefix(&self, call: &ToolCall) {
-        let detail = call_detail(call);
-        if let Some(first) = detail.split_whitespace().next() {
+    /// Remember an always-approved command: the exact command when risky,
+    /// the first word otherwise.
+    fn remember_approval(&self, command: &str) {
+        let norm = normalise_command(command);
+        let entry = if is_risky(&norm) {
+            norm
+        } else {
+            norm.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        if !entry.is_empty() {
             self.allowed_prefixes
                 .lock()
                 .expect("approval mutex poisoned")
-                .push(first.to_string());
+                .push(entry);
         }
+    }
+
+    fn record_denial(&self) -> usize {
+        let mut denials = self.denials.lock().expect("denial mutex poisoned");
+        *denials += 1;
+        *denials
     }
 
     /// Reclaim context when over budget: summarise older turns (provider
@@ -526,8 +598,18 @@ mod tests {
             })
         }
 
-        async fn read_file(&self, path: &str) -> anyhow::Result<String> {
-            Ok(format!("contents of {path}"))
+        async fn read_file(
+            &self,
+            path: &str,
+            _offset: Option<u64>,
+            _limit: Option<u64>,
+        ) -> anyhow::Result<crate::executor::FileContents> {
+            Ok(crate::executor::FileContents {
+                text: format!("contents of {path}"),
+                start_line: 1,
+                total_lines: 1,
+                truncated: false,
+            })
         }
 
         async fn write_file(&self, _path: &str, _contents: &str) -> anyhow::Result<()> {
@@ -788,6 +870,157 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CoreEvent::Compacted { .. }))
         );
+    }
+
+    struct CountingGate {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl ApprovalGate for CountingGate {
+        async fn decide(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            *self.calls.lock().unwrap() += 1;
+            ApprovalDecision::AllowAlways
+        }
+    }
+
+    /// Agent whose scripted provider requests the given shell calls, one per
+    /// step, then finishes. Pairs with a CountingGate sharing `counter`.
+    fn allow_always_agent(script_calls: Vec<Vec<ToolCall>>, counter: Arc<Mutex<usize>>) -> Agent {
+        let mut script: Vec<MockResponse> = script_calls
+            .into_iter()
+            .map(|calls| MockResponse {
+                text: String::new(),
+                calls,
+            })
+            .collect();
+        script.push(MockResponse {
+            text: "all done".into(),
+            calls: vec![],
+        });
+        Agent::new(
+            Arc::new(ScriptedProvider {
+                script,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Arc::new(RecordingExecutor::new()),
+            crate::tools::builtin_tools(),
+            Arc::new(CountingGate { calls: counter }),
+            None,
+        )
+    }
+
+    #[test]
+    fn risky_command_matching() {
+        assert!(is_risky("git push origin main"));
+        assert!(is_risky("rm -rf /tmp/x"));
+        assert!(is_risky("rm"));
+        assert!(!is_risky("rmdir /tmp/x"));
+        assert!(!is_risky("cargo test"));
+        assert!(!is_risky("git pushb"));
+    }
+
+    #[tokio::test]
+    async fn identical_risky_command_is_cached_exactly() {
+        let counter = Arc::new(Mutex::new(0));
+        let agent = allow_always_agent(
+            vec![
+                vec![tool_call("c1", "git push origin main")],
+                vec![tool_call("c2", "git push origin main")],
+            ],
+            Arc::clone(&counter),
+        );
+        let mut history = vec![Message::system("s")];
+        run(&agent, &mut history, "ship it").await;
+        // Allow-always on a risky command binds to the exact command: the
+        // identical repeat is covered (one prompt total).
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_risky_command_reprompts() {
+        let counter = Arc::new(Mutex::new(0));
+        let agent = allow_always_agent(
+            vec![
+                vec![tool_call("c1", "git push origin main")],
+                vec![tool_call("c2", "git push other")],
+            ],
+            Arc::clone(&counter),
+        );
+        let mut history = vec![Message::system("s")];
+        run(&agent, &mut history, "ship it").await;
+        assert_eq!(*counter.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn non_risky_allow_always_covers_the_prefix() {
+        let counter = Arc::new(Mutex::new(0));
+        let agent = allow_always_agent(
+            vec![
+                vec![tool_call("c1", "cargo test")],
+                vec![tool_call("c2", "cargo build")],
+            ],
+            Arc::clone(&counter),
+        );
+        let mut history = vec![Message::system("s")];
+        run(&agent, &mut history, "build and test").await;
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn denial_escalates_after_three_denials() {
+        struct DenyGate;
+        #[async_trait]
+        impl ApprovalGate for DenyGate {
+            async fn decide(&self, _r: ApprovalRequest) -> ApprovalDecision {
+                ApprovalDecision::Deny
+            }
+        }
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider {
+            script: vec![
+                MockResponse {
+                    text: String::new(),
+                    calls: vec![tool_call("c1", "rm a")],
+                },
+                MockResponse {
+                    text: String::new(),
+                    calls: vec![tool_call("c2", "rm b")],
+                },
+                MockResponse {
+                    text: String::new(),
+                    calls: vec![tool_call("c3", "rm c")],
+                },
+                MockResponse {
+                    text: "fine".into(),
+                    calls: vec![],
+                },
+            ],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let agent = Agent::new(
+            provider,
+            Arc::new(RecordingExecutor::new()),
+            crate::tools::builtin_tools(),
+            Arc::new(DenyGate),
+            None,
+        );
+        let mut history = vec![Message::system("s")];
+        run(&agent, &mut history, "nope").await;
+
+        let last_tool = history.iter().rev().find(|m| m.role == Role::Tool).unwrap();
+        assert!(last_tool.content.contains("wait for the user's input"));
+    }
+
+    #[test]
+    fn system_prompt_and_tool_defs_are_byte_stable() {
+        let mut agent = single_reply_agent();
+        agent.project_instructions = Some("be terse".into());
+        assert_eq!(agent.system_prompt(), agent.system_prompt());
+        let a = serde_json::to_string(&agent.tool_defs()).unwrap();
+        let b = serde_json::to_string(&agent.tool_defs()).unwrap();
+        assert_eq!(a, b);
+        // Instructions are reflected in the prompt.
+        assert!(agent.system_prompt().contains("be terse"));
     }
 
     #[test]

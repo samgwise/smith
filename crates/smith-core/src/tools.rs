@@ -7,7 +7,7 @@ use anyhow::bail;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::executor::{ToolExecutor, clamp_output};
+use crate::executor::{FileContents, ToolExecutor, clamp_output};
 use crate::model::ToolDef;
 
 /// Maximum characters of tool output fed back to the model.
@@ -79,13 +79,16 @@ impl Tool for ReadFileTool {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "read_file".into(),
-            description: "Read a text file from the workspace. Paths are relative to the \
-                workspace root."
+            description: "Read a page of a text file from the workspace. Paths are relative \
+                to the workspace root. Large files can be paged with `offset`/`limit`; the \
+                result reports the file's total line count and whether more lines follow."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Relative file path" }
+                    "path": { "type": "string", "description": "Relative file path" },
+                    "offset": { "type": "integer", "description": "1-based line to start from (default 1)" },
+                    "limit": { "type": "integer", "description": "Lines to return (default 2000)" }
                 },
                 "required": ["path"]
             }),
@@ -97,9 +100,31 @@ impl Tool for ReadFileTool {
     }
 
     async fn run(&self, executor: &dyn ToolExecutor, arguments: &str) -> anyhow::Result<String> {
+        let parsed: serde_json::Value = serde_json::from_str(arguments)
+            .map_err(|e| anyhow::anyhow!("invalid tool arguments ({e}); expected JSON object"))?;
         let path = arg_str(arguments, "path")?;
-        let content = executor.read_file(&path).await?;
-        Ok(clamp_output(content, MAX_TOOL_OUTPUT))
+        let offset = parsed.get("offset").and_then(|v| v.as_u64());
+        let limit = parsed.get("limit").and_then(|v| v.as_u64());
+
+        let contents = executor.read_file(&path, offset, limit).await?;
+        let FileContents {
+            text,
+            start_line,
+            total_lines,
+            truncated,
+        } = contents;
+
+        let mut out = String::new();
+        if start_line > 1 || truncated {
+            let end = start_line + text.lines().count().max(1) as u64 - 1;
+            out.push_str(&format!("[lines {start_line}-{end} of {total_lines}]"));
+            if truncated {
+                out.push_str(" — more lines follow; continue with a larger `offset`");
+            }
+            out.push('\n');
+        }
+        out.push_str(&text);
+        Ok(clamp_output(out, MAX_TOOL_OUTPUT))
     }
 }
 

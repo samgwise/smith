@@ -25,13 +25,15 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
     let session_label = logger.meta.id.chars().take(8).collect::<String>();
 
     let provider = run::build_provider(config)?;
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         provider,
         std::sync::Arc::new(executor),
         smith_core::builtin_tools(),
         std::sync::Arc::new(smith_tui::TuiGate::new(gate_tx)),
         Some(std::sync::Arc::new(logger)),
     );
+    agent.project_instructions =
+        smith_core::instructions::load_project_instructions(&workspace_canon);
     let system_prompt = agent.system_prompt();
 
     let provider_name = config.provider.clone();
@@ -98,6 +100,9 @@ enum Command {
         /// Override the configured model.
         #[arg(long)]
         model: Option<String>,
+        /// Headless verify command (overrides config; empty disables).
+        #[arg(long)]
+        verify: Option<String>,
     },
     /// Continue a previous session.
     Resume {
@@ -121,6 +126,9 @@ enum Command {
         /// Override the configured model.
         #[arg(long)]
         model: Option<String>,
+        /// Headless verify command (overrides config; empty disables).
+        #[arg(long)]
+        verify: Option<String>,
     },
     /// List recent sessions.
     Sessions,
@@ -169,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
             keep,
             provider,
             model,
+            verify,
         }) => {
             let mut config = config;
             if let Some(provider) = provider {
@@ -176,6 +185,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(model) = model {
                 config.model = model;
+            }
+            if let Some(verify) = verify {
+                config.verify.command = verify;
             }
             let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
             let outcome = run::run_headless(&config, &workspace, &task, keep).await?;
@@ -193,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
             workspace,
             provider,
             model,
+            verify,
         }) => {
             let mut config = config;
             if let Some(provider) = provider {
@@ -200,6 +213,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(model) = model {
                 config.model = model;
+            }
+            if let Some(verify) = verify {
+                config.verify.command = verify;
             }
             let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
             let outcome = run::resume_headless(

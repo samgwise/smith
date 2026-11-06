@@ -1508,6 +1508,7 @@ dependencies = [
  "smith-providers",
  "smith-sandbox",
  "smith-tui",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",

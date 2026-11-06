@@ -22,12 +22,33 @@ pub struct Config {
     pub ollama: OllamaConfig,
     pub openai: OpenAiConfig,
     pub sandbox: SandboxSection,
+    pub verify: VerifyConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct OllamaConfig {
     pub base_url: String,
+}
+
+/// Headless verification gate: run a command after the agent's turn and feed
+/// failures back for fixing.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    /// Command run in the sandbox after headless turns (empty = disabled).
+    pub command: String,
+    /// Maximum fix-and-retry rounds when the command fails.
+    pub max_rounds: usize,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            max_rounds: 2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -57,6 +78,7 @@ impl Default for Config {
             ollama: OllamaConfig::default(),
             openai: OpenAiConfig::default(),
             sandbox: SandboxSection::default(),
+            verify: VerifyConfig::default(),
         }
     }
 }
@@ -173,7 +195,13 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              cpus = \"2\"\n\
              pids_limit = 256\n\
              exec_timeout_secs = 120\n\
-             translate_paths = false\n"
+             translate_paths = false\n\
+             \n\
+             [verify]\n\
+             # headless gate: command run after each task; failures are fed\
+               back to the agent for fixing (max_rounds times)\n\
+             command = \"\"           # e.g. \"cargo test -q\"\n\
+             max_rounds = 2\n"
         ),
     )?;
     Ok(())
