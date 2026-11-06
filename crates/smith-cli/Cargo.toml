@@ -16,6 +16,7 @@ clap.workspace = true
 dunce.workspace = true
 futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 smith-core.workspace = true
 smith-mcp.workspace = true
 smith-providers.workspace = true

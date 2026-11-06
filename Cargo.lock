@@ -1771,6 +1771,7 @@ dependencies = [
  "dunce",
  "futures",
  "serde",
+ "serde_json",
  "smith-core",
  "smith-mcp",
  "smith-providers",

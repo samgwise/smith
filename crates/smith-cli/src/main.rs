@@ -1,4 +1,5 @@
 mod config;
+mod doctor;
 mod executor;
 mod run;
 
@@ -147,6 +148,26 @@ enum Command {
         #[arg(long)]
         verify: Option<String>,
     },
+    /// Diagnose the environment (read-only; --fix repairs, --deep runs round trips).
+    Doctor {
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Include deep checks (real round trips).
+        #[arg(long)]
+        deep: bool,
+        /// Remediate what can be fixed (start machine, pull/build images).
+        #[arg(long)]
+        fix: bool,
+    },
+    /// Run the full conformance suite (deep checks as a command).
+    Conformance {
+        #[arg(long)]
+        json: bool,
+        /// Network mode override for the run: none | proxy | open.
+        #[arg(long)]
+        network: Option<String>,
+    },
     /// List recent sessions.
     Sessions,
     /// Sandbox utilities.
@@ -251,6 +272,24 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             println!("session log: {}", outcome.session_path.display());
+        }
+        Some(Command::Doctor { json, deep, fix }) => {
+            let workspace = std::env::current_dir().context("cannot resolve working directory")?;
+            let code = doctor::run_and_print(&config, workspace, deep, fix, json).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Command::Conformance { json, network }) => {
+            let mut config = config;
+            if let Some(network) = network {
+                config.sandbox.network = network;
+            }
+            let workspace = std::env::current_dir().context("cannot resolve working directory")?;
+            let code = doctor::run_and_print(&config, workspace, true, true, json).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Command::Sessions) => {
             for (path, meta) in smith_core::list_sessions()? {

@@ -34,6 +34,32 @@ impl OllamaProvider {
             model: model.into(),
         }
     }
+
+    /// Model names available on the server (for `smith doctor`).
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .client
+            .get(format!("{}/api/tags", self.base_url))
+            .send()
+            .await
+            .context("could not reach Ollama; is `ollama serve` running?")?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("Ollama returned {status}");
+        }
+        let body: Value = resp.json().await.context("malformed /api/tags response")?;
+        Ok(body
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|m| m.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 #[async_trait]

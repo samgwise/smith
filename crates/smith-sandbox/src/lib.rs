@@ -118,7 +118,8 @@ impl Sandbox {
         }
     }
 
-    async fn run_podman(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    /// Run the podman CLI and capture output (exposed for diagnostics).
+    pub async fn run_podman(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
         Command::new(&self.podman)
             .args(args)
             .output()
@@ -356,7 +357,8 @@ impl Sandbox {
 
     /// Build the egress proxy image once, then keep the sidecar running.
     /// The sidecar survives across sessions; `smith clean` removes it.
-    async fn ensure_sidecar(&self) -> anyhow::Result<()> {
+    /// Exposed for `doctor --fix`.
+    pub async fn ensure_sidecar(&self) -> anyhow::Result<()> {
         let image_exists = self.run_podman(&["image", "exists", EGRESS_IMAGE]).await?;
         if !image_exists.status.success() {
             tracing::info!("building egress proxy image (one-time, a few minutes)");
@@ -518,6 +520,91 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Installed podman client version via the client-only `--version`
+    /// (works without a running machine).
+    pub async fn podman_version(&self) -> anyhow::Result<String> {
+        let out = self.run_podman(&["--version"]).await?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(text.rsplit(' ').next().unwrap_or("unknown").to_string())
+    }
+
+    /// Whether the podman server (machine) answers. `podman info` prints
+    /// client details on stderr and a connection error when it is down.
+    pub async fn podman_reachable(&self) -> bool {
+        self.run_podman(&["info", "--format", "ok"])
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Whether any podman machine is currently running (read-only).
+    pub async fn machine_running(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .machine_listing()
+            .await?
+            .iter()
+            .any(|(_, running)| *running))
+    }
+
+    /// Whether the sandbox base image exists locally (read-only).
+    pub async fn sandbox_image_exists(&self) -> bool {
+        self.run_podman(&["image", "exists", &self.config.image])
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// `(network_exists, subnet_matches_pinned)` for the egress network.
+    pub async fn egress_network_state(&self) -> anyhow::Result<(bool, bool)> {
+        let exists = self
+            .run_podman(&["network", "exists", EGRESS_NETWORK])
+            .await?;
+        if !exists.status.success() {
+            return Ok((false, false));
+        }
+        let subnet = self
+            .run_podman(&[
+                "network",
+                "inspect",
+                "-f",
+                "{{(index .Subnets 0).Subnet}}",
+                EGRESS_NETWORK,
+            ])
+            .await?;
+        Ok((
+            true,
+            String::from_utf8_lossy(&subnet.stdout).trim() == enforce::EGRESS_SUBNET,
+        ))
+    }
+
+    /// Whether the egress sidecar container exists and is running.
+    pub async fn egress_sidecar_running(&self) -> bool {
+        let exists = self
+            .run_podman(&["container", "exists", EGRESS_SIDECAR])
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !exists {
+            return false;
+        }
+        self.run_podman(&["inspect", "-f", "{{.State.Running}}", EGRESS_SIDECAR])
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false)
+    }
+
+    /// Whether the enforcement table is installed in the machine (machine
+    /// must be running; errors count as not installed).
+    pub async fn egress_table_installed(&self) -> bool {
+        self.machine_ssh(&format!(
+            "nft list table inet {} >/dev/null 2>&1",
+            enforce::EGRESS_TABLE
+        ))
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    }
+
     /// Remove the egress proxy sidecar and the enforcement table.
     pub async fn stop_egress_sidecar(&self) -> anyhow::Result<()> {
         let exists = self
@@ -645,6 +732,15 @@ impl Sandbox {
         }
         self.stop_egress_sidecar().await?;
         Ok(count)
+    }
+
+    /// Validate a workspace path (canonicalises, refuses home/sensitive).
+    /// Read-only; used by doctor and session start.
+    pub async fn check_workspace(&self, workspace: &Path) -> anyhow::Result<PathBuf> {
+        let canon = dunce::canonicalize(workspace)
+            .with_context(|| format!("canonicalising workspace {}", workspace.display()))?;
+        self.refuse_sensitive_workspace(&canon)?;
+        Ok(canon)
     }
 
     /// Refuse workspaces that are the home directory or well-known sensitive paths.

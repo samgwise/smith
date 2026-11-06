@@ -107,6 +107,20 @@ After the agent finishes a task, smith runs the command in the container; if
 it fails, the output is fed back for a fixing turn (up to `max_rounds`).
 Interactive TUI sessions are gate-free — you verify by eye.
 
+## Diagnostics
+
+```sh
+smith doctor              # fast environment checks (read-only)
+smith doctor --deep       # adds live round trips (container, file tools, MCP)
+smith doctor --fix        # remediate: start machine, pull/build images
+smith doctor --json       # machine-readable output
+smith conformance         # the deep suite as a command; exit code reflects failures
+smith conformance --network proxy   # exercise the egress stack explicitly
+```
+
+Exit code is 0 unless a check fails (warnings do not fail). Deep checks use a
+throwaway temp workspace — your project directory is never touched.
+
 ## Requirements
 
 - Rust (stable) — `cargo build --release`
