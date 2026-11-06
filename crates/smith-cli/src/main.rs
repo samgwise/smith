@@ -48,7 +48,8 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
     );
     agent.project_instructions =
         smith_core::instructions::load_project_instructions(&workspace_canon);
-    let system_prompt = agent.system_prompt();
+    agent.environment_notes = Some(environment_notes(config));
+    let system_prompt = agent.system_prompt().await;
 
     let provider_name = config.provider.clone();
     let model_name = config.model.clone();
@@ -309,6 +310,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One-line environment summary injected into the system prompt.
+fn environment_notes(config: &Config) -> String {
+    let egress = match config
+        .sandbox_config()
+        .map(|s| (s.network, s.egress_enforce))
+    {
+        Ok((smith_sandbox::NetworkMode::Proxy, true)) => {
+            "egress: allowlist proxy, packet-enforced".to_string()
+        }
+        Ok((smith_sandbox::NetworkMode::Proxy, false)) => {
+            "egress: allowlist proxy (cooperative only)".to_string()
+        }
+        Ok((smith_sandbox::NetworkMode::Disabled, _)) => "network: disabled".to_string(),
+        Ok((smith_sandbox::NetworkMode::Open, _)) => "network: unrestricted".to_string(),
+        Err(e) => return format!("network: unknown ({e:#})"),
+    };
+    format!("Network mode: {egress}")
 }
 
 /// Minimal ms-since-epoch formatter (avoids a chrono dependency).

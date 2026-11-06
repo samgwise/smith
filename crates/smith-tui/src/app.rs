@@ -159,7 +159,7 @@ impl App {
                 }
                 key = input_rx.recv() => {
                     match key {
-                        Some(k) => self.handle_key(k),
+                        Some(k) => self.handle_key(k).await,
                         None => break,
                     }
                 }
@@ -237,7 +237,7 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, ev: InputEvent) {
+    async fn handle_key(&mut self, ev: InputEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let InputEvent::Key(key) = ev;
@@ -275,7 +275,7 @@ impl App {
                     self.should_quit = true;
                 }
             }
-            (KeyCode::Enter, _) => self.submit(),
+            (KeyCode::Enter, _) => self.submit().await,
             (KeyCode::Backspace, _) => {
                 self.input.pop();
             }
@@ -290,14 +290,14 @@ impl App {
         }
     }
 
-    fn submit(&mut self) {
+    async fn submit(&mut self) {
         let input = self.input.trim().to_string();
         if input.is_empty() {
             return;
         }
         if let Some(rest) = input.strip_prefix('/') {
             self.input.clear();
-            self.handle_slash(rest);
+            self.handle_slash(rest).await;
             return;
         }
         if self.busy {
@@ -332,7 +332,7 @@ impl App {
 
     // ---------------------------------------------------- slash commands --
 
-    fn handle_slash(&mut self, rest: &str) {
+    async fn handle_slash(&mut self, rest: &str) {
         match parse_slash(rest) {
             Err(message) => self.push_line(format!("[error] {message}")),
             Ok(None) => {}
@@ -430,7 +430,7 @@ impl App {
                     self.push_line("[error] cannot resume while a turn is running".into());
                     return;
                 }
-                let loaded = self.load_session_for_resume(&prefix);
+                let loaded = self.load_session_for_resume(&prefix).await;
                 match loaded {
                     Ok((id_prefix, count)) => {
                         self.push_line(format!("[resumed session {id_prefix}: {count} messages]"));
@@ -443,7 +443,7 @@ impl App {
     }
 
     /// Load a session's history into the app (used by /resume).
-    fn load_session_for_resume(&mut self, prefix: &str) -> anyhow::Result<(String, usize)> {
+    async fn load_session_for_resume(&mut self, prefix: &str) -> anyhow::Result<(String, usize)> {
         let sessions = list_sessions()?;
         let matches: Vec<_> = sessions
             .iter()
@@ -470,7 +470,7 @@ impl App {
             .first()
             .is_some_and(|m| m.role == smith_core::Role::System)
         {
-            history.insert(0, Message::system(self.agent.system_prompt()));
+            history.insert(0, Message::system(self.agent.system_prompt().await));
         }
         let count = history.len();
         self.history = history;

@@ -101,8 +101,9 @@ pub async fn run_headless(
     );
     agent.project_instructions =
         smith_core::instructions::load_project_instructions(&workspace_canon);
+    agent.environment_notes = Some(environment_notes(config));
 
-    let mut history = vec![Message::system(agent.system_prompt())];
+    let mut history = vec![Message::system(agent.system_prompt().await)];
     let cancel = CancellationToken::new();
 
     // Ctrl+C cancels the current turn (and any gate rounds).
@@ -200,12 +201,13 @@ pub async fn resume_headless(
     );
     agent.project_instructions =
         smith_core::instructions::load_project_instructions(&workspace_canon);
+    agent.environment_notes = Some(environment_notes(config));
     let (_, mut history) = smith_core::load_history(&path)?;
     if !history
         .first()
         .is_some_and(|m| m.role == smith_core::Role::System)
     {
-        history.insert(0, Message::system(agent.system_prompt()));
+        history.insert(0, Message::system(agent.system_prompt().await));
     }
 
     let cancel = CancellationToken::new();
@@ -243,6 +245,26 @@ pub async fn resume_headless(
         session_path: path,
         container,
     })
+}
+
+/// One-line environment summary injected into the system prompt (shared with
+/// the TUI path in main.rs).
+fn environment_notes(config: &Config) -> String {
+    let egress = match config
+        .sandbox_config()
+        .map(|s| (s.network, s.egress_enforce))
+    {
+        Ok((smith_sandbox::NetworkMode::Proxy, true)) => {
+            "egress: allowlist proxy, packet-enforced".to_string()
+        }
+        Ok((smith_sandbox::NetworkMode::Proxy, false)) => {
+            "egress: allowlist proxy (cooperative only)".to_string()
+        }
+        Ok((smith_sandbox::NetworkMode::Disabled, _)) => "network: disabled".to_string(),
+        Ok((smith_sandbox::NetworkMode::Open, _)) => "network: unrestricted".to_string(),
+        Err(e) => return format!("network: unknown ({e:#})"),
+    };
+    format!("Network mode: {egress}")
 }
 
 /// Load layered MCP config (user + workspace) and connect; never fatal.

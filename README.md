@@ -56,12 +56,17 @@ ruleset cannot be installed, the session refuses to start (escape hatch:
 `egress_enforce = false`). Machine reboots clear the rules; the next session
 reinstalls them. `smith clean` removes the sidecar and the table.
 
-## Project instructions
+## Project instructions and system prompt
+
+The system prompt is built once per session and byte-stable afterwards (so
+provider prompt caches keep hitting). It contains: identity and rules, session
+date, the network posture, a **workspace snapshot** (top-level entries,
+detected project type, git state and available toolchains — gathered through
+the executor seam, degrading gracefully), and the project instruction file.
 
 If the workspace root contains `AGENTS.md` (or `CLAUDE.md`), its contents are
-loaded once per session into the system prompt. The file is read at session
-start only, keeping the prompt prefix byte-stable so provider prompt caches
-keep hitting.
+appended under "Project instructions". The file is read at session start
+only.
 
 ## MCP servers
 

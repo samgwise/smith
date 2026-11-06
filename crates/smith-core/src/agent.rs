@@ -1,6 +1,7 @@
 //! The agent loop: stream a response, run approved tools, repeat.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -123,6 +124,9 @@ pub struct Agent {
     pub compactor: Option<Arc<dyn Compactor>>,
     /// Project instructions (AGENTS.md) injected into the system prompt.
     pub project_instructions: Option<String>,
+    /// Front-end-supplied environment notes (e.g. egress mode) injected
+    /// into the system prompt.
+    pub environment_notes: Option<String>,
     /// Approvals for the rest of the session: first-word prefixes for normal
     /// commands, exact normalised commands for risky ones.
     allowed_prefixes: Mutex<Vec<String>>,
@@ -142,6 +146,15 @@ const RISKY_PREFIXES: [&str; 8] = [
     "dd",
     "chmod 777",
 ];
+
+/// Workspace snapshot probes (shared with tests that assert on them).
+const SNAPSHOT_GIT_PROBE: &str = "git rev-parse --abbrev-ref HEAD 2>/dev/null; \
+git rev-parse --short HEAD 2>/dev/null; \
+git status --porcelain 2>/dev/null | wc -l";
+
+const SNAPSHOT_TOOLCHAIN_PROBE: &str = "grep PRETTY_NAME /etc/os-release 2>/dev/null; \
+for t in cargo node python3 go; do command -v $t >/dev/null 2>&1 && \
+printf '%s: ' \"$t\" && $t --version 2>/dev/null | head -1; done";
 
 fn normalise_command(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -173,6 +186,7 @@ impl Agent {
             logger,
             compactor: Some(compactor),
             project_instructions: None,
+            environment_notes: None,
             allowed_prefixes: Mutex::new(vec![]),
             denials: Mutex::new(0),
         }
@@ -197,10 +211,18 @@ impl Agent {
         self.tools.iter().map(|t| t.def()).collect()
     }
 
-    /// Build the v1 system prompt from the executor's workspace view plus
-    /// the project instruction file, if any. Called once per session; the
-    /// result must stay byte-stable so provider prompt caches keep hitting.
-    pub fn system_prompt(&self) -> String {
+    /// Build the system prompt: identity + rules, session context (host
+    /// clock, front-end-supplied environment notes), a workspace snapshot
+    /// gathered through the executor seam, and the project instruction file
+    /// if any. Called once per session; the result must stay byte-stable so
+    /// provider prompt caches keep hitting.
+    pub async fn system_prompt(&self) -> String {
+        self.system_prompt_at(now_ms()).await
+    }
+
+    /// As [`system_prompt`](Self::system_prompt), with the clock supplied —
+    /// used by tests.
+    pub async fn system_prompt_at(&self, now_ms: u64) -> String {
         let mut prompt = format!(
             "You are smith, a pragmatic coding agent working inside a sandboxed \
 container with the user's project mounted at /workspace.\n\
@@ -213,11 +235,93 @@ Rules:\n\
 - If a command fails, read the error and adapt rather than repeating it.",
             root = self.executor.workspace_root()
         );
+        prompt.push_str(&format!(
+            "\n\nSession context:\n- Date: {} (UTC)",
+            utc_date_string(now_ms)
+        ));
+        if let Some(notes) = &self.environment_notes {
+            prompt.push_str("\n- ");
+            prompt.push_str(notes);
+        }
+        prompt.push_str(&self.workspace_snapshot().await);
         if let Some(instructions) = &self.project_instructions {
             prompt.push_str("\n\nProject instructions (from the repository):\n");
             prompt.push_str(instructions);
         }
         prompt
+    }
+
+    /// Gather a workspace snapshot through the executor seam. Every piece
+    /// degrades gracefully: a failed probe yields no line, never an error.
+    async fn workspace_snapshot(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::from("\n\nWorkspace snapshot:");
+
+        // Top-level entries + project type detection from the same listing.
+        if let Ok(entries) = self.executor.list_dir(".").await {
+            const MAX_ENTRIES: usize = 30;
+            let shown: Vec<String> = entries.iter().take(MAX_ENTRIES).cloned().collect();
+            let _ = write!(out, "\n- Top-level: {}", shown.join(", "));
+            if entries.len() > MAX_ENTRIES {
+                let _ = write!(out, " … and {} more", entries.len() - MAX_ENTRIES);
+            }
+            let detectors: [(&str, &str); 6] = [
+                ("Cargo.toml", "rust (cargo)"),
+                ("package.json", "node (npm)"),
+                ("pyproject.toml", "python"),
+                ("requirements.txt", "python (pip)"),
+                ("go.mod", "go"),
+                ("pom.xml", "java (maven)"),
+            ];
+            let mut kinds: Vec<&str> = detectors
+                .iter()
+                .filter(|(file, _)| entries.iter().any(|e| e == file))
+                .map(|(_, kind)| *kind)
+                .collect();
+            if entries.iter().any(|e| e == ".git/") {
+                kinds.push("git repository");
+            }
+            if !kinds.is_empty() {
+                let _ = write!(out, "\n- Project type: {}", kinds.join(", "));
+            }
+        }
+
+        // Git state in one round trip: branch, short HEAD, dirty count.
+        if let Ok(git) = self
+            .executor
+            .exec_shell(SNAPSHOT_GIT_PROBE, Duration::from_secs(10))
+            .await
+        {
+            let lines: Vec<&str> = git.stdout.lines().map(str::trim).collect();
+            if lines.len() == 3 && !lines[0].is_empty() {
+                let _ = write!(
+                    out,
+                    "\n- Git: branch {}, HEAD {}, {} changed file(s) (uncommitted)",
+                    lines[0], lines[1], lines[2]
+                );
+            } else {
+                let _ = write!(out, "\n- Git: not a repository (or git unavailable)");
+            }
+        }
+
+        // Distro + available toolchains in one round trip.
+        if let Ok(tools) = self
+            .executor
+            .exec_shell(SNAPSHOT_TOOLCHAIN_PROBE, Duration::from_secs(10))
+            .await
+        {
+            let summary: Vec<String> = tools
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !summary.is_empty() {
+                let _ = write!(out, "\n- Environment: {}", summary.join("; "));
+            }
+        }
+        out
     }
 
     /// Run one user turn: append the input, stream, execute tools, repeat until
@@ -534,6 +638,30 @@ Rules:\n\
     }
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// UTC date as `YYYY-MM-DD` from ms since the epoch (civil-from-days).
+pub fn utc_date_string(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Human-readable one-line description of a tool call (used for approvals and
 /// the tool activity pane).
 pub fn call_detail(call: &ToolCall) -> String {
@@ -721,13 +849,20 @@ mod tests {
             Arc::new(AlwaysAllowGate),
             None,
         );
-        let mut history = vec![Message::system(agent.system_prompt())];
+        let mut history = vec![Message::system(agent.system_prompt_at(0).await)];
 
         let events = run(&agent, &mut history, "run the tests").await;
 
+        // The workspace snapshot probes git and toolchains first; then the
+        // turn's tool calls.
         assert_eq!(
             executor.shell_commands.lock().unwrap().clone(),
-            vec!["cargo test".to_string(), "ls".to_string()]
+            vec![
+                SNAPSHOT_GIT_PROBE.to_string(),
+                SNAPSHOT_TOOLCHAIN_PROBE.to_string(),
+                "cargo test".to_string(),
+                "ls".to_string()
+            ]
         );
         assert!(matches!(events.last(), Some(CoreEvent::TurnCompleted)));
         // History ends with the final assistant message, preceded by the tool result.
@@ -838,7 +973,7 @@ mod tests {
         agent.compactor = Some(Arc::clone(&compactor) as Arc<dyn Compactor>);
         agent.limits.max_history_chars = 200;
 
-        let mut history = long_history(&agent.system_prompt());
+        let mut history = long_history(&agent.system_prompt_at(0).await);
         let events = run(&agent, &mut history, "final task").await;
 
         assert_eq!(*compactor.calls.lock().unwrap(), 1);
@@ -858,7 +993,7 @@ mod tests {
         agent.compactor = Some(Arc::new(FailingCompactor));
         agent.limits.max_history_chars = 100;
 
-        let mut history = long_history(&agent.system_prompt());
+        let mut history = long_history(&agent.system_prompt_at(0).await);
         let size_before: usize = history.iter().map(Message::size).sum();
         let events = run(&agent, &mut history, "final task").await;
 
@@ -1011,16 +1146,29 @@ mod tests {
         assert!(last_tool.content.contains("wait for the user's input"));
     }
 
-    #[test]
-    fn system_prompt_and_tool_defs_are_byte_stable() {
+    #[tokio::test]
+    async fn system_prompt_and_tool_defs_are_byte_stable() {
         let mut agent = single_reply_agent();
         agent.project_instructions = Some("be terse".into());
-        assert_eq!(agent.system_prompt(), agent.system_prompt());
-        let a = serde_json::to_string(&agent.tool_defs()).unwrap();
-        let b = serde_json::to_string(&agent.tool_defs()).unwrap();
+        agent.environment_notes = Some("Network mode: proxy (enforced)".into());
+        let a = agent.system_prompt_at(1_700_000_000_000).await;
+        let b = agent.system_prompt_at(1_700_000_000_000).await;
         assert_eq!(a, b);
-        // Instructions are reflected in the prompt.
-        assert!(agent.system_prompt().contains("be terse"));
+        let ta = serde_json::to_string(&agent.tool_defs()).unwrap();
+        let tb = serde_json::to_string(&agent.tool_defs()).unwrap();
+        assert_eq!(ta, tb);
+        // Instructions, notes and the snapshot are reflected in the prompt.
+        assert!(a.contains("be terse"));
+        assert!(a.contains("Network mode: proxy (enforced)"));
+        assert!(a.contains("Session context:"));
+        assert!(a.contains("Workspace snapshot:"));
+        assert!(a.contains("2023-11-14"));
+    }
+
+    #[test]
+    fn utc_date_formatting() {
+        assert_eq!(utc_date_string(1_700_000_000_000), "2023-11-14");
+        assert_eq!(utc_date_string(0), "1970-01-01");
     }
 
     #[test]
