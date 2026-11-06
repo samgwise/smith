@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/smith-core",
+    "crates/smith-providers",
+    "crates/smith-sandbox",
+    "crates/smith-tui",
+    "crates/smith-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+dirs = "5"
+dunce = "1"
+futures = "0.3"
+ratatui = "0.29"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+smith-core = { path = "crates/smith-core" }
+smith-providers = { path = "crates/smith-providers" }
+smith-sandbox = { path = "crates/smith-sandbox" }
+smith-tui = { path = "crates/smith-tui" }
+
+[profile.release]
+lto = true

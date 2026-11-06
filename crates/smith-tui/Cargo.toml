@@ -1,0 +1,16 @@
+[package]
+name = "smith-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ratatui frontend for smith"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+smith-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

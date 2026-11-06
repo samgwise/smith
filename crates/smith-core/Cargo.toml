@@ -1,0 +1,20 @@
+[package]
+name = "smith-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent loop, tool and provider traits, and session log"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
