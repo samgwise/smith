@@ -31,6 +31,25 @@ never the prefix. Headless `smith run` auto-approves (the sandbox is the
 boundary), and repeated denials escalate: after three, the agent is told to
 stop retrying and wait.
 
+## Egress control
+
+`sandbox.network` (default `proxy`) controls what the agent container can reach:
+
+- `proxy` — all HTTP(S) traffic routes through an allowlist-filtering proxy
+  sidecar (`smith-egress-proxy`, built once inside the podman machine from
+  the bundled Containerfile). HTTPS is filtered from the `CONNECT` hostname
+  without decryption. Default allowlist: crates.io, registry.npmjs.org,
+  pypi.org, ubuntu/debian repos, github.com + release downloads.
+  Override with `egress_allowlist`.
+- `none` — no network at all (`--network=none`).
+- `open` — unrestricted (the old default; `enabled` accepted as an alias).
+
+Known limitation: proxy env vars are cooperative. A program that ignores them
+and dials IP literals directly bypasses the filter. Closing that gap is the
+next milestone: an nftables default-deny ruleset inside the podman machine
+scoping container egress to the proxy + DNS only. `smith clean` also removes
+the proxy sidecar.
+
 ## Project instructions
 
 If the workspace root contains `AGENTS.md` (or `CLAUDE.md`), its contents are

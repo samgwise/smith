@@ -61,7 +61,7 @@ pub struct OpenAiConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct SandboxSection {
-    /// `enabled` or `disabled`.
+    /// `none` | `proxy` | `open` (`enabled` is an alias of `open`).
     pub network: String,
     pub image: String,
     pub memory: String,
@@ -69,6 +69,9 @@ pub struct SandboxSection {
     pub pids_limit: u32,
     pub exec_timeout_secs: u64,
     pub translate_paths: bool,
+    /// Destinations the agent container may reach in `proxy` mode;
+    /// empty = built-in defaults (crates.io, npm, pypi, ubuntu/debian, github).
+    pub egress_allowlist: Vec<String>,
 }
 
 impl Default for Config {
@@ -105,13 +108,14 @@ impl Default for SandboxSection {
     fn default() -> Self {
         let d = SandboxConfig::default();
         Self {
-            network: "enabled".into(),
+            network: "proxy".into(),
             image: d.image,
             memory: d.memory,
             cpus: d.cpus,
             pids_limit: d.pids_limit,
             exec_timeout_secs: d.exec_timeout.as_secs(),
             translate_paths: d.translate_paths,
+            egress_allowlist: vec![],
         }
     }
 }
@@ -143,11 +147,7 @@ impl Config {
     /// Resolve the sandbox configuration section.
     pub fn sandbox_config(&self) -> anyhow::Result<SandboxConfig> {
         let s = &self.sandbox;
-        let network = match s.network.as_str() {
-            "enabled" => NetworkMode::Enabled,
-            "disabled" => NetworkMode::Disabled,
-            other => bail!("sandbox.network must be `enabled` or `disabled`, got `{other}`"),
-        };
+        let network = parse_network_mode(&s.network)?;
         Ok(SandboxConfig {
             image: s.image.clone(),
             network,
@@ -156,12 +156,23 @@ impl Config {
             pids_limit: s.pids_limit,
             exec_timeout: std::time::Duration::from_secs(s.exec_timeout_secs.max(1)),
             translate_paths: s.translate_paths,
+            egress_allowlist: s.egress_allowlist.clone(),
         })
     }
 }
 
 pub fn config_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(smith_core::session::smith_dir()?.join("config.toml"))
+}
+
+/// Parse the `sandbox.network` value (shared by config and the CLI flag).
+pub fn parse_network_mode(value: &str) -> anyhow::Result<NetworkMode> {
+    match value {
+        "open" | "enabled" => Ok(NetworkMode::Open),
+        "proxy" => Ok(NetworkMode::Proxy),
+        "none" | "disabled" => Ok(NetworkMode::Disabled),
+        other => bail!("network mode must be `none`, `proxy` or `open`, got `{other}`"),
+    }
 }
 
 /// Write a commented starter config the first time (does not overwrite).
@@ -190,8 +201,9 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              base_url = \"https://api.openai.com/v1\"\n\
              # key comes from the OPENAI_API_KEY environment variable\n\
              \n\
-             [sandbox]\n\
-             network = \"enabled\"   # \"disabled\" maps to --network=none\n\
+             [sandbox]
+             network = \"proxy\"     # none | proxy | open; proxy filters by allowlist\n\
+             # egress_allowlist = [\"crates.io\", \"registry.npmjs.org\"]  # replaces defaults\n\
              image = \"docker.io/library/ubuntu:24.04\"\n\
              memory = \"4g\"\n\
              cpus = \"2\"\n\

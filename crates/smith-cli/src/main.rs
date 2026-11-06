@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use smith_core::{Agent, Message, SessionLogger};
-use smith_sandbox::{NetworkMode, Sandbox, SandboxConfig};
+use smith_sandbox::Sandbox;
 
 use crate::config::Config;
 
@@ -164,6 +164,12 @@ enum SandboxCmd {
         /// Workspace directory to mount (defaults to the current directory).
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Network mode override: none | proxy | open.
+        #[arg(long)]
+        network: Option<String>,
+        /// User to exec as (default: the non-root `dev` user).
+        #[arg(long)]
+        user: Option<String>,
         /// Command to run inside the container.
         #[arg(last = true)]
         command: Vec<String>,
@@ -257,37 +263,43 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Some(Command::Sandbox { cmd }) => {
-            let sandbox = Sandbox::new(config.sandbox_config().unwrap_or(SandboxConfig {
-                network: NetworkMode::Enabled,
-                ..SandboxConfig::default()
-            }));
-            match cmd {
-                SandboxCmd::Exec { workspace, command } => {
-                    let workspace =
-                        workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-                    let command = if command.is_empty() {
-                        "echo hello".to_string()
-                    } else {
-                        command.join(" ")
-                    };
-
-                    sandbox.ensure_ready().await?;
-                    sandbox.reap_stopped_sessions().await?;
-                    let session = sandbox.start_session(&workspace).await?;
-                    println!("session container: {}", session.name);
-
-                    let outcome = sandbox.exec(&session, &command, None).await?;
-                    println!("--- stdout ---\n{}", outcome.stdout.trim_end());
-                    println!(
-                        "exit={} timed_out={} duration={:?}",
-                        outcome.exit_code, outcome.timed_out, outcome.duration
-                    );
-
-                    sandbox.stop_session(&session).await?;
-                    println!("session container removed");
-                }
+        Some(Command::Sandbox {
+            cmd:
+                SandboxCmd::Exec {
+                    workspace,
+                    network,
+                    user,
+                    command,
+                },
+        }) => {
+            let mut sandbox_config = config.sandbox_config()?;
+            if let Some(network) = network {
+                sandbox_config.network = config::parse_network_mode(&network)?;
             }
+            let sandbox = Sandbox::new(sandbox_config);
+            let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+            let command = if command.is_empty() {
+                "echo hello".to_string()
+            } else {
+                command.join(" ")
+            };
+
+            sandbox.ensure_ready().await?;
+            sandbox.reap_stopped_sessions().await?;
+            let session = sandbox.start_session(&workspace).await?;
+            println!("session container: {}", session.name);
+
+            let outcome = sandbox
+                .exec_as(&session, user.as_deref(), &command, None)
+                .await?;
+            println!("--- stdout ---\n{}", outcome.stdout.trim_end());
+            println!(
+                "exit={} timed_out={} duration={:?}",
+                outcome.exit_code, outcome.timed_out, outcome.duration
+            );
+
+            sandbox.stop_session(&session).await?;
+            println!("session container removed");
         }
         Some(Command::Clean) => {
             let sandbox = Sandbox::new(config.sandbox_config()?);

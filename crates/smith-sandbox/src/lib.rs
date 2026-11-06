@@ -16,16 +16,27 @@ use tokio::time::timeout;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkMode {
     /// Default podman networking (containers can reach the internet).
-    Enabled,
+    Open,
+    /// All traffic routed through the allowlist-filtering egress proxy
+    /// sidecar on the `smith-egress` network.
+    Proxy,
     /// `--network=none`: no network interfaces at all.
     Disabled,
 }
 
+/// Name of the dedicated podman network and proxy sidecar.
+pub const EGRESS_NETWORK: &str = "smith-egress";
+pub const EGRESS_SIDECAR: &str = "smith-egress-proxy";
+pub const EGRESS_IMAGE: &str = "localhost/smith-egress:0.1";
+pub const PROXY_PORT: u16 = 3128;
+
 impl NetworkMode {
     fn podman_args(&self) -> &'static [&'static str] {
         match self {
-            NetworkMode::Enabled => &[],
+            NetworkMode::Open => &[],
             NetworkMode::Disabled => &["--network", "none"],
+            // Proxy mode builds its args in start_session (network + env).
+            NetworkMode::Proxy => &[],
         }
     }
 }
@@ -47,18 +58,21 @@ pub struct SandboxConfig {
     /// Translate Windows paths to `/mnt/<drive>/...` before mounting.
     /// Leave `false` unless direct Windows-path mounts fail on your setup.
     pub translate_paths: bool,
+    /// Destination allowlist for proxy mode; empty = built-in defaults.
+    pub egress_allowlist: Vec<String>,
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             image: "docker.io/library/ubuntu:24.04".to_string(),
-            network: NetworkMode::Enabled,
+            network: NetworkMode::Proxy,
             memory: "4g".to_string(),
             cpus: "2".to_string(),
             pids_limit: 256,
             exec_timeout: Duration::from_secs(120),
             translate_paths: false,
+            egress_allowlist: vec![],
         }
     }
 }
@@ -207,6 +221,22 @@ impl Sandbox {
             }
         }
 
+        // Proxy mode: ensure the egress network, image and sidecar exist
+        // before the agent container starts.
+        let mut proxy_env: Vec<(String, String)> = vec![];
+        if self.config.network == NetworkMode::Proxy {
+            self.ensure_egress_network().await?;
+            self.ensure_sidecar().await?;
+            let proxy_url = format!("http://{EGRESS_SIDECAR}:{PROXY_PORT}");
+            // Both cases: curl honours either, apt honours lowercase.
+            for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                proxy_env.push((name.into(), proxy_url.clone()));
+            }
+            for name in ["NO_PROXY", "no_proxy"] {
+                proxy_env.push((name.into(), "localhost,127.0.0.1".into()));
+            }
+        }
+
         let name = format!("smith-{}", uuid::Uuid::new_v4().simple());
         let pids_limit = self.config.pids_limit.to_string();
         let host_mount = if self.config.translate_paths {
@@ -219,24 +249,44 @@ impl Sandbox {
 
         // Create the non-root `dev` user on first boot, then idle forever.
         let boot = "useradd -m -s /bin/bash dev >/dev/null 2>&1 || true; exec sleep infinity";
-        let mut args: Vec<&str> = vec![
-            "run",
-            "-d",
-            "--name",
-            &name,
-            "-v",
-            &mount,
-            "--memory",
-            &self.config.memory,
-            "--cpus",
-            &self.config.cpus,
-            "--pids-limit",
-            &pids_limit,
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            name.clone(),
+            "-v".into(),
+            mount,
+            "--memory".into(),
+            self.config.memory.clone(),
+            "--cpus".into(),
+            self.config.cpus.clone(),
+            "--pids-limit".into(),
+            pids_limit,
         ];
-        args.extend_from_slice(self.config.network.podman_args());
-        args.extend_from_slice(&[&self.config.image, "/bin/sh", "-c", boot]);
+        match self.config.network {
+            NetworkMode::Proxy => {
+                args.push("--network".into());
+                args.push(EGRESS_NETWORK.into());
+                for (k, v) in &proxy_env {
+                    args.push("-e".into());
+                    args.push(format!("{k}={v}"));
+                }
+            }
+            other => {
+                for arg in other.podman_args() {
+                    args.push((*arg).to_string());
+                }
+            }
+        }
+        args.extend_from_slice(&[
+            self.config.image.clone(),
+            "/bin/sh".into(),
+            "-c".into(),
+            boot.into(),
+        ]);
 
-        let out = self.run_podman(&args).await?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run_podman(&arg_refs).await?;
         if !out.status.success() {
             anyhow::bail!(
                 "failed to start sandbox container: {}{}",
@@ -252,11 +302,112 @@ impl Sandbox {
         })
     }
 
+    /// Create the dedicated egress network if it does not exist yet.
+    async fn ensure_egress_network(&self) -> anyhow::Result<()> {
+        let exists = self
+            .run_podman(&["network", "exists", EGRESS_NETWORK])
+            .await?;
+        if !exists.status.success() {
+            tracing::info!("creating podman network {EGRESS_NETWORK}");
+            let out = self
+                .run_podman(&["network", "create", EGRESS_NETWORK])
+                .await?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "failed to create network {EGRESS_NETWORK}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the egress proxy image once, then keep the sidecar running.
+    /// The sidecar survives across sessions; `smith clean` removes it.
+    async fn ensure_sidecar(&self) -> anyhow::Result<()> {
+        let image_exists = self.run_podman(&["image", "exists", EGRESS_IMAGE]).await?;
+        if !image_exists.status.success() {
+            tracing::info!("building egress proxy image (one-time, a few minutes)");
+            let context = smith_egress::container_context()?;
+            let out = self
+                .run_podman(&[
+                    "build",
+                    "-t",
+                    EGRESS_IMAGE,
+                    "-f",
+                    smith_egress::containerfile_path()?
+                        .to_str()
+                        .context("containerfile path")?,
+                    context.to_str().context("egress build context")?,
+                ])
+                .await?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "failed to build the egress proxy image: {}{}",
+                    String::from_utf8_lossy(&out.stderr),
+                    String::from_utf8_lossy(&out.stdout)
+                );
+            }
+        }
+
+        let running = self
+            .run_podman(&["container", "exists", EGRESS_SIDECAR])
+            .await?;
+        if running.status.success() {
+            let state = self
+                .run_podman(&["inspect", "-f", "{{.State.Running}}", EGRESS_SIDECAR])
+                .await?;
+            if String::from_utf8_lossy(&state.stdout).trim() == "true" {
+                return Ok(());
+            }
+            let _ = self.run_podman(&["rm", "-f", EGRESS_SIDECAR]).await?;
+        }
+
+        let allowlist = if self.config.egress_allowlist.is_empty() {
+            smith_egress::DEFAULT_ALLOWLIST.join(",")
+        } else {
+            self.config.egress_allowlist.join(",")
+        };
+        tracing::info!("starting egress proxy sidecar");
+        let out = self
+            .run_podman(&[
+                "run",
+                "-d",
+                "--name",
+                EGRESS_SIDECAR,
+                "--network",
+                EGRESS_NETWORK,
+                "-e",
+                &format!("EGRESS_ALLOWLIST={allowlist}"),
+                EGRESS_IMAGE,
+            ])
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "failed to start the egress proxy sidecar: {}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        Ok(())
+    }
+
     /// Execute a shell command inside the session container as the non-root user.
     /// Both an in-container `timeout` and a host-side wall-clock guard apply.
     pub async fn exec(
         &self,
         session: &Session,
+        command: &str,
+        timeout_dur: Option<Duration>,
+    ) -> anyhow::Result<ExecOutcome> {
+        self.exec_as(session, None, command, timeout_dur).await
+    }
+
+    /// Execute as an explicit user (`None` = the non-root `dev` user).
+    pub async fn exec_as(
+        &self,
+        session: &Session,
+        user: Option<&str>,
         command: &str,
         timeout_dur: Option<Duration>,
     ) -> anyhow::Result<ExecOutcome> {
@@ -268,7 +419,7 @@ impl Sandbox {
         let args = [
             "exec",
             "--user",
-            "dev",
+            user.unwrap_or("dev"),
             "--workdir",
             session.workspace_container,
             &session.name,
@@ -329,6 +480,17 @@ impl Sandbox {
                 session.name,
                 String::from_utf8_lossy(&out.stderr)
             );
+        }
+        Ok(())
+    }
+
+    /// Remove the egress proxy sidecar (kept across sessions otherwise).
+    pub async fn stop_egress_sidecar(&self) -> anyhow::Result<()> {
+        let exists = self
+            .run_podman(&["container", "exists", EGRESS_SIDECAR])
+            .await?;
+        if exists.status.success() {
+            let _ = self.run_podman(&["rm", "-f", EGRESS_SIDECAR]).await?;
         }
         Ok(())
     }
@@ -417,6 +579,63 @@ mod tests {
     #[test]
     fn network_mode_args() {
         assert_eq!(NetworkMode::Disabled.podman_args(), &["--network", "none"]);
-        assert!(NetworkMode::Enabled.podman_args().is_empty());
+        assert!(NetworkMode::Open.podman_args().is_empty());
+    }
+
+    /// Live egress test: allowed host tunnels, non-allowlisted host is
+    /// denied by the proxy. Requires podman; run with `cargo test --ignored`.
+    #[tokio::test]
+    #[ignore = "requires podman and network; run with --ignored"]
+    async fn egress_proxy_allows_and_denies() {
+        let sandbox = Sandbox::new(SandboxConfig {
+            network: NetworkMode::Proxy,
+            ..Default::default()
+        });
+        sandbox.ensure_ready().await.unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let session = sandbox.start_session(&ws.path()).await.unwrap();
+
+        // curl is not in the ubuntu base image; install it through the proxy
+        // (archive.ubuntu.com is on the default allowlist — itself a check).
+        let install = sandbox
+            .exec_as(
+                &session,
+                Some("root"),
+                "apt-get update -qq && apt-get install -y -qq curl",
+                Some(Duration::from_secs(300)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            install.exit_code, 0,
+            "apt through the proxy: {}",
+            install.stdout
+        );
+
+        let allowed = sandbox
+            .exec_as(
+                &session,
+                Some("root"),
+                "curl -sSf --max-time 20 https://registry.npmjs.org -o /dev/null && echo ALLOWED",
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        assert!(allowed.stdout.contains("ALLOWED"), "{}", allowed.stdout);
+
+        let denied = sandbox
+            .exec_as(
+                &session,
+                Some("root"),
+                "curl -sSf --max-time 20 https://example.com -o /dev/null; echo exit=$?",
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        // curl exit 22 = HTTP error: the proxy answered the CONNECT with 403.
+        assert!(denied.stdout.contains("exit=22"), "{}", denied.stdout);
+
+        sandbox.stop_session(&session).await.unwrap();
+        sandbox.stop_egress_sidecar().await.unwrap();
     }
 }

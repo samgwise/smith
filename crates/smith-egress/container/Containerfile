@@ -1,0 +1,15 @@
+# Builds the smith egress proxy for Linux inside the podman machine.
+# Build context: this directory (the crate is a standalone manifest on
+# purpose so it needs nothing from the workspace).
+FROM docker.io/library/rust:1-slim AS build
+WORKDIR /build
+COPY . .
+RUN cargo build --release --bin smith-egress-proxy
+
+# The runtime stage needs a libc: the build uses the glibc toolchain, and a
+# FROM-scratch image has no dynamic loader (the binary exits 1 immediately).
+FROM docker.io/library/debian:bookworm-slim
+COPY --from=build /build/target/release/smith-egress-proxy /smith-egress-proxy
+ENV EGRESS_PORT=3128
+EXPOSE 3128
+ENTRYPOINT ["/smith-egress-proxy"]

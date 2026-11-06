@@ -1802,6 +1802,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "smith-egress"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "smith-mcp"
 version = "0.1.0"
 dependencies = [
@@ -1835,6 +1845,8 @@ dependencies = [
  "anyhow",
  "dirs",
  "dunce",
+ "smith-egress",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

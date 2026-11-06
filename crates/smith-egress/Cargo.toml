@@ -1,0 +1,14 @@
+[package]
+name = "smith-egress"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Egress allowlist proxy for smith sandbox containers"
+# Deliberately NOT workspace-inherited: the Containerfile builds this crate
+# standalone inside the podman machine (build context = this directory).
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
