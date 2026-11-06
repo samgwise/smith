@@ -3,7 +3,7 @@
 //! Records use a logical workspace identity (a hash of the canonical path)
 //! rather than absolute host paths, so session files stay portable.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -126,6 +126,43 @@ impl SessionLogger {
             model: model.into(),
         })?;
         Ok(logger)
+    }
+
+    /// Reopen an existing session file for appending (resume). Fails if the
+    /// file has no meta record.
+    pub fn open_for_append(path: &Path) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading session {}", path.display()))?;
+        let first = raw.lines().next().context("session file is empty")?;
+        let SessionRecord::Meta {
+            id,
+            created_ms,
+            workspace_id,
+            workspace_name,
+            provider,
+            model,
+        } = serde_json::from_str(first)
+            .with_context(|| format!("parsing meta in {}", path.display()))?
+        else {
+            anyhow::bail!("first record in {} is not a meta record", path.display());
+        };
+
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("appending to {}", path.display()))?;
+        Ok(Self {
+            writer: Mutex::new(BufWriter::new(file)),
+            path: path.to_path_buf(),
+            meta: SessionMeta {
+                id,
+                created_ms,
+                workspace_id,
+                workspace_name,
+                provider,
+                model,
+            },
+        })
     }
 
     pub fn write_record(&self, record: &SessionRecord) -> anyhow::Result<()> {
@@ -300,6 +337,28 @@ mod tests {
         assert_eq!(history[2].role, Role::Tool);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(history[3].role, Role::Assistant);
+    }
+
+    #[test]
+    fn open_for_append_continues_the_same_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("demo");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let logger =
+            SessionLogger::new_in(&tmp.path().join("sessions"), &ws, "ollama", "m1").unwrap();
+        logger.log_user("first task").unwrap();
+
+        let reopened = SessionLogger::open_for_append(&logger.path).unwrap();
+        assert_eq!(reopened.meta.id, logger.meta.id);
+        assert_eq!(reopened.meta.model, "m1");
+        reopened.log_user("second task").unwrap();
+
+        let (meta, history) = load_history(&logger.path).unwrap();
+        assert_eq!(meta.id, logger.meta.id);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "first task");
+        assert_eq!(history[1].content, "second task");
     }
 
     #[test]

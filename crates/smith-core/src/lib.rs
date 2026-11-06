@@ -5,6 +5,7 @@
 //! [`provider::LlmProvider`] and [`executor::ToolExecutor`].
 
 pub mod agent;
+pub mod compaction;
 pub mod executor;
 pub mod model;
 pub mod provider;
@@ -15,8 +16,11 @@ pub use agent::{
     Agent, AlwaysAllowGate, ApprovalDecision, ApprovalGate, ApprovalRequest, CoreEvent, Limits,
     call_detail,
 };
+pub use compaction::{Compactor, ProviderCompactor, SharedProvider};
 pub use executor::{ExecResult, ToolExecutor, clamp_output};
 pub use model::{FinishReason, Message, ProviderEvent, Role, ToolCall, ToolDef, Usage};
 pub use provider::{LlmProvider, ProviderStream};
-pub use session::{SessionLogger, SessionMeta, SessionRecord, list_sessions, load_history};
+pub use session::{
+    SessionLogger, SessionMeta, SessionRecord, list_sessions, load_history, workspace_identity,
+};
 pub use tools::{Tool, builtin_tools};

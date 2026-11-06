@@ -1,10 +1,15 @@
 //! TUI application state and the main event loop.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use ratatui::text::Line;
-use smith_core::{Agent, ApprovalDecision, ApprovalRequest, CoreEvent, Message, Usage};
+use smith_core::{
+    Agent, ApprovalDecision, ApprovalRequest, CoreEvent, LlmProvider, Message, Usage,
+    list_sessions, load_history, workspace_identity,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -27,12 +32,22 @@ enum Turn {
     Idle,
 }
 
+/// Builds a provider for `/model` and `/provider` switches.
+pub type ProviderFactory =
+    Arc<dyn Fn(&str, &str) -> anyhow::Result<Arc<dyn LlmProvider>> + Send + Sync>;
+
 pub struct AppParams {
     pub agent: Arc<Agent>,
     pub history: Vec<Message>,
     pub gate_rx: ApprovalRx,
-    pub model_label: String,
+    /// Canonical workspace path (for `/resume` identity checks).
+    pub workspace: PathBuf,
     pub workspace_label: String,
+    pub container_label: String,
+    pub session_label: String,
+    pub provider_name: String,
+    pub model_name: String,
+    pub build_provider: ProviderFactory,
 }
 
 pub struct App {
@@ -55,8 +70,15 @@ pub struct App {
     usage: Usage,
     /// `None` = follow the tail; `Some(offset)` = user scrolled up.
     scroll: Option<u16>,
-    model_label: String,
+    workspace: PathBuf,
     workspace_label: String,
+    container_label: String,
+    session_label: String,
+    provider_name: String,
+    model_name: String,
+    build_provider: ProviderFactory,
+    /// Last Ctrl+C while busy (quit-with-second-press flow).
+    last_ctrl_c: Option<Instant>,
     status_note: String,
     should_quit: bool,
 }
@@ -79,8 +101,14 @@ impl App {
             input: String::new(),
             usage: Usage::default(),
             scroll: None,
-            model_label: params.model_label,
+            workspace: params.workspace,
             workspace_label: params.workspace_label,
+            container_label: params.container_label,
+            session_label: params.session_label,
+            provider_name: params.provider_name,
+            model_name: params.model_name,
+            build_provider: params.build_provider,
+            last_ctrl_c: None,
             status_note: String::new(),
             should_quit: false,
         }
@@ -90,17 +118,18 @@ impl App {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
 
-        // Blocking keyboard reader on its own thread.
+        // Blocking keyboard reader on its own thread. On Windows crossterm
+        // delivers both Press and Release events; only Press is acted on.
         std::thread::spawn(move || {
-            use crossterm::event::{Event, read};
+            use crossterm::event::{Event, KeyEventKind, read};
             loop {
                 match read() {
-                    Ok(Event::Key(key)) => {
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         if input_tx.send(InputEvent::Key(key)).is_err() {
                             return;
                         }
                     }
-                    Ok(_) => {} // resize/mouse ignored for v1
+                    Ok(_) => {} // resize/mouse/key-release ignored for v1
                     Err(_) => return,
                 }
             }
@@ -184,6 +213,13 @@ impl App {
                 }
             }
             CoreEvent::Usage(u) => self.usage = u,
+            CoreEvent::Compacted { messages, summary } => {
+                self.push_line(format!("[compacted {messages} messages: {summary}]"));
+            }
+            CoreEvent::Notice { text } => {
+                self.push_line(text.clone());
+                self.transcript.push(Line::from(""));
+            }
             CoreEvent::TurnCompleted => {
                 self.status_note.clear();
             }
@@ -208,11 +244,21 @@ impl App {
         }
 
         match (key.code, key.modifiers) {
-            // Ctrl+C: cancel a running turn, quit when idle.
+            // Ctrl+C: cancel a running turn, quit when idle. A second press
+            // within 2s of the first cancels and quits together.
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 if self.busy {
                     if let Turn::Running { cancel, .. } = &self.turn {
                         cancel.cancel();
+                    }
+                    if self
+                        .last_ctrl_c
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+                    {
+                        self.should_quit = true;
+                    } else {
+                        self.last_ctrl_c = Some(Instant::now());
+                        self.status_note = "cancelling — press Ctrl+C again to quit".into();
                     }
                 } else {
                     self.should_quit = true;
@@ -242,7 +288,15 @@ impl App {
 
     fn submit(&mut self) {
         let input = self.input.trim().to_string();
-        if input.is_empty() || self.busy {
+        if input.is_empty() {
+            return;
+        }
+        if let Some(rest) = input.strip_prefix('/') {
+            self.input.clear();
+            self.handle_slash(rest);
+            return;
+        }
+        if self.busy {
             return;
         }
         self.input.clear();
@@ -270,6 +324,141 @@ impl App {
             }
         });
         self.turn = Turn::Running { handle, cancel };
+    }
+
+    // ---------------------------------------------------- slash commands --
+
+    fn handle_slash(&mut self, rest: &str) {
+        match parse_slash(rest) {
+            Err(message) => self.push_line(format!("[error] {message}")),
+            Ok(None) => {}
+            Ok(Some(Slash::Help)) => {
+                for line in [
+                    "/model <name>      switch model mid-session",
+                    "/provider <name>   switch provider (ollama|openai)",
+                    "/diff              show git diff of the workspace",
+                    "/sessions          list saved sessions",
+                    "/resume <id>       continue a saved session",
+                    "/help              this list",
+                    "/quit              exit smith",
+                ] {
+                    self.push_line(line.to_string());
+                }
+                self.transcript.push(Line::from(""));
+            }
+            Ok(Some(Slash::Quit)) => self.should_quit = true,
+            Ok(Some(Slash::Model(name))) => {
+                match (self.build_provider)(&self.provider_name, &name) {
+                    Ok(provider) => {
+                        self.agent.set_provider(provider);
+                        self.model_name = name.clone();
+                        self.push_line(format!("[model switched to {name}]"));
+                    }
+                    Err(e) => self.push_line(format!("[error] {e:#}")),
+                }
+            }
+            Ok(Some(Slash::Provider(name))) => {
+                match (self.build_provider)(&name, &self.model_name) {
+                    Ok(provider) => {
+                        self.agent.set_provider(provider);
+                        self.provider_name = name.clone();
+                        self.push_line(format!("[provider switched to {name}]"));
+                    }
+                    Err(e) => self.push_line(format!("[error] {e:#}")),
+                }
+            }
+            Ok(Some(Slash::Diff)) => {
+                let agent = Arc::clone(&self.agent);
+                let tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let exec = agent.executor();
+                    let text = match exec
+                        .exec_shell("git --no-pager diff", Duration::from_secs(30))
+                        .await
+                    {
+                        Ok(res) if res.stdout.trim().is_empty() && res.stderr.trim().is_empty() => {
+                            "git diff: (no changes)".to_string()
+                        }
+                        Ok(res) => {
+                            let out = format!("{}{}", res.stdout, res.stderr);
+                            let chars: Vec<char> = out.chars().collect();
+                            let start = chars.len().saturating_sub(4000);
+                            format!("git diff:\n{}", chars[start..].iter().collect::<String>())
+                        }
+                        Err(e) => {
+                            format!("git diff failed: {e:#} (git may be missing in the base image)")
+                        }
+                    };
+                    let _ = tx.send(CoreEvent::Notice { text });
+                });
+            }
+            Ok(Some(Slash::Sessions)) => match list_sessions() {
+                Ok(sessions) if sessions.is_empty() => self.push_line("[no saved sessions]".into()),
+                Ok(sessions) => {
+                    for (path, meta) in sessions.iter().take(10) {
+                        self.push_line(format!(
+                            "{}  {}:{}  {} ({})",
+                            &meta.id[..8.min(meta.id.len())],
+                            meta.provider,
+                            meta.model,
+                            meta.workspace_name,
+                            path.display()
+                        ));
+                    }
+                    self.transcript.push(Line::from(""));
+                }
+                Err(e) => self.push_line(format!("[error] {e:#}")),
+            },
+            Ok(Some(Slash::Resume(prefix))) => {
+                if self.busy {
+                    self.push_line("[error] cannot resume while a turn is running".into());
+                    return;
+                }
+                let loaded = self.load_session_for_resume(&prefix);
+                match loaded {
+                    Ok((id_prefix, count)) => {
+                        self.push_line(format!("[resumed session {id_prefix}: {count} messages]"));
+                        self.session_label = id_prefix;
+                    }
+                    Err(e) => self.push_line(format!("[error] {e:#}")),
+                }
+            }
+        }
+    }
+
+    /// Load a session's history into the app (used by /resume).
+    fn load_session_for_resume(&mut self, prefix: &str) -> anyhow::Result<(String, usize)> {
+        let sessions = list_sessions()?;
+        let matches: Vec<_> = sessions
+            .iter()
+            .filter(|(_, meta)| meta.id.starts_with(prefix))
+            .collect();
+        match matches.len() {
+            0 => anyhow::bail!("no session matches `{prefix}` (see /sessions)"),
+            n if n > 1 => anyhow::bail!("{n} sessions match `{prefix}`; be more specific"),
+            _ => {}
+        }
+        let (path, meta) = matches[0].clone();
+
+        let current = workspace_identity(&self.workspace);
+        if meta.workspace_id != current {
+            anyhow::bail!(
+                "session {} belongs to workspace `{}`, not this one",
+                &meta.id[..8.min(meta.id.len())],
+                meta.workspace_name
+            );
+        }
+
+        let (_, mut history) = load_history(&path)?;
+        if !history
+            .first()
+            .is_some_and(|m| m.role == smith_core::Role::System)
+        {
+            history.insert(0, Message::system(self.agent.system_prompt()));
+        }
+        let count = history.len();
+        self.history = history;
+        Ok((meta.id[..8.min(meta.id.len())].to_string(), count))
     }
 
     // ----------------------------------------------------------- scrolling --
@@ -360,8 +549,20 @@ impl App {
         self.pending_approval.as_ref()
     }
 
-    pub fn model_label(&self) -> &str {
-        &self.model_label
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    pub fn container_label(&self) -> &str {
+        &self.container_label
+    }
+
+    pub fn session_label(&self) -> &str {
+        &self.session_label
     }
 
     pub fn workspace_label(&self) -> &str {
@@ -405,6 +606,78 @@ impl App {
                 false
             }
         }
+    }
+}
+
+/// A parsed slash command from the input box.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Slash {
+    Model(String),
+    Provider(String),
+    Diff,
+    Sessions,
+    Resume(String),
+    Help,
+    Quit,
+}
+
+/// Parse the text after `/`. Returns `Ok(None)` for empty input.
+pub fn parse_slash(rest: &str) -> Result<Option<Slash>, String> {
+    let mut parts = rest.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let arg = parts.next();
+    let tail = arg.map(|a| a.to_string());
+    match name {
+        "" => Ok(None),
+        "model" => tail
+            .map(|t| Ok(Some(Slash::Model(t))))
+            .unwrap_or(Err("/model requires a model name".into())),
+        "provider" => match tail.as_deref() {
+            Some("ollama") | Some("openai") => Ok(Some(Slash::Provider(tail.unwrap()))),
+            _ => Err("/provider expects `ollama` or `openai`".into()),
+        },
+        "diff" => Ok(Some(Slash::Diff)),
+        "sessions" => Ok(Some(Slash::Sessions)),
+        "resume" => tail
+            .map(|t| Ok(Some(Slash::Resume(t))))
+            .unwrap_or(Err("/resume requires a session id (see /sessions)".into())),
+        "help" => Ok(Some(Slash::Help)),
+        "quit" => Ok(Some(Slash::Quit)),
+        other => Err(format!("unknown command `/{other}` — try /help")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_commands() {
+        assert_eq!(
+            parse_slash("model qwen3:0.6b").unwrap(),
+            Some(Slash::Model("qwen3:0.6b".into()))
+        );
+        assert_eq!(
+            parse_slash("provider openai").unwrap(),
+            Some(Slash::Provider("openai".into()))
+        );
+        assert_eq!(parse_slash("diff").unwrap(), Some(Slash::Diff));
+        assert_eq!(parse_slash("sessions").unwrap(), Some(Slash::Sessions));
+        assert_eq!(
+            parse_slash("resume abc123").unwrap(),
+            Some(Slash::Resume("abc123".into()))
+        );
+        assert_eq!(parse_slash("help").unwrap(), Some(Slash::Help));
+        assert_eq!(parse_slash("quit").unwrap(), Some(Slash::Quit));
+        assert_eq!(parse_slash("").unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_malformed_commands() {
+        assert!(parse_slash("model").is_err());
+        assert!(parse_slash("provider shazam").is_err());
+        assert!(parse_slash("resume").is_err());
+        assert!(parse_slash("frobnicate").is_err());
     }
 }
 

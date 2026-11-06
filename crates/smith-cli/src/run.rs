@@ -1,4 +1,4 @@
-//! Headless one-shot runs: `smith run "task"`.
+//! Headless one-shot runs (`smith run`) and session resume (`smith resume`).
 //!
 //! Everything is auto-approved here (there is no TUI to ask), which is only
 //! safe because execution stays inside the podman sandbox.
@@ -136,6 +136,112 @@ pub async fn run_headless(
     })
 }
 
+/// Continue a saved session: fresh container, same workspace, same log file.
+/// Without `task`, prints a recap of where the session left off.
+pub async fn resume_headless(
+    config: &Config,
+    workspace: &Path,
+    id: Option<&str>,
+    task: Option<&str>,
+    force: bool,
+    keep: bool,
+) -> anyhow::Result<RunOutcome> {
+    let canon = dunce::canonicalize(workspace)?;
+    let sessions = smith_core::list_sessions()?;
+    anyhow::ensure!(
+        !sessions.is_empty(),
+        "no saved sessions (see `smith sessions`)"
+    );
+
+    let (path, meta) = match id {
+        Some(id) => {
+            let matches: Vec<_> = sessions
+                .iter()
+                .filter(|(_, m)| m.id.starts_with(id))
+                .collect();
+            match matches.len() {
+                0 => anyhow::bail!("no session matches `{id}` (see `smith sessions`)"),
+                1 => matches[0].clone(),
+                n => anyhow::bail!("{n} sessions match `{id}`; be more specific"),
+            }
+        }
+        None => sessions[0].clone(),
+    };
+
+    let current = smith_core::session::workspace_identity(&canon);
+    if meta.workspace_id != current && !force {
+        anyhow::bail!(
+            "session {} belongs to workspace `{}`; run from that workspace or pass --force",
+            &meta.id[..8],
+            meta.workspace_name
+        );
+    }
+
+    let (sandbox, executor) = start_executor(config, workspace).await?;
+    let container = executor.session().name.clone();
+
+    let logger = smith_core::SessionLogger::open_for_append(&path)?;
+    println!("resumed session {} ({})", meta.id, path.display());
+
+    let provider = build_provider(config)?;
+    let agent = Agent::new(
+        provider,
+        Arc::new(executor),
+        smith_core::builtin_tools(),
+        Arc::new(AutoAllowGate),
+        Some(Arc::new(logger)),
+    );
+    let (_, mut history) = smith_core::load_history(&path)?;
+    if !history
+        .first()
+        .is_some_and(|m| m.role == smith_core::Role::System)
+    {
+        history.insert(0, Message::system(agent.system_prompt()));
+    }
+
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let printer = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            print_event(&ev);
+        }
+    });
+
+    match task {
+        Some(task) => {
+            agent.run_turn(&mut history, task, tx, cancel).await?;
+            printer.await.ok();
+        }
+        None => {
+            let recap = history
+                .iter()
+                .rev()
+                .find(|m| m.role == smith_core::Role::Assistant)
+                .map(|m| m.content.clone())
+                .unwrap_or_else(|| "(no assistant messages yet)".into());
+            println!("recap: {}", recap.trim());
+            let _ = tx; // closes the printer on drop
+            printer.await.ok();
+        }
+    }
+
+    if keep {
+        println!("keeping container {container} (remove later with `smith clean`)");
+    } else {
+        let session = Session {
+            name: container.clone(),
+            workspace_host: canon,
+            workspace_container: "/workspace",
+        };
+        sandbox.stop_session(&session).await?;
+    }
+
+    Ok(RunOutcome {
+        session_path: path,
+        container,
+    })
+}
+
 fn print_event(ev: &CoreEvent) {
     match ev {
         CoreEvent::AssistantDelta { text } => {
@@ -152,6 +258,12 @@ fn print_event(ev: &CoreEvent) {
         }
         CoreEvent::Usage(u) => {
             println!("[usage] in: {}, out: {}", u.input_tokens, u.output_tokens);
+        }
+        CoreEvent::Compacted { messages, .. } => {
+            println!("[compacted {messages} messages]");
+        }
+        CoreEvent::Notice { text } => {
+            println!("{text}");
         }
         CoreEvent::TurnCompleted => println!("\n[done]"),
         CoreEvent::TurnCancelled => println!("\n[cancelled]"),

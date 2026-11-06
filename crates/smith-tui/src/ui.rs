@@ -153,8 +153,11 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let usage = app.usage();
     let status = format!(
-        " {} | {} | in {} out {}{}{}",
-        app.model_label(),
+        " {}: {} | {} | sess {} | {} | in {} out {}{}{}",
+        app.provider_name(),
+        app.model_name(),
+        app.container_label(),
+        app.session_label(),
         app.workspace_label(),
         usage.input_tokens,
         usage.output_tokens,

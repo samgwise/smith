@@ -22,6 +22,7 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
 
     let logger = SessionLogger::new(&workspace_canon, &config.provider, &config.model)?;
     println!("session: {}", logger.path.display());
+    let session_label = logger.meta.id.chars().take(8).collect::<String>();
 
     let provider = run::build_provider(config)?;
     let agent = Agent::new(
@@ -31,27 +32,42 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
         std::sync::Arc::new(smith_tui::TuiGate::new(gate_tx)),
         Some(std::sync::Arc::new(logger)),
     );
+    let system_prompt = agent.system_prompt();
+
+    let provider_name = config.provider.clone();
+    let model_name = config.model.clone();
+    let container_label = container
+        .trim_start_matches("smith-")
+        .chars()
+        .take(12)
+        .collect::<String>();
+
+    let cfg_for_factory = config.clone();
+    let build_provider: smith_tui::app::ProviderFactory =
+        std::sync::Arc::new(move |provider: &str, model: &str| {
+            let mut cfg = cfg_for_factory.clone();
+            cfg.provider = provider.to_string();
+            cfg.model = model.to_string();
+            run::build_provider(&cfg)
+        });
 
     let params = smith_tui::AppParams {
         agent: std::sync::Arc::new(agent),
-        history: vec![], // the system prompt is added by the agent below
+        history: vec![Message::system(system_prompt)],
         gate_rx,
-        model_label: format!("{}:{}", config.provider, config.model),
+        workspace: workspace_canon.clone(),
         workspace_label: workspace_canon
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| workspace.display().to_string()),
+        container_label,
+        session_label,
+        provider_name,
+        model_name,
+        build_provider,
     };
 
-    // Seed history with the system prompt before the first turn.
-    let mut params_with_prompt = params;
-    let system = {
-        let agent = &params_with_prompt.agent;
-        vec![Message::system(agent.system_prompt())]
-    };
-    params_with_prompt.history = system;
-
-    let result = smith_tui::App::new(params_with_prompt).run().await;
+    let result = smith_tui::App::new(params).run().await;
 
     println!("\nsession container {container} is still running; remove it with `smith clean`");
     result
@@ -77,6 +93,29 @@ enum Command {
         #[arg(long)]
         keep: bool,
         /// Override the configured provider (`ollama` or `openai`).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Override the configured model.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Continue a previous session.
+    Resume {
+        /// Session id (or unique prefix); newest if omitted.
+        id: Option<String>,
+        /// Follow-up task to run in the resumed session.
+        #[arg(long)]
+        task: Option<String>,
+        /// Resume even though the workspace differs from the session's.
+        #[arg(long)]
+        force: bool,
+        /// Keep the session container after the run.
+        #[arg(long)]
+        keep: bool,
+        /// Workspace directory (defaults to the current directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Override the configured provider.
         #[arg(long)]
         provider: Option<String>,
         /// Override the configured model.
@@ -145,6 +184,34 @@ async fn main() -> anyhow::Result<()> {
                 outcome.container,
                 outcome.session_path.display()
             );
+        }
+        Some(Command::Resume {
+            id,
+            task,
+            force,
+            keep,
+            workspace,
+            provider,
+            model,
+        }) => {
+            let mut config = config;
+            if let Some(provider) = provider {
+                config.provider = provider;
+            }
+            if let Some(model) = model {
+                config.model = model;
+            }
+            let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+            let outcome = run::resume_headless(
+                &config,
+                &workspace,
+                id.as_deref(),
+                task.as_deref(),
+                force,
+                keep,
+            )
+            .await?;
+            println!("session log: {}", outcome.session_path.display());
         }
         Some(Command::Sessions) => {
             for (path, meta) in smith_core::list_sessions()? {
