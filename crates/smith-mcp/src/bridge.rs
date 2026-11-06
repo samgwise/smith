@@ -1,4 +1,4 @@
-//! Bridge: one MCP tool exposed as a smith [`Tool`].
+//! Bridge: one MCP tool exposed as a smith [`Tool`](smith_core::Tool).
 
 use std::time::Duration;
 

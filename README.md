@@ -8,11 +8,13 @@ code only ever runs in the container, never on your host.
 
 | Crate | Role |
 |---|---|
-| `smith-core` | Agent loop, `LlmProvider`/`ToolExecutor`/`Tool` traits, JSONL session log |
+| `smith-core` | Agent loop, `LlmProvider`/`ToolExecutor`/`Tool` traits, compaction, JSONL session log |
 | `smith-providers` | Ollama (native `/api/chat`) and OpenAI (chat completions) streaming clients |
-| `smith-sandbox` | Podman machine/container lifecycle, exec with timeouts |
-| `smith-tui` | Ratatui interface: transcript, tool activity, approval modal |
-| `smith-cli` | `smith` binary: TUI, headless runs, sandbox utilities |
+| `smith-mcp` | MCP client: stdio servers exposed as `mcp_<server>_<tool>` tools |
+| `smith-sandbox` | Podman machine/container lifecycle, exec with timeouts, egress enforcement |
+| `smith-egress` | Allowlist-filtering proxy sidecar (CONNECT filter + bundled Containerfile) |
+| `smith-tui` | Ratatui interface: transcript, tool activity, approval modal, slash commands |
+| `smith-cli` | `smith` binary: TUI, headless runs, resume, housekeeping |
 
 ## Security model (v1)
 
@@ -112,17 +114,24 @@ Interactive TUI sessions are gate-free — you verify by eye.
 # Interactive TUI (container stays up; clean later)
 smith
 
-# One-shot task, auto-approved
+# One-shot task, auto-approved, gated by the verify command
 smith run "explain what this project does"
-smith run --workspace C:\path\to\repo "fix the failing test"
+smith run --workspace C:\path\to\repo --verify "cargo test -q" "fix the failing test"
 
 # Override provider/model for one run
 smith run --provider openai "summarise the diff"
 
+# Continue a saved session (recap without a task)
+smith resume           # newest session
+smith resume abc123 --task "now add tests"
+
 # Housekeeping
-smith clean      # remove all smith session containers
+smith clean      # remove session containers, the proxy sidecar and its rules
 smith sessions   # list session logs in ~/.smith/sessions
 ```
+
+In the TUI: `/help` lists the slash commands (`/model`, `/provider`, `/diff`,
+`/sessions`, `/resume`, `/mcp`, `/quit`).
 
 Config lives at `~/.smith/config.toml` (created on first run with comments):
 
@@ -131,7 +140,8 @@ provider = "ollama"       # or "openai"
 model = "qwen3.8:27b"
 
 [sandbox]
-network = "enabled"       # "disabled" runs the container with --network=none
+network = "proxy"         # none | proxy | open
+egress_enforce = true     # nftables default-deny in the podman machine
 ```
 
 ## Development
