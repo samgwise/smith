@@ -75,6 +75,9 @@ pub struct SandboxSection {
     /// Enforce the allowlist with nftables inside the podman machine
     /// (fail closed on installation failure). Proxy mode only.
     pub egress_enforce: bool,
+    /// Clearance policy for non-allowlisted destinations: `ask` | `deny`
+    /// | `allow`. Headless runs degrade `ask` to `deny`.
+    pub egress_clearance: String,
 }
 
 impl Default for Config {
@@ -120,6 +123,7 @@ impl Default for SandboxSection {
             translate_paths: d.translate_paths,
             egress_allowlist: vec![],
             egress_enforce: d.egress_enforce,
+            egress_clearance: d.egress_clearance,
         }
     }
 }
@@ -162,6 +166,7 @@ impl Config {
             translate_paths: s.translate_paths,
             egress_allowlist: s.egress_allowlist.clone(),
             egress_enforce: s.egress_enforce,
+            egress_clearance: s.egress_clearance.clone(),
         })
     }
 }
@@ -209,7 +214,8 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              [sandbox]
              network = \"proxy\"     # none | proxy | open; proxy filters by allowlist\n\
              # egress_allowlist = [\"crates.io\", \"registry.npmjs.org\"]  # replaces defaults\n\
-             egress_enforce = true  # nftables default-deny in the machine; fail closed\n
+             egress_enforce = true  # nftables default-deny in the machine; fail closed\n\
+             egress_clearance = \"ask\"  # ask | deny | allow (non-allowlisted hosts)\n
              image = \"docker.io/library/ubuntu:24.04\"\n\
              memory = \"4g\"\n\
              cpus = \"2\"\n\

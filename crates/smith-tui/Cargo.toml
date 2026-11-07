@@ -12,5 +12,6 @@ crossterm.workspace = true
 futures.workspace = true
 ratatui.workspace = true
 smith-core.workspace = true
+smith-egress.path = "../smith-egress"
 tokio.workspace = true
 tokio-util.workspace = true

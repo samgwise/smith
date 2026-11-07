@@ -1,24 +1,39 @@
-//! smith-egress-proxy: an allowlist-filtering HTTP proxy that runs as a
-//! sidecar container inside the podman machine.
+//! smith-egress-proxy: an allowlist-filtering HTTP proxy with per-destination
+//! clearance, running as a sidecar container inside the podman machine.
 //!
+//! Data plane (port 3128):
 //! - `CONNECT host:port` (HTTPS): the hostname is checked against the
 //!   allowlist; if permitted the tunnel is opened and traffic passes through
 //!   end-to-end encrypted. No certificate interception anywhere.
 //! - Plain HTTP: the target is taken from the absolute URI / `Host` header,
 //!   filtered, then forwarded.
-//! - The allowlist arrives as `EGRESS_ALLOWLIST=host1,host2,...`; an empty
-//!   value uses the built-in defaults. Empty allowlist entries never permit
-//!   anything.
+//!
+//! Clearance (control API, port 9239, token-authenticated): a destination
+//! outside the allowlist can be held and asked — `GET /pending`, `POST
+//! /decide`, `GET|POST /mode`. Decisions: allow once, allow always
+//! (session-scoped runtime allowlist), deny.
 
 use anyhow::Context;
 use smith_egress::Allowlist;
+use smith_egress::clearance::{Clearance, ClearanceMode, Decision};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const PORT: u16 = 3128;
+const CONTROL_PORT: u16 = 9239;
 /// Head bytes buffered before deciding (requests smaller than this only).
 const HEAD_LIMIT: usize = 16 * 1024;
+/// How long a held CONNECT waits for a clearance decision.
+const CLEARANCE_WAIT: Duration = Duration::from_secs(120);
+
+struct ProxyState {
+    allowlist: Allowlist,
+    clearance: Clearance,
+    /// Bearer token for the control API; `None` disables the API.
+    token: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,25 +43,64 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let allowlist = match std::env::var("EGRESS_ALLOWLIST") {
-        Ok(value) if !value.trim().is_empty() => Allowlist::parse(&value),
+    let allowlist = match std::env::var("EGRESS_ALLOWLIST").as_deref() {
+        // "none" = empty allowlist (tests): every destination needs clearance.
+        Ok("none") => Allowlist::default(),
+        Ok(value) if !value.trim().is_empty() => Allowlist::parse(value),
         _ => Allowlist::defaults(),
     };
-    tracing::info!("egress proxy listening on :{PORT}");
+    let mode = std::env::var("EGRESS_CLEARANCE")
+        .ok()
+        .and_then(|v| ClearanceMode::parse(&v))
+        .unwrap_or(ClearanceMode::Ask);
+    let token = std::env::var("CLEARANCE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
 
-    let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
+    let state = Arc::new(ProxyState {
+        allowlist,
+        clearance: Clearance::new(mode),
+        token,
+    });
+    tracing::info!(
+        "egress proxy listening on :{PORT} (clearance mode {})",
+        state.clearance.mode().as_str()
+    );
+
+    // Reap expired pending requests periodically.
+    let reaper_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            reaper_state.clearance.reap_expired(CLEARANCE_WAIT);
+        }
+    });
+
+    let control_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err(e) = control_server(control_state).await {
+            tracing::error!("clearance control API failed: {e:#}");
+        }
+    });
+
+    let port: u16 = std::env::var("EGRESS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(PORT);
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    tracing::info!("data plane on :{port}");
     loop {
         let (client, peer) = listener.accept().await?;
-        let allowlist = allowlist.clone();
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, allowlist).await {
+            if let Err(e) = handle_connection(client, state).await {
                 tracing::debug!("connection from {peer} ended: {e:#}");
             }
         });
     }
 }
 
-async fn handle_connection(client: TcpStream, allowlist: Allowlist) -> anyhow::Result<()> {
+async fn handle_connection(client: TcpStream, state: Arc<ProxyState>) -> anyhow::Result<()> {
     let mut client = client;
     let (head, leftover) = read_head(&mut client).await?;
 
@@ -60,7 +114,7 @@ async fn handle_connection(client: TcpStream, allowlist: Allowlist) -> anyhow::R
             .rsplit_once(':')
             .map(|(h, _)| h.to_string())
             .unwrap_or_else(|| target.to_string());
-        if allowlist.allows(&host) {
+        if decide_destination(&state, &host).await != Decision::Deny {
             tracing::info!("tunnel allowed: {host}");
             client
                 .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -73,18 +127,18 @@ async fn handle_connection(client: TcpStream, allowlist: Allowlist) -> anyhow::R
             client
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await?;
-            anyhow::bail!("destination not on the allowlist: {host}")
+            anyhow::bail!("destination not cleared: {host}")
         }
     } else {
         // Plain HTTP: absolute-URI request; target host from the URI, falling
         // back to the Host header.
         let host = plain_http_host(target, &head).context("no resolvable host")?;
-        if !allowlist.allows(&host) {
+        if decide_destination(&state, &host).await == Decision::Deny {
             tracing::info!("http denied: {host}");
             client
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await?;
-            anyhow::bail!("destination not on the allowlist: {host}")
+            anyhow::bail!("destination not cleared: {host}")
         }
         tracing::info!("http allowed: {host}");
         let port = target
@@ -101,6 +155,194 @@ async fn handle_connection(client: TcpStream, allowlist: Allowlist) -> anyhow::R
         Ok(())
     }
 }
+
+/// The clearance decision for one destination: static allowlist, mode, or a
+/// held pending request answered by the controller.
+async fn decide_destination(state: &ProxyState, host: &str) -> Decision {
+    if state.clearance.is_allowed(&state.allowlist, host) {
+        return Decision::AllowOnce;
+    }
+    match state.clearance.mode() {
+        ClearanceMode::Allow => {
+            tracing::info!("clearance auto-allow: {host}");
+            Decision::AllowOnce
+        }
+        ClearanceMode::Deny => {
+            tracing::info!("clearance auto-deny: {host}");
+            Decision::Deny
+        }
+        ClearanceMode::Ask => {
+            let (id, rx) = state.clearance.create_pending(host);
+            tracing::info!("clearance requested: {host} (request {id})");
+            match tokio::time::timeout(CLEARANCE_WAIT, rx).await {
+                Ok(Ok(decision)) => decision,
+                Ok(Err(_)) | Err(_) => {
+                    tracing::info!("clearance timed out or abandoned: {host}");
+                    Decision::Deny
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------- control server --
+
+async fn control_server(state: Arc<ProxyState>) -> anyhow::Result<()> {
+    let port: u16 = std::env::var("EGRESS_CONTROL_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(CONTROL_PORT);
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    tracing::info!("clearance control API on :{port}");
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = handle_control(stream, state).await {
+                tracing::debug!("control connection ended: {e:#}");
+            }
+        });
+    }
+}
+
+async fn handle_control(stream: TcpStream, state: Arc<ProxyState>) -> anyhow::Result<()> {
+    let mut stream = stream;
+    let (head, leftover) = read_head(&mut stream).await?;
+
+    // Token auth: every control route requires it.
+    let expected = state
+        .token
+        .clone()
+        .context("control API disabled (no token)")?;
+    let authorised = head.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("authorization")
+                && v.trim().trim_start_matches("Bearer ") == expected
+        })
+    });
+    if !authorised {
+        return http_reply(&mut stream, 401, "{\"error\":\"unauthorised\"}").await;
+    }
+
+    let request_line = head.lines().next().context("empty request")?.to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().context("no method")?.to_ascii_lowercase();
+    let path = parts
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    match (method.as_str(), path.as_str()) {
+        ("get", "/pending") => {
+            let list: Vec<serde_json::Value> = state
+                .clearance
+                .pending_list()
+                .into_iter()
+                .map(|(id, host)| serde_json::json!({ "id": id, "host": host }))
+                .collect();
+            http_reply(&mut stream, 200, &serde_json::to_string(&list)?).await
+        }
+        ("post", "/decide") => {
+            let body = body_bytes(&mut stream, &head, leftover).await?;
+            let v: serde_json::Value = serde_json::from_slice(&body).context("bad JSON body")?;
+            let id = v
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .context("missing id")?;
+            let decision = v
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                .context("missing decision")?;
+            let decision = match decision {
+                "allow" => Decision::AllowOnce,
+                "always" => Decision::AllowAlways,
+                "deny" => Decision::Deny,
+                other => anyhow::bail!("unknown decision `{other}`"),
+            };
+            let applied = state.clearance.decide(id, decision);
+            http_reply(
+                &mut stream,
+                200,
+                &serde_json::json!({ "applied": applied }).to_string(),
+            )
+            .await
+        }
+        ("post", "/mode") => {
+            let body = body_bytes(&mut stream, &head, leftover).await?;
+            let v: serde_json::Value = serde_json::from_slice(&body).context("bad JSON body")?;
+            let mode = v
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .context("missing mode")?;
+            let mode = ClearanceMode::parse(mode).context("unknown mode")?;
+            state.clearance.set_mode(mode);
+            http_reply(
+                &mut stream,
+                200,
+                &serde_json::json!({ "mode": mode.as_str() }).to_string(),
+            )
+            .await
+        }
+        ("get", "/mode") => {
+            http_reply(
+                &mut stream,
+                200,
+                &serde_json::json!({ "mode": state.clearance.mode().as_str() }).to_string(),
+            )
+            .await
+        }
+        _ => http_reply(&mut stream, 404, "{\"error\":\"not found\"}").await,
+    }
+}
+
+async fn http_reply(stream: &mut TcpStream, status: u16, body: &str) -> anyhow::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        _ => "Bad Request",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+/// Read the request body (Content-Length bytes) beyond the already-buffered
+/// leftover.
+async fn body_bytes(
+    stream: &mut TcpStream,
+    head: &str,
+    mut leftover: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    let content_length: usize = head
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, v)| v.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    let mut body = std::mem::take(&mut leftover);
+    while body.len() < content_length {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            anyhow::bail!("connection closed mid-body");
+        }
+        body.extend_from_slice(&buf[..n]);
+    }
+    body.truncate(content_length);
+    Ok(body)
+}
+
+// ------------------------------------------------------------ shared io --
 
 /// Read until the end of the HTTP head (\r\n\r\n), returning the head string
 /// plus any body bytes already buffered.

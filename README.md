@@ -56,6 +56,24 @@ ruleset cannot be installed, the session refuses to start (escape hatch:
 `egress_enforce = false`). Machine reboots clear the rules; the next session
 reinstalls them. `smith clean` removes the sidecar and the table.
 
+### Per-destination clearance
+
+When the container reaches a host outside the allowlist, the connection is
+held and (by default) you are asked live: the same modal as tool approvals,
+with `y` once / `a` for the session / `n` deny. `a` adds the host to a
+session-scoped runtime allowlist — no prompt again for that host until the
+sidecar restarts.
+
+```toml
+[sandbox]
+egress_clearance = "ask"   # ask (TUI modal) | deny (auto-deny) | allow
+```
+
+Headless runs degrade `ask` to `deny` (nothing is attached to answer the
+modal) unless you set `allow`. The clearance API on the sidecar is
+localhost-published and token-authenticated (token in
+`~/.smith/egress-token`); held connections time out to deny after 120 s.
+
 ## Project instructions and system prompt
 
 The system prompt is built once per session and byte-stable afterwards (so

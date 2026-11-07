@@ -1773,6 +1773,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smith-core",
+ "smith-egress",
  "smith-mcp",
  "smith-providers",
  "smith-sandbox",
@@ -1807,6 +1808,8 @@ name = "smith-egress"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1864,6 +1867,7 @@ dependencies = [
  "futures",
  "ratatui",
  "smith-core",
+ "smith-egress",
  "tokio",
  "tokio-util",
 ]

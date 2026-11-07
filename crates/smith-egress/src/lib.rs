@@ -4,6 +4,9 @@
 //! and permits only destinations on the allowlist. HTTPS is filtered from the
 //! `CONNECT` request line — traffic stays end-to-end encrypted (no MITM).
 
+pub mod clearance;
+pub mod client;
+
 /// Destinations reachable by default: package registries and VCS hosts the
 /// agent commonly needs. Replaceable via `sandbox.egress_allowlist`.
 pub const DEFAULT_ALLOWLIST: &[&str] = &[

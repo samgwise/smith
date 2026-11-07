@@ -24,6 +24,7 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
     let logger = SessionLogger::new(&workspace_canon, &config.provider, &config.model)?;
     println!("session: {}", logger.path.display());
     let session_label = logger.meta.id.chars().take(8).collect::<String>();
+    run::set_clearance_mode(config, true);
 
     // MCP servers: connected for the whole TUI session, tools added to the
     // registry once (cache-stable), shut down when the session ends.
@@ -96,6 +97,9 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
 #[derive(Parser)]
 #[command(name = "smith", about = "Podman-sandboxed coding agent", version)]
 struct Cli {
+    /// Network mode override for the TUI session: none | proxy | open.
+    #[arg(long)]
+    network: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -207,7 +211,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    if let Some(network) = &cli.network {
+        config.sandbox.network = network.clone();
+    }
     config::ensure_example_config()?;
 
     match cli.command {

@@ -31,6 +31,8 @@ pub const EGRESS_NETWORK: &str = "smith-egress";
 pub const EGRESS_SIDECAR: &str = "smith-egress-proxy";
 pub const EGRESS_IMAGE: &str = "localhost/smith-egress:0.1";
 pub const PROXY_PORT: u16 = 3128;
+/// Clearance control API port (published on host loopback only).
+pub const CLEARANCE_PORT: u16 = 9239;
 
 impl NetworkMode {
     fn podman_args(&self) -> &'static [&'static str] {
@@ -65,6 +67,9 @@ pub struct SandboxConfig {
     /// Enforce the allowlist with nftables inside the podman machine
     /// (fail closed when installation fails). Proxy mode only.
     pub egress_enforce: bool,
+    /// Clearance policy for non-allowlisted destinations in proxy mode:
+    /// `ask` | `deny` | `allow`.
+    pub egress_clearance: String,
 }
 
 impl Default for SandboxConfig {
@@ -79,6 +84,7 @@ impl Default for SandboxConfig {
             translate_paths: false,
             egress_allowlist: vec![],
             egress_enforce: true,
+            egress_clearance: "ask".to_string(),
         }
     }
 }
@@ -255,8 +261,14 @@ impl Sandbox {
         };
         let mount = format!("{host_mount}:/workspace");
 
-        // Create the non-root `dev` user on first boot, then idle forever.
-        let boot = "useradd -m -s /bin/bash dev >/dev/null 2>&1 || true; exec sleep infinity";
+        // Create the non-root `dev` user, then idle forever. In the
+        // background (as root, via the allowlisted ubuntu mirrors) install
+        // curl + git + CAs — the base image has none of them and the agent
+        // (non-root) cannot install anything itself.
+        let boot = "useradd -m -s /bin/bash dev >/dev/null 2>&1 || true; \
+            (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+             curl git ca-certificates) >/dev/null 2>&1 & \
+            exec sleep infinity";
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
@@ -359,6 +371,8 @@ impl Sandbox {
     /// The sidecar survives across sessions; `smith clean` removes it.
     /// Exposed for `doctor --fix`.
     pub async fn ensure_sidecar(&self) -> anyhow::Result<()> {
+        let token = write_clearance_token()?;
+        let clearance = self.config.egress_clearance.clone();
         let image_exists = self.run_podman(&["image", "exists", EGRESS_IMAGE]).await?;
         if !image_exists.status.success() {
             tracing::info!("building egress proxy image (one-time, a few minutes)");
@@ -392,9 +406,38 @@ impl Sandbox {
                 .run_podman(&["inspect", "-f", "{{.State.Running}}", EGRESS_SIDECAR])
                 .await?;
             if String::from_utf8_lossy(&state.stdout).trim() == "true" {
-                return Ok(());
+                // Mode changes need a sidecar restart (the env is fixed at
+                // container start).
+                let mode_env = self
+                    .run_podman(&[
+                        "inspect",
+                        "-f",
+                        "{{range .Config.Env}}{{println .}}{{end}}",
+                        EGRESS_SIDECAR,
+                    ])
+                    .await?;
+                let env_lines: Vec<String> = String::from_utf8_lossy(&mode_env.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                let current_mode = env_lines
+                    .iter()
+                    .find_map(|l| l.strip_prefix("EGRESS_CLEARANCE="))
+                    .unwrap_or("ask")
+                    .to_string();
+                // Pre-clearance sidecars have no token env and no published
+                // control port; they must be recreated, not reused.
+                let has_token = env_lines.iter().any(|l| l.starts_with("CLEARANCE_TOKEN="));
+                if current_mode == clearance && has_token {
+                    return Ok(());
+                }
+                tracing::info!(
+                    "clearance mode changed {current_mode} -> {clearance}; restarting sidecar"
+                );
+                let _ = self.run_podman(&["rm", "-f", EGRESS_SIDECAR]).await?;
+            } else {
+                let _ = self.run_podman(&["rm", "-f", EGRESS_SIDECAR]).await?;
             }
-            let _ = self.run_podman(&["rm", "-f", EGRESS_SIDECAR]).await?;
         }
 
         let allowlist = if self.config.egress_allowlist.is_empty() {
@@ -413,8 +456,14 @@ impl Sandbox {
                 EGRESS_NETWORK,
                 "--ip",
                 enforce::EGRESS_PROXY_IP,
+                "-p",
+                &format!("127.0.0.1:{PROXY_PORT}:{CLEARANCE_PORT}"),
                 "-e",
                 &format!("EGRESS_ALLOWLIST={allowlist}"),
+                "-e",
+                &format!("EGRESS_CLEARANCE={clearance}"),
+                "-e",
+                &format!("CLEARANCE_TOKEN={token}"),
                 EGRESS_IMAGE,
             ])
             .await?;
@@ -761,6 +810,26 @@ impl Sandbox {
         }
         Ok(())
     }
+}
+
+/// Generate (or reuse) the clearance token and write it to
+/// `~/.smith/egress-token`. All local smith sessions read this to talk to
+/// the sidecar's control API.
+fn write_clearance_token() -> anyhow::Result<String> {
+    let dir = dirs::home_dir()
+        .context("cannot resolve home directory")?
+        .join(".smith");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("egress-token");
+    let token = match std::fs::read_to_string(&path) {
+        Ok(existing) if !existing.trim().is_empty() => existing.trim().to_string(),
+        _ => {
+            let token = uuid::Uuid::new_v4().simple().to_string();
+            std::fs::write(&path, &token).with_context(|| format!("writing {}", path.display()))?;
+            token
+        }
+    };
+    Ok(token)
 }
 
 /// Drain piped stdout of a spawned child into a string. Used after the child has

@@ -82,6 +82,8 @@ pub struct App {
     mcp_status: Vec<String>,
     /// Last Ctrl+C while busy (quit-with-second-press flow).
     last_ctrl_c: Option<Instant>,
+    /// Egress clearance requests waiting for the modal to free up.
+    egress_queue: Vec<(u64, String)>,
     status_note: String,
     should_quit: bool,
 }
@@ -113,6 +115,7 @@ impl App {
             build_provider: params.build_provider,
             mcp_status: params.mcp_status,
             last_ctrl_c: None,
+            egress_queue: vec![],
             status_note: String::new(),
             should_quit: false,
         }
@@ -141,6 +144,30 @@ impl App {
 
         let mut terminal = ui::setup().context("failed to enter terminal UI mode")?;
 
+        // Egress clearance poller: surfaces pending destinations as modals.
+        let (egress_tx, mut egress_rx) = mpsc::unbounded_channel::<(u64, String)>();
+        if let Some(token) = smith_egress::client::read_token() {
+            tokio::spawn(async move {
+                let mut seen: Vec<u64> = vec![];
+                loop {
+                    if let Ok(pending) = smith_egress::client::get_pending(
+                        smith_egress::client::CLEARANCE_CONTROL_PORT,
+                        &token,
+                    ) {
+                        for (id, host) in pending {
+                            if !seen.contains(&id) {
+                                seen.push(id);
+                                if egress_tx.send((id, host)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+            });
+        }
+
         loop {
             ui::draw(&mut terminal, &self)?;
 
@@ -161,6 +188,12 @@ impl App {
                     match key {
                         Some(k) => self.handle_key(k).await,
                         None => break,
+                    }
+                }
+                egress = egress_rx.recv() => {
+                    if let Some((id, host)) = egress {
+                        self.egress_queue.push((id, host));
+                        self.promote_next_egress();
                     }
                 }
             }
@@ -442,6 +475,42 @@ impl App {
         }
     }
 
+    /// Show the next queued egress clearance modal if none is open, wiring
+    /// the reply channel to a decide POST.
+    fn promote_next_egress(&mut self) {
+        if self.pending_approval.is_some() {
+            return; // modal busy; the queue drains when it frees
+        }
+        let Some((id, host)) = (!self.egress_queue.is_empty()).then(|| self.egress_queue.remove(0))
+        else {
+            return;
+        };
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        self.pending_approval = Some((
+            ApprovalRequest {
+                tool: "egress".into(),
+                detail: host.clone(),
+            },
+            reply_tx,
+        ));
+        self.status_note = format!("egress clearance: {host}");
+        tokio::spawn(async move {
+            if let Some(decision) = reply_rx.recv().await {
+                let decision = match decision {
+                    ApprovalDecision::AllowOnce => "allow",
+                    ApprovalDecision::AllowAlways => "always",
+                    ApprovalDecision::Deny => "deny",
+                };
+                let _ = smith_egress::client::post_decide(
+                    smith_egress::client::CLEARANCE_CONTROL_PORT,
+                    &smith_egress::client::read_token().unwrap_or_default(),
+                    id,
+                    decision,
+                );
+            }
+        });
+    }
+
     /// Load a session's history into the app (used by /resume).
     async fn load_session_for_resume(&mut self, prefix: &str) -> anyhow::Result<(String, usize)> {
         let sessions = list_sessions()?;
@@ -614,6 +683,8 @@ impl App {
         match modal_decision(key) {
             Some(decision) => {
                 let _ = reply.send(decision);
+                // The modal freed: surface the next queued egress request.
+                self.promote_next_egress();
                 true
             }
             None => {

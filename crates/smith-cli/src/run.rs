@@ -76,6 +76,7 @@ pub async fn run_headless(
 ) -> anyhow::Result<RunOutcome> {
     let (sandbox, executor) = start_executor(config, workspace).await?;
     let container = executor.session().name.clone();
+    set_clearance_mode(config, false);
 
     let logger = SessionLogger::new(
         &executor.session().workspace_host,
@@ -181,6 +182,7 @@ pub async fn resume_headless(
 
     let (sandbox, executor) = start_executor(config, workspace).await?;
     let container = executor.session().name.clone();
+    set_clearance_mode(config, false);
 
     let logger = smith_core::SessionLogger::open_for_append(&path)?;
     println!("resumed session {} ({})", meta.id, path.display());
@@ -265,6 +267,30 @@ fn environment_notes(config: &Config) -> String {
         Err(e) => return format!("network: unknown ({e:#})"),
     };
     format!("Network mode: {egress}")
+}
+
+/// Set the sidecar clearance mode for a headless run: `ask` degrades to
+/// `deny` (nothing is attached to answer the modal); `allow` is honoured.
+/// Best-effort: a missing sidecar/token just keeps the sidecar default.
+pub fn set_clearance_mode(config: &Config, interactive: bool) {
+    let effective = match config.sandbox.egress_clearance.as_str() {
+        "allow" => "allow",
+        "deny" => "deny",
+        _ if interactive => "ask",
+        _ => {
+            println!("[clearance] ask degraded to deny for this headless run");
+            "deny"
+        }
+    };
+    if let Some(token) = smith_egress::client::read_token()
+        && let Err(e) = smith_egress::client::set_mode(
+            smith_egress::client::CLEARANCE_CONTROL_PORT,
+            &token,
+            effective,
+        )
+    {
+        tracing::debug!("clearance mode not set: {e:#}");
+    }
 }
 
 /// Load layered MCP config (user + workspace) and connect; never fatal.
