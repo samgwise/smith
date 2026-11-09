@@ -14,6 +14,11 @@ use smith_sandbox::{Sandbox, Session};
 /// Files larger than this are refused by `read_file` (pathological sizes;
 /// normal large files are paged instead).
 const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Single-quote a path for safe embedding in a shell command.
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
 /// Lines returned per page when `limit` is not given.
 const DEFAULT_PAGE_LINES: u64 = 2000;
 
@@ -22,15 +27,20 @@ pub struct LocalExecutor {
     session: Session,
     /// Canonicalised host workspace root.
     root: PathBuf,
+    /// Remote mode: file ops go through `podman cp`/`exec` instead of the
+    /// local filesystem (the workspace lives on the remote host).
+    remote: bool,
 }
 
 impl LocalExecutor {
     pub fn new(sandbox: Arc<Sandbox>, session: Session) -> Self {
+        let remote = sandbox.config.podman_connection.is_some();
         let root = session.workspace_host.clone();
         Self {
             sandbox,
             session,
             root,
+            remote,
         }
     }
 
@@ -107,6 +117,9 @@ impl ToolExecutor for LocalExecutor {
         limit: Option<u64>,
     ) -> anyhow::Result<FileContents> {
         use std::io::BufRead;
+        if self.remote {
+            return self.read_file_remote(path, offset, limit).await;
+        }
         let host = self.resolve(path)?;
         let meta = std::fs::metadata(&host).with_context(|| format!("stat {path}"))?;
         if meta.is_dir() {
@@ -140,6 +153,9 @@ impl ToolExecutor for LocalExecutor {
     }
 
     async fn write_file(&self, path: &str, contents: &str) -> anyhow::Result<()> {
+        if self.remote {
+            return self.write_file_remote(path, contents).await;
+        }
         let host = self.resolve(path)?;
         if let Some(parent) = host.parent() {
             std::fs::create_dir_all(parent)
@@ -149,6 +165,9 @@ impl ToolExecutor for LocalExecutor {
     }
 
     async fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
+        if self.remote {
+            return self.list_dir_remote(path).await;
+        }
         let host = self.resolve(path)?;
         let meta = std::fs::metadata(&host).with_context(|| format!("stat {path}"))?;
         if !meta.is_dir() {
@@ -171,6 +190,160 @@ impl ToolExecutor for LocalExecutor {
 
     fn workspace_root(&self) -> &str {
         self.session.workspace_container
+    }
+}
+
+// ------------------------------------------------------- remote mode --
+
+impl LocalExecutor {
+    /// Container-side path for a workspace-relative request (remote mode:
+    /// the local `resolve` cannot validate a path that lives on the remote
+    /// host, so path safety = the container's own mount + relative-only).
+    fn container_path(&self, raw: &str) -> anyhow::Result<String> {
+        let rel = raw.trim();
+        anyhow::ensure!(!rel.is_empty(), "empty path");
+        // Accept /workspace-rooted absolute paths; reject everything else.
+        let rel = rel
+            .strip_prefix("/workspace")
+            .map(|rest| rest.trim_start_matches(['/']))
+            .unwrap_or(rel);
+        anyhow::ensure!(
+            !rel.split(['/', '\\']).any(|seg| seg == ".."),
+            "path must not traverse outside the workspace: {raw}"
+        );
+        Ok(if rel.is_empty() || rel == "." {
+            "/workspace".to_string()
+        } else {
+            format!("/workspace/{rel}")
+        })
+    }
+
+    /// `cat` the file over the exec channel, then page locally. (Remote
+    /// `podman cp` is server-side and cannot reach the client machine.)
+    async fn read_file_remote(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> anyhow::Result<FileContents> {
+        let container_path = self.container_path(path)?;
+        let stat = self
+            .sandbox
+            .exec_as(
+                &self.session,
+                Some("root"),
+                &format!("stat -c %s '{container_path}'"),
+                None,
+            )
+            .await?;
+        let size: u64 = stat.stdout.trim().parse().unwrap_or(u64::MAX);
+        if size > MAX_READ_BYTES {
+            bail!("{path} is larger than 16 MiB; use the shell tool (grep/sed) instead");
+        }
+
+        let content = self
+            .sandbox
+            .exec_as(
+                &self.session,
+                None,
+                &format!("cat '{container_path}'"),
+                None,
+            )
+            .await?;
+        anyhow::ensure!(
+            content.exit_code == 0,
+            "reading {path} failed: {}",
+            content.stderr
+        );
+
+        let start = offset.unwrap_or(1).max(1);
+        let page = limit.unwrap_or(DEFAULT_PAGE_LINES).max(1);
+        let total_lines = content.stdout.lines().count() as u64;
+        let page_lines: Vec<&str> = content
+            .stdout
+            .lines()
+            .skip((start - 1) as usize)
+            .take(page as usize)
+            .collect();
+        let truncated = start + page_lines.len() as u64 <= total_lines;
+        Ok(FileContents {
+            text: page_lines.join("\n"),
+            start_line: start,
+            total_lines,
+            truncated,
+        })
+    }
+
+    /// Feed the content via stdin: `cat > path`, then fix ownership.
+    async fn write_file_remote(&self, path: &str, contents: &str) -> anyhow::Result<()> {
+        let container_path = self.container_path(path)?;
+        let parent = container_path
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let quoted_parent = shell_quote(&parent);
+        let mkdir = self
+            .sandbox
+            .exec_as(
+                &self.session,
+                Some("root"),
+                &format!("mkdir -p {quoted_parent}"),
+                None,
+            )
+            .await?;
+        anyhow::ensure!(
+            mkdir.exit_code == 0,
+            "creating parent dir for {path} failed: {}",
+            mkdir.stderr
+        );
+
+        let write = self
+            .sandbox
+            .exec_stdin_as(
+                &self.session,
+                Some("root"),
+                &format!("cat > {}", shell_quote(&container_path)),
+                contents,
+                None,
+            )
+            .await?;
+        anyhow::ensure!(
+            write.exit_code == 0,
+            "writing {path} failed: {}",
+            write.stderr
+        );
+        // Keep the file editable by the non-root agent user.
+        let _ = self
+            .sandbox
+            .exec_as(
+                &self.session,
+                Some("root"),
+                &format!("chown dev:dev {}", shell_quote(&container_path)),
+                None,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// `ls -1ap` inside the container: names, `/`-suffixed directories.
+    async fn list_dir_remote(&self, path: &str) -> anyhow::Result<Vec<String>> {
+        let container_path = self.container_path(path)?;
+        let out = self
+            .sandbox
+            .exec_as(
+                &self.session,
+                None,
+                &format!("ls -1ap -- {}", shell_quote(&container_path)),
+                None,
+            )
+            .await?;
+        anyhow::ensure!(out.exit_code == 0, "ls {path} failed: {}", out.stderr);
+        Ok(out
+            .stdout
+            .lines()
+            .filter(|l| !l.is_empty() && *l != "./" && *l != "../")
+            .map(str::to_string)
+            .collect())
     }
 }
 

@@ -78,6 +78,10 @@ pub struct SandboxSection {
     /// Clearance policy for non-allowlisted destinations: `ask` | `deny`
     /// | `allow`. Headless runs degrade `ask` to `deny`.
     pub egress_clearance: String,
+    /// Podman system connection name for remote execution (None = local).
+    pub podman_connection: Option<String>,
+    /// Workspace path on the remote host (required when connected).
+    pub remote_workspace: Option<String>,
 }
 
 impl Default for Config {
@@ -124,6 +128,8 @@ impl Default for SandboxSection {
             egress_allowlist: vec![],
             egress_enforce: d.egress_enforce,
             egress_clearance: d.egress_clearance,
+            podman_connection: d.podman_connection,
+            remote_workspace: d.remote_workspace,
         }
     }
 }
@@ -167,6 +173,8 @@ impl Config {
             egress_allowlist: s.egress_allowlist.clone(),
             egress_enforce: s.egress_enforce,
             egress_clearance: s.egress_clearance.clone(),
+            podman_connection: s.podman_connection.clone(),
+            remote_workspace: s.remote_workspace.clone(),
         })
     }
 }
@@ -215,7 +223,10 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              network = \"proxy\"     # none | proxy | open; proxy filters by allowlist\n\
              # egress_allowlist = [\"crates.io\", \"registry.npmjs.org\"]  # replaces defaults\n\
              egress_enforce = true  # nftables default-deny in the machine; fail closed\n\
-             egress_clearance = \"ask\"  # ask | deny | allow (non-allowlisted hosts)\n
+             egress_clearance = \"ask\"  # ask | deny | allow (non-allowlisted hosts)\n\
+             # remote execution: a podman system connection name + workspace path on that host\n\
+             # podman_connection = \"gpu-box\"\n\
+             # remote_workspace = \"/home/user/project\"\n
              image = \"docker.io/library/ubuntu:24.04\"\n\
              memory = \"4g\"\n\
              cpus = \"2\"\n\

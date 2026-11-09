@@ -125,6 +125,12 @@ enum Command {
         /// Headless verify command (overrides config; empty disables).
         #[arg(long)]
         verify: Option<String>,
+        /// Podman system connection for remote execution.
+        #[arg(long)]
+        connection: Option<String>,
+        /// Workspace path on the remote host.
+        #[arg(long)]
+        remote_workspace: Option<String>,
     },
     /// Continue a previous session.
     Resume {
@@ -151,6 +157,12 @@ enum Command {
         /// Headless verify command (overrides config; empty disables).
         #[arg(long)]
         verify: Option<String>,
+        /// Podman system connection for remote execution.
+        #[arg(long)]
+        connection: Option<String>,
+        /// Workspace path on the remote host.
+        #[arg(long)]
+        remote_workspace: Option<String>,
     },
     /// Diagnose the environment (read-only; --fix repairs, --deep runs round trips).
     Doctor {
@@ -171,6 +183,12 @@ enum Command {
         /// Network mode override for the run: none | proxy | open.
         #[arg(long)]
         network: Option<String>,
+        /// Podman system connection for remote execution.
+        #[arg(long)]
+        connection: Option<String>,
+        /// Workspace path on the remote host.
+        #[arg(long)]
+        remote_workspace: Option<String>,
     },
     /// List recent sessions.
     Sessions,
@@ -229,6 +247,8 @@ async fn main() -> anyhow::Result<()> {
             provider,
             model,
             verify,
+            connection,
+            remote_workspace,
         }) => {
             let mut config = config;
             if let Some(provider) = provider {
@@ -239,6 +259,12 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(verify) = verify {
                 config.verify.command = verify;
+            }
+            if let Some(connection) = connection {
+                config.sandbox.podman_connection = Some(connection);
+            }
+            if let Some(remote_workspace) = remote_workspace {
+                config.sandbox.remote_workspace = Some(remote_workspace);
             }
             let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
             let outcome = run::run_headless(&config, &workspace, &task, keep).await?;
@@ -257,6 +283,8 @@ async fn main() -> anyhow::Result<()> {
             provider,
             model,
             verify,
+            connection,
+            remote_workspace,
         }) => {
             let mut config = config;
             if let Some(provider) = provider {
@@ -267,6 +295,12 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(verify) = verify {
                 config.verify.command = verify;
+            }
+            if let Some(connection) = connection {
+                config.sandbox.podman_connection = Some(connection);
+            }
+            if let Some(remote_workspace) = remote_workspace {
+                config.sandbox.remote_workspace = Some(remote_workspace);
             }
             let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
             let outcome = run::resume_headless(
@@ -287,10 +321,21 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(code);
             }
         }
-        Some(Command::Conformance { json, network }) => {
+        Some(Command::Conformance {
+            json,
+            network,
+            connection,
+            remote_workspace,
+        }) => {
             let mut config = config;
             if let Some(network) = network {
                 config.sandbox.network = network;
+            }
+            if let Some(connection) = connection {
+                config.sandbox.podman_connection = Some(connection);
+            }
+            if let Some(remote_workspace) = remote_workspace {
+                config.sandbox.remote_workspace = Some(remote_workspace);
             }
             let workspace = std::env::current_dir().context("cannot resolve working directory")?;
             let code = doctor::run_and_print(&config, workspace, true, true, json).await;

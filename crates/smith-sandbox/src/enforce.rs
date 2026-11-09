@@ -10,6 +10,7 @@
 //! accepted only when the source is the proxy's pinned IP; everything else
 //! (including IPv6 and IP-literal dials) drops.
 
+use anyhow::Context as _;
 use base64::Engine as _;
 
 /// Fixed addressing for the egress network.
@@ -44,6 +45,24 @@ pub fn encode_payload(ruleset: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(ruleset)
 }
 
+/// Parse a podman connection URI (`ssh://user@host:port/socket`) into
+/// `(user, host, port)` for the SshHost enforcement transport.
+pub fn ssh_target_from_uri(uri: &str) -> anyhow::Result<(String, String, u16)> {
+    let rest = uri
+        .strip_prefix("ssh://")
+        .with_context(|| format!("unsupported connection URI (need ssh): {uri}"))?;
+    let (user, hostport) = rest
+        .split_once('@')
+        .with_context(|| format!("connection URI has no user: {uri}"))?;
+    let hostport = hostport.split('/').next().unwrap_or(hostport);
+    let (host, port) = hostport
+        .rsplit_once(':')
+        .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(22)))
+        .unwrap_or_else(|| (hostport.to_string(), 22));
+    anyhow::ensure!(!host.is_empty(), "connection URI has no host: {uri}");
+    Ok((user.to_string(), host, port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +86,21 @@ mod tests {
         let twice = format!("{once}{once}");
         assert_eq!(twice.lines().count(), once.lines().count() * 2);
         assert!(delete_command().ends_with("delete table inet smith-egress"));
+    }
+
+    #[test]
+    fn parses_ssh_connection_uris() {
+        assert_eq!(
+            ssh_target_from_uri("ssh://user@127.0.0.1:59921/run/user/1000/podman/podman.sock")
+                .unwrap(),
+            ("user".into(), "127.0.0.1".into(), 59921)
+        );
+        assert_eq!(
+            ssh_target_from_uri("ssh://sam@gpu-box.local/run/podman/podman.sock").unwrap(),
+            ("sam".into(), "gpu-box.local".into(), 22)
+        );
+        assert!(ssh_target_from_uri("unix:///run/podman/podman.sock").is_err());
+        assert!(ssh_target_from_uri("ssh://host-only/socket").is_err());
     }
 
     #[test]

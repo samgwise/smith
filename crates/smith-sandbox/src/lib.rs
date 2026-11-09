@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -70,6 +71,10 @@ pub struct SandboxConfig {
     /// Clearance policy for non-allowlisted destinations in proxy mode:
     /// `ask` | `deny` | `allow`.
     pub egress_clearance: String,
+    /// Podman system connection name (remote execution). `None` = local.
+    pub podman_connection: Option<String>,
+    /// Workspace path on the remote host (required when connected).
+    pub remote_workspace: Option<String>,
 }
 
 impl Default for SandboxConfig {
@@ -85,6 +90,8 @@ impl Default for SandboxConfig {
             egress_allowlist: vec![],
             egress_enforce: true,
             egress_clearance: "ask".to_string(),
+            podman_connection: None,
+            remote_workspace: None,
         }
     }
 }
@@ -125,9 +132,16 @@ impl Sandbox {
     }
 
     /// Run the podman CLI and capture output (exposed for diagnostics).
+    /// Prepends `--connection <name>` when a remote connection is set.
     pub async fn run_podman(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
+        let mut full: Vec<&str> = vec![];
+        if let Some(connection) = &self.config.podman_connection {
+            full.push("--connection");
+            full.push(connection);
+        }
+        full.extend_from_slice(args);
         Command::new(&self.podman)
-            .args(args)
+            .args(full)
             .output()
             .await
             .context("failed to spawn the podman CLI (is it on PATH?)")
@@ -210,9 +224,25 @@ impl Sandbox {
 
     /// Start a session container with the workspace bind-mounted.
     pub async fn start_session(&self, workspace: &Path) -> anyhow::Result<Session> {
-        let canon = dunce::canonicalize(workspace)
-            .with_context(|| format!("canonicalising workspace {}", workspace.display()))?;
-        self.refuse_sensitive_workspace(&canon)?;
+        // Remote mode: the workspace path is a path on the remote host —
+        // no local canonicalisation, and only sanity checks apply.
+        let remote = self.config.podman_connection.is_some();
+        let canon = if remote {
+            let remote_path = self
+                .config
+                .remote_workspace
+                .clone()
+                .context("a remote connection needs sandbox.remote_workspace set")?;
+            if !remote_path.starts_with('/') {
+                bail!("remote_workspace must be an absolute path on the remote host");
+            }
+            PathBuf::from(remote_path)
+        } else {
+            let canon = dunce::canonicalize(workspace)
+                .with_context(|| format!("canonicalising workspace {}", workspace.display()))?;
+            self.refuse_sensitive_workspace(&canon)?;
+            canon
+        };
 
         // Ensure the image is available before creating the container.
         let exists = self
@@ -253,7 +283,10 @@ impl Sandbox {
 
         let name = format!("smith-{}", uuid::Uuid::new_v4().simple());
         let pids_limit = self.config.pids_limit.to_string();
-        let host_mount = if self.config.translate_paths {
+        let host_mount = if remote {
+            // A path on the remote host: already POSIX, no translation.
+            canon.display().to_string()
+        } else if self.config.translate_paths {
             to_wsl_path(&canon)?
         } else {
             // Use the plain (non-UNC) Windows path; podman handles drive-letter mounts.
@@ -488,6 +521,19 @@ impl Sandbox {
         self.exec_as(session, None, command, timeout_dur).await
     }
 
+    /// Execute with stdin fed to the command (remote file writes use this).
+    pub async fn exec_stdin_as(
+        &self,
+        session: &Session,
+        user: Option<&str>,
+        command: &str,
+        stdin: &str,
+        timeout_dur: Option<Duration>,
+    ) -> anyhow::Result<ExecOutcome> {
+        self.exec_inner(session, user, command, timeout_dur, Some(stdin.as_bytes()))
+            .await
+    }
+
     /// Execute as an explicit user (`None` = the non-root `dev` user).
     pub async fn exec_as(
         &self,
@@ -496,13 +542,32 @@ impl Sandbox {
         command: &str,
         timeout_dur: Option<Duration>,
     ) -> anyhow::Result<ExecOutcome> {
+        self.exec_inner(session, user, command, timeout_dur, None)
+            .await
+    }
+
+    async fn exec_inner(
+        &self,
+        session: &Session,
+        user: Option<&str>,
+        command: &str,
+        timeout_dur: Option<Duration>,
+        stdin: Option<&[u8]>,
+    ) -> anyhow::Result<ExecOutcome> {
         let timeout_dur = timeout_dur.unwrap_or(self.config.exec_timeout);
         // Slightly generous outer guard: the in-container `timeout` should fire first.
         let outer = timeout_dur + Duration::from_secs(10);
 
         let secs = timeout_dur.as_secs().max(1).to_string();
-        let args = [
+        let mut args: Vec<&str> = vec![];
+        if let Some(connection) = &self.config.podman_connection {
+            args.push("--connection");
+            args.push(connection);
+        }
+        args.extend_from_slice(&[
             "exec",
+            // -i: keep stdin attached — required for exec_stdin_as.
+            "-i",
             "--user",
             user.unwrap_or("dev"),
             "--workdir",
@@ -513,47 +578,64 @@ impl Sandbox {
             "sh",
             "-c",
             command,
-        ];
+        ]);
 
         let started = Instant::now();
         let mut child = Command::new(&self.podman)
-            .args(args)
+            .args(&args)
+            .kill_on_drop(true)
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .context("failed to spawn `podman exec`")?;
 
-        let timed_out = match timeout(outer, child.wait()).await {
-            Ok(Ok(status)) => {
-                let code = status.code().unwrap_or(-1);
+        // Feed stdin from its own task: a child that never reads must not
+        // deadlock the wait, and dropping the pipe on exit closes cleanly.
+        let writer_task = child.stdin.take().map(|mut pipe| {
+            let data = stdin.map(|d| d.to_vec());
+            tokio::spawn(async move {
+                if let Some(data) = data {
+                    let _ = pipe.write_all(&data).await;
+                    let _ = pipe.shutdown().await;
+                }
+            })
+        });
+
+        let outcome = match timeout(outer, child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                let code = output.status.code().unwrap_or(-1);
                 // 124 = in-container `timeout` fired; 137 = SIGKILL.
                 let timed_out = code == 124 || code == 137;
-                let stdout = drain_piped(&mut child).await;
-                return Ok(ExecOutcome {
+                Ok(ExecOutcome {
                     exit_code: code,
-                    stdout,
-                    stderr: String::new(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                     timed_out,
                     duration: started.elapsed(),
-                });
+                })
             }
-            Ok(Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "failed while waiting for `podman exec`: {e}"
-                ));
-            }
-            Err(_) => true, // outer wall-clock guard fired
+            Ok(Err(e)) => Err(anyhow::anyhow!(
+                "failed while waiting for `podman exec`: {e}"
+            )),
+            // Outer wall-clock guard fired: the child future was dropped and
+            // kill_on_drop already killed it.
+            Err(_) => Ok(ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: true,
+                duration: started.elapsed(),
+            }),
         };
-
-        let _ = child.kill().await;
-        let stdout = drain_piped(&mut child).await;
-        Ok(ExecOutcome {
-            exit_code: -1,
-            stdout,
-            stderr: String::new(),
-            timed_out,
-            duration: started.elapsed(),
-        })
+        if let Some(task) = writer_task {
+            let _ = task.await;
+        }
+        outcome
     }
 
     /// Remove a session container.
@@ -642,10 +724,10 @@ impl Sandbox {
             .unwrap_or(false)
     }
 
-    /// Whether the enforcement table is installed in the machine (machine
-    /// must be running; errors count as not installed).
+    /// Whether the enforcement table is installed where the podman server
+    /// lives (errors count as not installed).
     pub async fn egress_table_installed(&self) -> bool {
-        self.machine_ssh(&format!(
+        self.root_shell(&format!(
             "nft list table inet {} >/dev/null 2>&1",
             enforce::EGRESS_TABLE
         ))
@@ -690,19 +772,71 @@ impl Sandbox {
             .context("no running podman machine")
     }
 
-    /// Run a shell command inside the podman machine VM (as root).
+    /// Run a shell command as root where the podman server lives: inside the
+    /// podman machine (local setups) or over SSH on the remote host
+    /// (connection mode).
     ///
-    /// `podman machine ssh` joins its arguments with spaces and runs the
-    /// result through the remote shell, so pipes inside `command` must be
-    /// protected by quoting the whole thing as one remote argument.
-    async fn machine_ssh(&self, command: &str) -> anyhow::Result<std::process::Output> {
+    /// Both transports join their arguments and run the result through a
+    /// remote shell, so pipes inside `command` are protected by quoting the
+    /// whole thing as one remote argument.
+    async fn root_shell(&self, command: &str) -> anyhow::Result<std::process::Output> {
+        let remote_shell = format!("sudo sh -c \"{command}\"");
+        if let Some(connection) = &self.config.podman_connection {
+            let (user, host, port, identity) = self.connection_ssh_target(connection).await?;
+            let mut cmd = Command::new("ssh");
+            if let Some(identity) = identity {
+                cmd.arg("-i").arg(&identity);
+            }
+            cmd.arg("-p")
+                .arg(port.to_string())
+                .arg(format!("{user}@{host}"))
+                .arg(remote_shell);
+            return cmd
+                .output()
+                .await
+                .context("failed to run ssh to the remote podman host");
+        }
         let machine = self.running_machine().await?;
-        let remote = format!("sudo sh -c \"{command}\"");
         Command::new(&self.podman)
-            .args(["machine", "ssh", &machine, "--", &remote])
+            .args(["machine", "ssh", &machine, "--", &remote_shell])
             .output()
             .await
             .context("failed to run `podman machine ssh`")
+    }
+
+    /// `(user, host, port, identity)` from a podman system connection.
+    async fn connection_ssh_target(
+        &self,
+        connection: &str,
+    ) -> anyhow::Result<(String, String, u16, Option<String>)> {
+        let out = self
+            .run_podman(&[
+                "system",
+                "connection",
+                "inspect",
+                "-f",
+                "{{.URI}}|{{.Identity}}",
+                connection,
+            ])
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "unknown podman connection `{connection}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (uri, identity) = text
+            .trim()
+            .split_once('|')
+            .map(|(u, i)| {
+                (
+                    u.to_string(),
+                    Some(i.trim().to_string()).filter(|s| !s.is_empty()),
+                )
+            })
+            .unwrap_or_else(|| (text.trim().to_string(), None));
+        let (user, host, port) = enforce::ssh_target_from_uri(&uri)?;
+        Ok((user, host, port, identity))
     }
 
     /// Install the enforcement ruleset into the machine VM. Fails closed:
@@ -724,7 +858,7 @@ impl Sandbox {
         let ruleset = enforce::ruleset(&bridge, enforce::EGRESS_PROXY_IP);
         let payload = enforce::encode_payload(&ruleset);
         let shell = format!("echo {payload} | base64 -d | nft -f /dev/stdin",);
-        let out = self.machine_ssh(&shell).await?;
+        let out = self.root_shell(&shell).await?;
         if !out.status.success() {
             bail!(
                 "failed to install egress enforcement (nft) in the podman machine: {}{}",
@@ -735,7 +869,7 @@ impl Sandbox {
         // Verify the table actually exists — a silent no-op (e.g. empty
         // ruleset input) must fail closed too.
         let verify = self
-            .machine_ssh(&format!("nft list table inet {}", enforce::EGRESS_TABLE))
+            .root_shell(&format!("nft list table inet {}", enforce::EGRESS_TABLE))
             .await?;
         if !verify.status.success() {
             bail!("egress enforcement table missing after install");
@@ -746,7 +880,7 @@ impl Sandbox {
 
     /// Best-effort removal of the enforcement table.
     async fn enforce_remove(&self) {
-        let out = self.machine_ssh(&enforce::delete_command()).await;
+        let out = self.root_shell(&enforce::delete_command()).await;
         match out {
             Ok(out) if out.status.success() => {}
             Ok(out) => tracing::debug!(
@@ -830,17 +964,6 @@ fn write_clearance_token() -> anyhow::Result<String> {
         }
     };
     Ok(token)
-}
-
-/// Drain piped stdout of a spawned child into a string. Used after the child has
-/// (almost) finished; small outputs only.
-async fn drain_piped(child: &mut tokio::process::Child) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    if let Some(stdout) = child.stdout.as_mut() {
-        let _ = stdout.read_to_end(&mut buf).await;
-    }
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Convert a Windows path to its WSL form, e.g. `C:\\a\\b` -> `/mnt/c/a/b`.

@@ -86,6 +86,35 @@ If the workspace root contains `AGENTS.md` (or `CLAUDE.md`), its contents are
 appended under "Project instructions". The file is read at session start
 only.
 
+## Remote execution
+
+Run the agent loop on your machine while the sandbox runs elsewhere — any
+Linux host with podman and SSH access:
+
+```sh
+# One-time: register the host as a podman connection
+podman system connection add gpu-box ssh://user@gpu-box.example.com/run/user/1000/podman/podman.sock
+
+# The workspace must exist on the remote host (git clone or rsync)
+smith run --connection gpu-box --remote-workspace /home/user/project "fix the failing test"
+```
+
+Or set it in config:
+
+```toml
+[sandbox]
+podman_connection = "gpu-box"
+remote_workspace = "/home/user/project"
+```
+
+Credentials stay on your machine; the remote host needs only podman and its
+own egress stack (the proxy sidecar and nftables enforcement install on it
+automatically). File tools run over the wire (`podman exec cat`/stdin pipes);
+note the connection should be one where cgroups work — podman machine
+installations should use the root socket connection (the `*-root` entry
+podman registers by default). Every podman call is an SSH round trip, so
+expect some latency; the `smith serve` daemon milestone addresses that.
+
 ## MCP servers
 
 smith connects to stdio MCP servers and exposes their tools to the agent as
