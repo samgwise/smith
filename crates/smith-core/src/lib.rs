@@ -11,6 +11,7 @@ pub mod instructions;
 pub mod model;
 pub mod provider;
 pub mod session;
+pub mod testing;
 pub mod tools;
 
 pub use agent::{

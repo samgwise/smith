@@ -121,7 +121,7 @@ async fn connect_via_proxy(proxy_port: u16, target: &str) -> Result<TcpStream, u
 async fn ask_mode_holds_then_tunnels_on_allow() {
     let echo_port = echo_server().await;
     let (data_port, control_port) = (19310, 19241);
-    let child = spawn_proxy("ask", data_port, control_port);
+    let _child = spawn_proxy("ask", data_port, control_port);
 
     // CONNECT before any decision: held, no response yet.
     let target = format!("127.0.0.1:{echo_port}");
@@ -166,7 +166,7 @@ async fn ask_mode_holds_then_tunnels_on_allow() {
 async fn deny_mode_rejects_immediately() {
     let echo_port = echo_server().await;
     let (data_port, control_port) = (19311, 19242);
-    let child = spawn_proxy("deny", data_port, control_port);
+    let _child = spawn_proxy("deny", data_port, control_port);
 
     let status = connect_via_proxy(data_port, &format!("127.0.0.1:{echo_port}"))
         .await
@@ -177,7 +177,7 @@ async fn deny_mode_rejects_immediately() {
 #[tokio::test]
 async fn control_api_requires_the_token() {
     let (data_port, control_port) = (19312, 19243);
-    let child = spawn_proxy("deny", data_port, control_port);
+    let _child = spawn_proxy("deny", data_port, control_port);
 
     let (status, _) = control(control_port, "GET", "/pending", None, None).await;
     assert_eq!(status, 401);
@@ -189,7 +189,7 @@ async fn control_api_requires_the_token() {
 async fn always_decision_covers_the_host_without_reprompting() {
     let echo_port = echo_server().await;
     let (data_port, control_port) = (19313, 19244);
-    let child = spawn_proxy("ask", data_port, control_port);
+    let _child = spawn_proxy("ask", data_port, control_port);
     let target = format!("127.0.0.1:{echo_port}");
 
     // First connect: held; answer "always".
@@ -213,10 +213,11 @@ async fn always_decision_covers_the_host_without_reprompting() {
         Some(&format!(r#"{{"id":{id},"decision":"always"}}"#)),
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(5), holder)
+    let tunnel = tokio::time::timeout(Duration::from_secs(5), holder)
         .await
         .expect("first tunnel resolved")
         .unwrap();
+    assert!(tunnel.is_ok(), "tunnel failed with {:#?}", tunnel.err());
 
     // Second connect to the same host: tunnel opens with no new pending.
     let mut stream = tokio::time::timeout(

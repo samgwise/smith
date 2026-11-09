@@ -13,5 +13,7 @@ futures.workspace = true
 ratatui.workspace = true
 smith-core.workspace = true
 smith-egress.path = "../smith-egress"
+smith-protocol.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true

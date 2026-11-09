@@ -1,6 +1,7 @@
-//! The v1 local `ToolExecutor`: file IO host-side inside the workspace, shell
-//! inside the session container. Both live behind the same seam so a remote
-//! executor can replace this later.
+//! The podman-backed `ToolExecutor`: file IO host-side inside the workspace
+//! (local mode) or over the exec channel (remote mode), shell always inside
+//! the session container. This is the single execution seam the agent loop
+//! uses; the serve daemon reuses it unchanged.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,7 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use smith_core::{ExecResult, FileContents, ToolExecutor};
-use smith_sandbox::{Sandbox, Session};
+
+use crate::{Sandbox, Session};
 
 /// Files larger than this are refused by `read_file` (pathological sizes;
 /// normal large files are paged instead).
@@ -27,8 +29,8 @@ pub struct LocalExecutor {
     session: Session,
     /// Canonicalised host workspace root.
     root: PathBuf,
-    /// Remote mode: file ops go through `podman cp`/`exec` instead of the
-    /// local filesystem (the workspace lives on the remote host).
+    /// Remote mode: file ops go through exec pipes instead of the local
+    /// filesystem (the workspace lives on the remote host).
     remote: bool,
 }
 

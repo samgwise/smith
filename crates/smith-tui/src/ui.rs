@@ -60,7 +60,7 @@ fn render(frame: &mut Frame, app: &App) {
     render_tools(frame, tools_area, app);
     render_input(frame, input_area, app);
     render_status(frame, status_area, app);
-    if let Some((request, _)) = app.pending_approval() {
+    if let Some(request) = app.pending_approval() {
         render_modal(frame, area, request);
     }
 }

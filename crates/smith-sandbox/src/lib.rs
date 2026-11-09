@@ -14,6 +14,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 pub mod enforce;
+pub mod executor;
 
 /// How the container is allowed to talk to the network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1010,7 +1011,7 @@ mod tests {
         });
         sandbox.ensure_ready().await.unwrap();
         let ws = tempfile::tempdir().unwrap();
-        let session = sandbox.start_session(&ws.path()).await.unwrap();
+        let session = sandbox.start_session(ws.path()).await.unwrap();
 
         // curl is not in the ubuntu base image; install it through the proxy
         // (archive.ubuntu.com is on the default allowlist — itself a check).

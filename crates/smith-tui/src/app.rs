@@ -1,20 +1,17 @@
 //! TUI application state and the main event loop.
+//!
+//! The App is front-end only: every session operation crosses the
+//! [`SessionLink`] seam (`crate::link`) — in-process for `smith`, the serve
+//! protocol for `smith attach`. The two modes render identically.
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use ratatui::text::Line;
-use smith_core::{
-    Agent, ApprovalDecision, ApprovalRequest, CoreEvent, LlmProvider, Message, Usage,
-    list_sessions, load_history, workspace_identity,
-};
+use smith_core::{ApprovalDecision, ApprovalRequest, CoreEvent, Usage};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
-use crate::gate::ApprovalRx;
+use crate::link::{LinkEvent, SessionLink};
 use crate::ui;
 
 /// Key events from the reader thread.
@@ -23,45 +20,39 @@ pub enum InputEvent {
     Key(crossterm::event::KeyEvent),
 }
 
-enum Turn {
-    /// A turn is running.
-    Running {
-        handle: JoinHandle<Vec<Message>>,
-        cancel: CancellationToken,
-    },
-    Idle,
-}
-
-/// Builds a provider for `/model` and `/provider` switches.
-pub type ProviderFactory =
-    Arc<dyn Fn(&str, &str) -> anyhow::Result<Arc<dyn LlmProvider>> + Send + Sync>;
-
 pub struct AppParams {
-    pub agent: Arc<Agent>,
-    pub history: Vec<Message>,
-    pub gate_rx: ApprovalRx,
-    /// Canonical workspace path (for `/resume` identity checks).
-    pub workspace: PathBuf,
+    /// The session this window is attached to.
+    pub link: Box<dyn SessionLink>,
+    /// Whether prompts echo back as UserMessage events (remote mode).
+    pub user_echo: bool,
     pub workspace_label: String,
     pub container_label: String,
     pub session_label: String,
     pub provider_name: String,
     pub model_name: String,
-    pub build_provider: ProviderFactory,
-    /// Snapshot of MCP server status taken at session start.
+    /// Snapshot of MCP server status taken at attach time.
     pub mcp_status: Vec<String>,
 }
 
-pub struct App {
-    agent: Arc<Agent>,
-    history: Vec<Message>,
-    gate_rx: ApprovalRx,
-    event_tx: mpsc::UnboundedSender<CoreEvent>,
-    event_rx: mpsc::UnboundedReceiver<CoreEvent>,
+/// What a modal answers: an agent tool approval or an egress clearance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModalKind {
+    Tool,
+    Clearance(u64),
+}
 
+struct PendingModal {
+    call_id: String,
+    request: ApprovalRequest,
+    kind: ModalKind,
+}
+
+pub struct App {
+    link: Box<dyn SessionLink>,
+    user_echo: bool,
     busy: bool,
-    turn: Turn,
-    pending_approval: Option<(ApprovalRequest, mpsc::UnboundedSender<ApprovalDecision>)>,
+
+    pending_approval: Option<PendingModal>,
 
     /// Rendered transcript lines (already wrapped at draw time via `ui`).
     transcript: Vec<Line<'static>>,
@@ -72,13 +63,11 @@ pub struct App {
     usage: Usage,
     /// `None` = follow the tail; `Some(offset)` = user scrolled up.
     scroll: Option<u16>,
-    workspace: PathBuf,
     workspace_label: String,
     container_label: String,
     session_label: String,
     provider_name: String,
     model_name: String,
-    build_provider: ProviderFactory,
     mcp_status: Vec<String>,
     /// Last Ctrl+C while busy (quit-with-second-press flow).
     last_ctrl_c: Option<Instant>,
@@ -90,15 +79,10 @@ pub struct App {
 
 impl App {
     pub fn new(params: AppParams) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
-            agent: params.agent,
-            history: params.history,
-            gate_rx: params.gate_rx,
-            event_tx,
-            event_rx,
+            link: params.link,
+            user_echo: params.user_echo,
             busy: false,
-            turn: Turn::Idle,
             pending_approval: None,
             transcript: vec![],
             streaming: String::new(),
@@ -106,13 +90,11 @@ impl App {
             input: String::new(),
             usage: Usage::default(),
             scroll: None,
-            workspace: params.workspace,
             workspace_label: params.workspace_label,
             container_label: params.container_label,
             session_label: params.session_label,
             provider_name: params.provider_name,
             model_name: params.model_name,
-            build_provider: params.build_provider,
             mcp_status: params.mcp_status,
             last_ctrl_c: None,
             egress_queue: vec![],
@@ -144,44 +126,17 @@ impl App {
 
         let mut terminal = ui::setup().context("failed to enter terminal UI mode")?;
 
-        // Egress clearance poller: surfaces pending destinations as modals.
-        let (egress_tx, mut egress_rx) = mpsc::unbounded_channel::<(u64, String)>();
-        if let Some(token) = smith_egress::client::read_token() {
-            tokio::spawn(async move {
-                let mut seen: Vec<u64> = vec![];
-                loop {
-                    if let Ok(pending) = smith_egress::client::get_pending(
-                        smith_egress::client::CLEARANCE_CONTROL_PORT,
-                        &token,
-                    ) {
-                        for (id, host) in pending {
-                            if !seen.contains(&id) {
-                                seen.push(id);
-                                if egress_tx.send((id, host)).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(700)).await;
-                }
-            });
-        }
-
         loop {
             ui::draw(&mut terminal, &self)?;
 
-            // Drain any queued events without blocking the draw loop.
             tokio::select! {
-                ev = self.event_rx.recv() => {
-                    match ev {
-                        Some(ev) => self.handle_core(ev),
-                        None => break,
-                    }
-                }
-                some = self.gate_rx.recv() => {
-                    if let Some((request, reply)) = some {
-                        self.pending_approval = Some((request, reply));
+                event = self.link.next_event() => {
+                    match event {
+                        Some(event) => self.handle_link(event),
+                        None => {
+                            // Link closed: nothing left to show.
+                            self.status_note = "session link closed".into();
+                        }
                     }
                 }
                 key = input_rx.recv() => {
@@ -190,29 +145,6 @@ impl App {
                         None => break,
                     }
                 }
-                egress = egress_rx.recv() => {
-                    if let Some((id, host)) = egress {
-                        self.egress_queue.push((id, host));
-                        self.promote_next_egress();
-                    }
-                }
-            }
-
-            // Reap a finished turn and take history back.
-            if let Turn::Running { handle, .. } = &mut self.turn
-                && handle.is_finished()
-            {
-                let Turn::Running { handle, .. } = std::mem::replace(&mut self.turn, Turn::Idle)
-                else {
-                    unreachable!()
-                };
-                match handle.await {
-                    Ok(history) => self.history = history,
-                    Err(e) => {
-                        self.status_note = format!("turn failed: {e}");
-                    }
-                }
-                self.busy = false;
             }
 
             if self.should_quit {
@@ -224,7 +156,42 @@ impl App {
         Ok(())
     }
 
-    // ------------------------------------------------------ event handling --
+    // ------------------------------------------------------ link events --
+
+    fn handle_link(&mut self, event: LinkEvent) {
+        match event {
+            LinkEvent::Core(ev) => self.handle_core(ev),
+            LinkEvent::Status(status) => {
+                self.busy = status.busy;
+                self.provider_name = status.provider;
+                self.model_name = status.model;
+                if let Some(container) = status.container {
+                    self.container_label = container;
+                }
+                if self.session_label.is_empty() {
+                    self.session_label = status.id.chars().take(8).collect();
+                }
+                self.mcp_status = status.mcp_status;
+            }
+            LinkEvent::Clearance { id, host } => {
+                self.egress_queue.push((id, host));
+                self.promote_next_egress();
+            }
+            LinkEvent::ApprovalDecided { decision, .. } => {
+                // Another viewer decided; close our modal if one is open.
+                // (If we decided ourselves the modal is already gone.)
+                if let Some(modal) = self.pending_approval.take()
+                    && modal.kind == ModalKind::Tool
+                {
+                    self.status_note = match decision {
+                        ApprovalDecision::Deny => "approved elsewhere: denied".into(),
+                        _ => "approved elsewhere".into(),
+                    };
+                    self.promote_next_egress();
+                }
+            }
+        }
+    }
 
     fn handle_core(&mut self, ev: CoreEvent) {
         match ev {
@@ -257,16 +224,40 @@ impl App {
                 self.push_line(text.clone());
                 self.transcript.push(Line::from(""));
             }
+            CoreEvent::UserMessage { text } => {
+                // Remote mode echoes the prompt; local mode renders its own.
+                if self.user_echo {
+                    self.push_user(&text);
+                }
+            }
+            CoreEvent::ApprovalRequested { call_id, detail } => {
+                // Remote mode: approvals arrive as events. (Local mode also
+                // sees them — the gate bridge synthesises them — and both
+                // reply through the link.)
+                if self.pending_approval.is_none() {
+                    self.pending_approval = Some(PendingModal {
+                        call_id,
+                        request: ApprovalRequest {
+                            tool: "shell".into(),
+                            detail,
+                        },
+                        kind: ModalKind::Tool,
+                    });
+                    self.status_note = "approval required".into();
+                }
+            }
             CoreEvent::TurnCompleted => {
+                self.busy = false;
                 self.status_note.clear();
             }
             CoreEvent::TurnCancelled => {
+                self.busy = false;
                 self.status_note = "turn cancelled".into();
             }
             CoreEvent::Error { message } => {
+                self.busy = false;
                 self.status_note = message;
             }
-            CoreEvent::ApprovalRequested { .. } => {}
         }
     }
 
@@ -276,7 +267,7 @@ impl App {
         let InputEvent::Key(key) = ev;
 
         // Modal has first claim on the keyboard.
-        if self.pending_approval_key(&key) {
+        if self.pending_approval_key(&key).await {
             return;
         }
 
@@ -285,9 +276,7 @@ impl App {
             // within 2s of the first cancels and quits together.
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 if self.busy {
-                    if let Turn::Running { cancel, .. } = &self.turn {
-                        cancel.cancel();
-                    }
+                    self.link.cancel().await;
                     if self
                         .last_ctrl_c
                         .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
@@ -337,30 +326,20 @@ impl App {
             return;
         }
         self.input.clear();
-        self.push_user(&input);
-
-        let agent = Arc::clone(&self.agent);
-        let mut history = std::mem::take(&mut self.history);
-        let tx = self.event_tx.clone();
-        let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
+        // Remote sessions echo the prompt back as an event; local renders it
+        // here (the agent never emits UserMessage in local mode).
+        if !self.user_echo {
+            self.push_user(&input);
+        }
 
         self.busy = true;
         self.status_note = "thinking...".into();
-        let handle = tokio::spawn(async move {
-            let result = agent
-                .run_turn(&mut history, &input, tx, cancel_for_task)
-                .await;
-            match result {
-                Ok(()) => history,
-                Err(e) => {
-                    // Surface the failure; keep whatever history we have.
-                    let _ = e;
-                    history
-                }
-            }
-        });
-        self.turn = Turn::Running { handle, cancel };
+        if let Err(e) = self.link.send_prompt(input).await {
+            self.busy = false;
+            self.status_note.clear();
+            self.push_line(format!("[error] {e:#}"));
+            self.transcript.push(Line::from(""));
+        }
     }
 
     // ---------------------------------------------------- slash commands --
@@ -374,7 +353,7 @@ impl App {
                     "/model <name>      switch model mid-session",
                     "/provider <name>   switch provider (ollama|openai)",
                     "/diff              show git diff of the workspace",
-                    "/sessions          list saved sessions",
+                    "/sessions          list sessions",
                     "/mcp               list MCP servers and status",
                     "/resume <id>       continue a saved session",
                     "/help              this list",
@@ -386,62 +365,57 @@ impl App {
             }
             Ok(Some(Slash::Quit)) => self.should_quit = true,
             Ok(Some(Slash::Model(name))) => {
-                match (self.build_provider)(&self.provider_name, &name) {
-                    Ok(provider) => {
-                        self.agent.set_provider(provider);
+                let provider = self.provider_name.clone();
+                match self.link.set_provider(&provider, &name).await {
+                    Ok(line) => {
                         self.model_name = name.clone();
-                        self.push_line(format!("[model switched to {name}]"));
+                        self.push_line(line);
                     }
                     Err(e) => self.push_line(format!("[error] {e:#}")),
                 }
             }
             Ok(Some(Slash::Provider(name))) => {
-                match (self.build_provider)(&name, &self.model_name) {
-                    Ok(provider) => {
-                        self.agent.set_provider(provider);
+                let model = self.model_name.clone();
+                match self.link.set_provider(&name, &model).await {
+                    Ok(line) => {
                         self.provider_name = name.clone();
-                        self.push_line(format!("[provider switched to {name}]"));
+                        self.push_line(line);
                     }
                     Err(e) => self.push_line(format!("[error] {e:#}")),
                 }
             }
             Ok(Some(Slash::Diff)) => {
-                let agent = Arc::clone(&self.agent);
-                let tx = self.event_tx.clone();
-                tokio::spawn(async move {
-                    let exec = agent.executor();
-                    let text = match exec
-                        .exec_shell("git --no-pager diff", Duration::from_secs(30))
-                        .await
-                    {
-                        Ok(res) if res.stdout.trim().is_empty() && res.stderr.trim().is_empty() => {
-                            "git diff: (no changes)".to_string()
-                        }
-                        Ok(res) => {
-                            let out = format!("{}{}", res.stdout, res.stderr);
-                            let chars: Vec<char> = out.chars().collect();
-                            let start = chars.len().saturating_sub(4000);
-                            format!("git diff:\n{}", chars[start..].iter().collect::<String>())
-                        }
-                        Err(e) => {
-                            format!("git diff failed: {e:#} (git may be missing in the base image)")
-                        }
-                    };
-                    let _ = tx.send(CoreEvent::Notice { text });
-                });
+                let text = match self.link.diff().await {
+                    Ok(text) => text,
+                    Err(e) => format!("git diff failed: {e:#}"),
+                };
+                self.push_line(text);
+                self.transcript.push(Line::from(""));
             }
-            Ok(Some(Slash::Sessions)) => match list_sessions() {
-                Ok(sessions) if sessions.is_empty() => self.push_line("[no saved sessions]".into()),
+            Ok(Some(Slash::Sessions)) => match self.link.sessions().await {
+                Ok(sessions) if sessions.is_empty() => {
+                    self.push_line("[no sessions]".into());
+                }
                 Ok(sessions) => {
-                    for (path, meta) in sessions.iter().take(10) {
-                        self.push_line(format!(
-                            "{}  {}:{}  {} ({})",
-                            &meta.id[..8.min(meta.id.len())],
-                            meta.provider,
-                            meta.model,
-                            meta.workspace_name,
-                            path.display()
-                        ));
+                    for s in sessions.iter().take(10) {
+                        let busy_marker = if s.busy { " [busy]" } else { "" };
+                        match &s.path {
+                            Some(path) => self.push_line(format!(
+                                "{}  {}:{}  {}{busy_marker} ({})",
+                                &s.id[..8.min(s.id.len())],
+                                s.provider,
+                                s.model,
+                                s.workspace,
+                                path
+                            )),
+                            None => self.push_line(format!(
+                                "{}  {}:{}  {}{busy_marker}",
+                                &s.id[..8.min(s.id.len())],
+                                s.provider,
+                                s.model,
+                                s.workspace
+                            )),
+                        }
                     }
                     self.transcript.push(Line::from(""));
                 }
@@ -463,11 +437,10 @@ impl App {
                     self.push_line("[error] cannot resume while a turn is running".into());
                     return;
                 }
-                let loaded = self.load_session_for_resume(&prefix).await;
-                match loaded {
-                    Ok((id_prefix, count)) => {
-                        self.push_line(format!("[resumed session {id_prefix}: {count} messages]"));
-                        self.session_label = id_prefix;
+                match self.link.resume(&prefix).await {
+                    Ok(line) => {
+                        self.session_label = prefix;
+                        self.push_line(line);
                     }
                     Err(e) => self.push_line(format!("[error] {e:#}")),
                 }
@@ -475,8 +448,7 @@ impl App {
         }
     }
 
-    /// Show the next queued egress clearance modal if none is open, wiring
-    /// the reply channel to a decide POST.
+    /// Show the next queued egress clearance modal if none is open.
     fn promote_next_egress(&mut self) {
         if self.pending_approval.is_some() {
             return; // modal busy; the queue drains when it frees
@@ -485,65 +457,15 @@ impl App {
         else {
             return;
         };
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-        self.pending_approval = Some((
-            ApprovalRequest {
+        self.pending_approval = Some(PendingModal {
+            call_id: format!("clearance-{id}"),
+            request: ApprovalRequest {
                 tool: "egress".into(),
                 detail: host.clone(),
             },
-            reply_tx,
-        ));
-        self.status_note = format!("egress clearance: {host}");
-        tokio::spawn(async move {
-            if let Some(decision) = reply_rx.recv().await {
-                let decision = match decision {
-                    ApprovalDecision::AllowOnce => "allow",
-                    ApprovalDecision::AllowAlways => "always",
-                    ApprovalDecision::Deny => "deny",
-                };
-                let _ = smith_egress::client::post_decide(
-                    smith_egress::client::CLEARANCE_CONTROL_PORT,
-                    &smith_egress::client::read_token().unwrap_or_default(),
-                    id,
-                    decision,
-                );
-            }
+            kind: ModalKind::Clearance(id),
         });
-    }
-
-    /// Load a session's history into the app (used by /resume).
-    async fn load_session_for_resume(&mut self, prefix: &str) -> anyhow::Result<(String, usize)> {
-        let sessions = list_sessions()?;
-        let matches: Vec<_> = sessions
-            .iter()
-            .filter(|(_, meta)| meta.id.starts_with(prefix))
-            .collect();
-        match matches.len() {
-            0 => anyhow::bail!("no session matches `{prefix}` (see /sessions)"),
-            n if n > 1 => anyhow::bail!("{n} sessions match `{prefix}`; be more specific"),
-            _ => {}
-        }
-        let (path, meta) = matches[0].clone();
-
-        let current = workspace_identity(&self.workspace);
-        if meta.workspace_id != current {
-            anyhow::bail!(
-                "session {} belongs to workspace `{}`, not this one",
-                &meta.id[..8.min(meta.id.len())],
-                meta.workspace_name
-            );
-        }
-
-        let (_, mut history) = load_history(&path)?;
-        if !history
-            .first()
-            .is_some_and(|m| m.role == smith_core::Role::System)
-        {
-            history.insert(0, Message::system(self.agent.system_prompt().await));
-        }
-        let count = history.len();
-        self.history = history;
-        Ok((meta.id[..8.min(meta.id.len())].to_string(), count))
+        self.status_note = format!("egress clearance: {host}");
     }
 
     // ----------------------------------------------------------- scrolling --
@@ -628,10 +550,9 @@ impl App {
         self.scroll
     }
 
-    pub fn pending_approval(
-        &self,
-    ) -> Option<&(ApprovalRequest, mpsc::UnboundedSender<ApprovalDecision>)> {
-        self.pending_approval.as_ref()
+    /// The modal's request (what the renderer shows), if one is open.
+    pub fn pending_approval(&self) -> Option<&ApprovalRequest> {
+        self.pending_approval.as_ref().map(|m| &m.request)
     }
 
     pub fn provider_name(&self) -> &str {
@@ -674,26 +595,57 @@ fn modal_decision(key: &crossterm::event::KeyEvent) -> Option<ApprovalDecision> 
 }
 
 impl App {
-    /// If the modal is open and the key answers it, reply with the decision.
+    /// If the modal is open and the key answers it, reply through the link.
     /// Returns whether the key was consumed by the modal.
-    fn pending_approval_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
-        let Some((request, reply)) = self.pending_approval.take() else {
+    async fn pending_approval_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        let Some(modal) = self.pending_approval.take() else {
             return false;
         };
         match modal_decision(key) {
             Some(decision) => {
-                let _ = reply.send(decision);
+                match &modal.kind {
+                    ModalKind::Tool => {
+                        self.link.respond_approval(&modal.call_id, decision).await;
+                    }
+                    ModalKind::Clearance(id) => {
+                        self.link.respond_clearance(*id, decision).await;
+                    }
+                }
                 // The modal freed: surface the next queued egress request.
                 self.promote_next_egress();
                 true
             }
             None => {
                 // Not answered; put it back.
-                self.pending_approval = Some((request, reply));
+                self.pending_approval = Some(modal);
                 false
             }
         }
     }
+}
+
+/// Naive greedy word-wrap for transcript lines.
+fn wrap(text: String) -> Vec<String> {
+    const WIDTH: usize = 96;
+    let mut out = vec![];
+    for para in text.lines() {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in para.split_whitespace() {
+            if !current.is_empty() && current.len() + 1 + word.len() > WIDTH {
+                out.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        out.push(current);
+    }
+    out
 }
 
 /// A parsed slash command from the input box.
@@ -726,7 +678,6 @@ pub fn parse_slash(rest: &str) -> Result<Option<Slash>, String> {
         },
         "diff" => Ok(Some(Slash::Diff)),
         "sessions" => Ok(Some(Slash::Sessions)),
-        "mcp" => Ok(Some(Slash::Mcp)),
         "resume" => tail
             .map(|t| Ok(Some(Slash::Resume(t))))
             .unwrap_or(Err("/resume requires a session id (see /sessions)".into())),
@@ -768,28 +719,4 @@ mod tests {
         assert!(parse_slash("resume").is_err());
         assert!(parse_slash("frobnicate").is_err());
     }
-}
-
-/// Naive greedy word-wrap for transcript lines.
-fn wrap(text: String) -> Vec<String> {
-    const WIDTH: usize = 96;
-    let mut out = vec![];
-    for para in text.lines() {
-        if para.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        for word in para.split_whitespace() {
-            if !current.is_empty() && current.len() + 1 + word.len() > WIDTH {
-                out.push(std::mem::take(&mut current));
-            }
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-        out.push(current);
-    }
-    out
 }

@@ -1,21 +1,25 @@
+mod attach;
 mod config;
 mod doctor;
-mod executor;
 mod run;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use smith_core::{Agent, Message, SessionLogger};
 use smith_sandbox::Sandbox;
+use smith_tui::{LocalLink, TuiGate, approval_channel};
 
 use crate::config::Config;
 
 /// Interactive TUI session: sandbox up for the whole session, approval modal
 /// in the UI, container left running on exit (reaped later by `smith clean`).
+/// The harness runs in-process (LocalLink); `smith attach` is the remote
+/// counterpart.
 async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result<()> {
-    let (gate_tx, gate_rx) = smith_tui::approval_channel();
+    let (gate_tx, gate_rx) = approval_channel();
 
     let (_sandbox, executor) = run::start_executor(config, workspace).await?;
     let container = executor.session().name.clone();
@@ -24,18 +28,11 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
     let logger = SessionLogger::new(&workspace_canon, &config.provider, &config.model)?;
     println!("session: {}", logger.path.display());
     let session_label = logger.meta.id.chars().take(8).collect::<String>();
-    run::set_clearance_mode(config, true);
+    smith_server::set_clearance_mode(config, true);
 
     // MCP servers: connected for the whole TUI session, tools added to the
     // registry once (cache-stable), shut down when the session ends.
-    let mut mcp_session = {
-        let mut mcp_config = config.mcp.clone();
-        match smith_mcp::McpConfig::load_workspace(&workspace_canon) {
-            Ok(ws) => mcp_config = mcp_config.merged(ws),
-            Err(e) => tracing::warn!("could not load workspace MCP config: {e:#}"),
-        }
-        smith_mcp::McpSession::connect(&mcp_config).await
-    };
+    let mut mcp_session = smith_server::connect_mcp(config, &workspace_canon).await;
     let mcp_status = mcp_session.status_lines();
     let mut tools = smith_core::builtin_tools();
     tools.extend(mcp_session.take_tools());
@@ -43,14 +40,14 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
     let provider = run::build_provider(config)?;
     let mut agent = Agent::new(
         provider,
-        std::sync::Arc::new(executor),
+        Arc::new(executor),
         tools,
-        std::sync::Arc::new(smith_tui::TuiGate::new(gate_tx)),
-        Some(std::sync::Arc::new(logger)),
+        Arc::new(TuiGate::new(gate_tx)),
+        Some(Arc::new(logger)),
     );
     agent.project_instructions =
         smith_core::instructions::load_project_instructions(&workspace_canon);
-    agent.environment_notes = Some(environment_notes(config));
+    agent.environment_notes = Some(smith_server::environment_notes(config));
     let system_prompt = agent.system_prompt().await;
 
     let provider_name = config.provider.clone();
@@ -62,19 +59,25 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
         .collect::<String>();
 
     let cfg_for_factory = config.clone();
-    let build_provider: smith_tui::app::ProviderFactory =
-        std::sync::Arc::new(move |provider: &str, model: &str| {
+    let build_provider: smith_tui::ProviderFactory =
+        Arc::new(move |provider: &str, model: &str| {
             let mut cfg = cfg_for_factory.clone();
             cfg.provider = provider.to_string();
             cfg.model = model.to_string();
             run::build_provider(&cfg)
         });
 
-    let params = smith_tui::AppParams {
-        agent: std::sync::Arc::new(agent),
-        history: vec![Message::system(system_prompt)],
+    let link = LocalLink::new(
+        Arc::new(agent),
+        vec![Message::system(system_prompt)],
         gate_rx,
-        workspace: workspace_canon.clone(),
+        build_provider,
+        workspace_canon.clone(),
+    );
+
+    let params = smith_tui::AppParams {
+        link: Box::new(link),
+        user_echo: false,
         workspace_label: workspace_canon
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -83,7 +86,6 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
         session_label,
         provider_name,
         model_name,
-        build_provider,
         mcp_status,
     };
 
@@ -189,6 +191,24 @@ enum Command {
         /// Workspace path on the remote host.
         #[arg(long)]
         remote_workspace: Option<String>,
+    },
+    /// Run the harness daemon: hosted sessions, approvals, model keys.
+    /// Thin clients attach with `smith attach`.
+    Serve {
+        /// Bind address override (default: [serve].bind, 127.0.0.1:9240).
+        #[arg(long)]
+        bind: Option<String>,
+    },
+    /// Attach the TUI to a session hosted by a `smith serve` daemon.
+    Attach {
+        /// Session id (or unique prefix); newest for this workspace if omitted.
+        id: Option<String>,
+        /// Daemon address, e.g. 127.0.0.1:9240 (env SMITH_SERVE_URL).
+        #[arg(long)]
+        url: Option<String>,
+        /// Daemon token (env SMITH_SERVE_TOKEN; default: the daemon's token file).
+        #[arg(long)]
+        token: Option<String>,
     },
     /// List recent sessions.
     Sessions,
@@ -343,6 +363,12 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(code);
             }
         }
+        Some(Command::Serve { bind }) => {
+            smith_server::serve(&config, bind).await?;
+        }
+        Some(Command::Attach { id, url, token }) => {
+            attach::run_attach(url.as_deref(), token.as_deref(), id.as_deref()).await?;
+        }
         Some(Command::Sessions) => {
             for (path, meta) in smith_core::list_sessions()? {
                 println!(
@@ -403,25 +429,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One-line environment summary injected into the system prompt.
-fn environment_notes(config: &Config) -> String {
-    let egress = match config
-        .sandbox_config()
-        .map(|s| (s.network, s.egress_enforce))
-    {
-        Ok((smith_sandbox::NetworkMode::Proxy, true)) => {
-            "egress: allowlist proxy, packet-enforced".to_string()
-        }
-        Ok((smith_sandbox::NetworkMode::Proxy, false)) => {
-            "egress: allowlist proxy (cooperative only)".to_string()
-        }
-        Ok((smith_sandbox::NetworkMode::Disabled, _)) => "network: disabled".to_string(),
-        Ok((smith_sandbox::NetworkMode::Open, _)) => "network: unrestricted".to_string(),
-        Err(e) => return format!("network: unknown ({e:#})"),
-    };
-    format!("Network mode: {egress}")
-}
-
 /// Minimal ms-since-epoch formatter (avoids a chrono dependency).
 fn chrono_like(ms: u64) -> String {
     let secs = ms / 1000;
@@ -430,7 +437,7 @@ fn chrono_like(ms: u64) -> String {
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;

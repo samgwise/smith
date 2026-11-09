@@ -13,8 +13,10 @@ code only ever runs in the container, never on your host.
 | `smith-mcp` | MCP client: stdio servers exposed as `mcp_<server>_<tool>` tools |
 | `smith-sandbox` | Podman machine/container lifecycle, exec with timeouts, egress enforcement |
 | `smith-egress` | Allowlist-filtering proxy sidecar (CONNECT filter + bundled Containerfile) |
+| `smith-protocol` | The frozen serve wire contract: envelopes, SSE framing, raw client |
+| `smith-server` | The `smith serve` daemon: hosted sessions, approval routing, clearance poller |
 | `smith-tui` | Ratatui interface: transcript, tool activity, approval modal, slash commands |
-| `smith-cli` | `smith` binary: TUI, headless runs, resume, housekeeping |
+| `smith-cli` | `smith` binary: TUI, headless runs, serve/attach, resume, housekeeping |
 
 ## Security model (v1)
 
@@ -115,6 +117,47 @@ installations should use the root socket connection (the `*-root` entry
 podman registers by default). Every podman call is an SSH round trip, so
 expect some latency; the `smith serve` daemon milestone addresses that.
 
+## The daemon: `smith serve` / `smith attach`
+
+The harness plane is also a place: `smith serve` runs a small daemon that
+hosts agent loops, session logs, approvals and the model keys; the TUI
+attaches as a thin client. Daemon and client can share a machine (loopback)
+or the daemon can live on a host near the sandbox.
+
+```sh
+# Terminal 1: the daemon (loopback, bearer token auto-generated)
+smith serve                 # or: smith serve --bind 127.0.0.1:9240
+
+# Terminal 2: thin client — newest session for this workspace, or create one
+smith attach
+
+# Attach to a specific hosted session, or a daemon elsewhere
+smith attach 73bd12a6
+smith attach --url 10.0.0.5:9240 --token <token>
+```
+
+What changes in attach mode:
+
+- Model keys live only in the daemon's environment — the prompting device
+  never sees them.
+- The turn keeps running when you detach; attach again and the full
+  transcript replays from the daemon's journal. Two attached clients share
+  one session live.
+- Approval and egress-clearance modals round-trip over the wire: the first
+  client to answer wins, others see "approved elsewhere". Unanswered
+  approvals auto-deny after `approval_timeout_secs` (default 300).
+- `/model`, `/provider`, `/diff`, `/sessions`, `/resume` talk to the daemon;
+  the daemon builds the system prompt and owns the history.
+
+The wire contract (envelope, routes, SSE stream, replay semantics) is the
+frozen v1 protocol in [`docs/SERVE_PROTOCOL.md`](docs/SERVE_PROTOCOL.md). A
+live end-to-end check against a running daemon:
+`cargo run -p smith-cli --example serve_smoke`.
+
+Default posture: loopback bind, bearer token in `~/.smith/serve-token`, no
+TLS at this layer (put a reverse proxy in front when the daemon leaves the
+box — the same deployment shape as linguine's `/v1`).
+
 ## MCP servers
 
 smith connects to stdio MCP servers and exposes their tools to the agent as
@@ -180,6 +223,10 @@ throwaway temp workspace — your project directory is never touched.
 # Interactive TUI (container stays up; clean later)
 smith
 
+# The harness as a daemon + thin clients (see the daemon section above)
+smith serve
+smith attach
+
 # One-shot task, auto-approved, gated by the verify command
 smith run "explain what this project does"
 smith run --workspace C:\path\to\repo --verify "cargo test -q" "fix the failing test"
@@ -208,6 +255,10 @@ model = "qwen3.8:27b"
 [sandbox]
 network = "proxy"         # none | proxy | open
 egress_enforce = true     # nftables default-deny in the podman machine
+
+[serve]
+bind = "127.0.0.1:9240"      # smith serve (token: ~/.smith/serve-token)
+approval_timeout_secs = 300  # unanswered approval modals auto-deny
 ```
 
 ## Development

@@ -4,20 +4,22 @@
 //! safe because execution stays inside the podman sandbox.
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use smith_core::{
     Agent, ApprovalDecision, ApprovalGate, ApprovalRequest, CoreEvent, Message, SessionLogger,
     ToolExecutor, clamp_output,
 };
-use smith_sandbox::{Sandbox, Session};
+// Harness assembly lives in smith-server; re-exported for main.rs.
+use smith_sandbox::Session;
+pub use smith_server::{
+    build_provider, connect_mcp, environment_notes, set_clearance_mode, start_executor,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, VerifyConfig};
-use crate::executor::LocalExecutor;
 
 struct AutoAllowGate;
 
@@ -29,42 +31,8 @@ impl ApprovalGate for AutoAllowGate {
 }
 
 pub struct RunOutcome {
-    pub session_path: PathBuf,
+    pub session_path: std::path::PathBuf,
     pub container: String,
-}
-
-/// Build the provider for the configured backend.
-pub fn build_provider(config: &Config) -> anyhow::Result<Arc<dyn smith_core::LlmProvider>> {
-    match config.provider.as_str() {
-        "ollama" => Ok(Arc::new(smith_providers::OllamaProvider::new(
-            config.ollama.base_url.clone(),
-            config.model.clone(),
-        ))),
-        "openai" => {
-            let key = std::env::var("OPENAI_API_KEY").context(
-                "OPENAI_API_KEY environment variable is not set (required for the openai provider)",
-            )?;
-            Ok(Arc::new(smith_providers::OpenAiProvider::new(
-                config.openai.base_url.clone(),
-                key,
-                config.model.clone(),
-            )))
-        }
-        other => anyhow::bail!("unknown provider `{other}`; expected `ollama` or `openai`"),
-    }
-}
-
-/// Start a sandbox session and executor for a workspace.
-pub async fn start_executor(
-    config: &Config,
-    workspace: &Path,
-) -> anyhow::Result<(Arc<Sandbox>, LocalExecutor)> {
-    let sandbox = Arc::new(Sandbox::new(config.sandbox_config()?));
-    sandbox.ensure_ready().await?;
-    sandbox.reap_stopped_sessions().await?;
-    let session = sandbox.start_session(workspace).await?;
-    let executor = LocalExecutor::new(Arc::clone(&sandbox), session);
-    Ok((sandbox, executor))
 }
 
 /// Run one task headlessly, printing events as they arrive.
@@ -249,60 +217,6 @@ pub async fn resume_headless(
     })
 }
 
-/// One-line environment summary injected into the system prompt (shared with
-/// the TUI path in main.rs).
-fn environment_notes(config: &Config) -> String {
-    let egress = match config
-        .sandbox_config()
-        .map(|s| (s.network, s.egress_enforce))
-    {
-        Ok((smith_sandbox::NetworkMode::Proxy, true)) => {
-            "egress: allowlist proxy, packet-enforced".to_string()
-        }
-        Ok((smith_sandbox::NetworkMode::Proxy, false)) => {
-            "egress: allowlist proxy (cooperative only)".to_string()
-        }
-        Ok((smith_sandbox::NetworkMode::Disabled, _)) => "network: disabled".to_string(),
-        Ok((smith_sandbox::NetworkMode::Open, _)) => "network: unrestricted".to_string(),
-        Err(e) => return format!("network: unknown ({e:#})"),
-    };
-    format!("Network mode: {egress}")
-}
-
-/// Set the sidecar clearance mode for a headless run: `ask` degrades to
-/// `deny` (nothing is attached to answer the modal); `allow` is honoured.
-/// Best-effort: a missing sidecar/token just keeps the sidecar default.
-pub fn set_clearance_mode(config: &Config, interactive: bool) {
-    let effective = match config.sandbox.egress_clearance.as_str() {
-        "allow" => "allow",
-        "deny" => "deny",
-        _ if interactive => "ask",
-        _ => {
-            println!("[clearance] ask degraded to deny for this headless run");
-            "deny"
-        }
-    };
-    if let Some(token) = smith_egress::client::read_token()
-        && let Err(e) = smith_egress::client::set_mode(
-            smith_egress::client::CLEARANCE_CONTROL_PORT,
-            &token,
-            effective,
-        )
-    {
-        tracing::debug!("clearance mode not set: {e:#}");
-    }
-}
-
-/// Load layered MCP config (user + workspace) and connect; never fatal.
-async fn connect_mcp(config: &Config, workspace_canon: &Path) -> smith_mcp::McpSession {
-    let mut mcp_config = config.mcp.clone();
-    match smith_mcp::McpConfig::load_workspace(workspace_canon) {
-        Ok(workspace_config) => mcp_config = mcp_config.merged(workspace_config),
-        Err(e) => tracing::warn!("could not load workspace MCP config: {e:#}"),
-    }
-    smith_mcp::McpSession::connect(&mcp_config).await
-}
-
 /// Run one turn with the live event printer attached.
 async fn run_turn_with_printer(
     agent: &Agent,
@@ -394,6 +308,9 @@ fn print_event(ev: &CoreEvent) {
         CoreEvent::TurnCompleted => println!("\n[done]"),
         CoreEvent::TurnCancelled => println!("\n[cancelled]"),
         CoreEvent::Error { message } => println!("[error] {message}"),
+        // The headless printer shows the task line itself; and approvals are
+        // auto-allowed here.
+        CoreEvent::UserMessage { .. } => {}
         CoreEvent::ApprovalRequested { .. } => {}
     }
 }

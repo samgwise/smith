@@ -82,7 +82,6 @@ mod tests {
     use super::*;
     use crate::model::{FinishReason, Role, ToolDef};
     use crate::provider::ProviderStream;
-    use std::pin::Pin;
 
     struct StaticProvider;
 

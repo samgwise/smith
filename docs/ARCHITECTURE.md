@@ -109,12 +109,47 @@ their explicitly configured environment (`${VAR}`-expanded; unset references
 drop the entry), and their tool list is fetched once per session to keep the
 request shape cache-stable. A failed server is reported and skipped.
 
+## The harness plane: `smith serve`
+
+M13 turned the harness into a place: `smith-server` hosts agent loops,
+session logs, approval routing and the model keys in a daemon; thin clients
+attach over the wire. The pieces:
+
+- **`smith-protocol`** is the frozen wire contract (`docs/SERVE_PROTOCOL.md`):
+  a versioned, sequenced envelope wrapping smith-core's `CoreEvent` plus
+  protocol-level events (`status`, `clearance_requested`,
+  `approval_decided`), carried by hand-rolled HTTP/1.1 with SSE streaming.
+  No web framework — the egress sidecar's control API is the house pattern,
+  and the message types (not the transport) are the compatibility surface.
+- **`smith-server`** assembles sessions exactly like `smith run` does
+  (`ConfigFactory`) behind an injectable `SessionFactory` seam, keeps a
+  journal per session (sequence numbers, bounded replay ring, broadcast
+  fan-out), and routes approvals through a first-decision-wins slot that
+  auto-denies on timeout. Egress clearance polling moved here too: the
+  sidecar is a machine-level concern, not a TUI concern. The egress client
+  is blocking std I/O (it also builds standalone in the container), so it
+  runs on the blocking pool.
+- **`smith-tui`'s `SessionLink` seam** is what made this a small diff: the
+  UI never touches the agent, history or gates — it sees `LinkEvent`s and
+  calls the link. `LocalLink` preserves the colocalised behaviour exactly
+  (in-process turn task, gate bridge, local clearance poller);
+  `RemoteLink` is the thin client (SSE reader with reconnect + replay,
+  RPCs for prompts/decisions). One UI, two topologies — the colocation
+  decision stays open by construction.
+
+Security posture of the daemon: loopback bind by default, bearer token in
+`~/.smith/serve-token`, request size caps and read timeouts on the hand-
+rolled parser, and — the point of the exercise — model keys exist only in
+the daemon's environment, so the prompting device holds no secrets.
+
 ## History
 
 The build proceeded in milestones (see `git log`): v1 vertical slice
 (sandbox + loop + TUI), M5 resumable sessions + compaction + slash commands,
 M6 project instructions + cache-stable prompting + paged reads + verify gate +
 exact-action approvals, M7 MCP client, M8 egress proxy, M9 nftables
-enforcement. The roadmap beyond: per-destination live allow/deny prompts, a
-replay/eval harness over session logs, streamable-HTTP MCP transport +
-OAuth, native-Linux enforcement, and remote executors/fleets.
+enforcement, M10 doctor + conformance, M11 per-destination clearance,
+M12 remote executor (podman-remote), M13 `smith serve` daemon + thin-client
+TUI (wire contract frozen in `docs/SERVE_PROTOCOL.md`). The fleet arc
+continues in `docs/FLEET_ROADMAP.md`: worker daemon + scheduler (M14),
+multi-agent orchestration (M15).

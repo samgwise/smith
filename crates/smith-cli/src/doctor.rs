@@ -11,8 +11,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::executor::LocalExecutor;
 use smith_core::{FileContents, ToolExecutor};
+use smith_sandbox::executor::LocalExecutor;
 use smith_sandbox::{Sandbox, SandboxConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

@@ -1,0 +1,13 @@
+[package]
+name = "smith-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol between smith thin clients and the serve daemon"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smith-core.workspace = true
+tokio.workspace = true

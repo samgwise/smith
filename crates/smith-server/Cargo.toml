@@ -1,0 +1,28 @@
+[package]
+name = "smith-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Smith controller daemon: hosted sessions, approval routing and the serve API"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dunce.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smith-core.workspace = true
+smith-egress.path = "../smith-egress"
+smith-mcp.workspace = true
+smith-providers.workspace = true
+smith-protocol.workspace = true
+smith-sandbox.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tempfile = "3"

@@ -7,8 +7,10 @@ description = "Podman-backed sandbox that runs agent commands in an isolated con
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 dirs.workspace = true
+smith-core.workspace = true
 smith-egress.path = "../smith-egress"
 dunce.workspace = true
 tokio.workspace = true

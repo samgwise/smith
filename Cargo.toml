@@ -5,7 +5,9 @@ members = [
     "crates/smith-egress",
     "crates/smith-mcp",
     "crates/smith-providers",
+    "crates/smith-protocol",
     "crates/smith-sandbox",
+    "crates/smith-server",
     "crates/smith-tui",
     "crates/smith-cli",
 ]
@@ -38,6 +40,8 @@ uuid = { version = "1", features = ["v4"] }
 
 smith-core = { path = "crates/smith-core" }
 smith-mcp = { path = "crates/smith-mcp" }
+smith-protocol = { path = "crates/smith-protocol" }
+smith-server = { path = "crates/smith-server" }
 smith-providers = { path = "crates/smith-providers" }
 smith-sandbox = { path = "crates/smith-sandbox" }
 smith-tui = { path = "crates/smith-tui" }

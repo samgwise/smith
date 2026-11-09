@@ -61,16 +61,20 @@ flowchart LR
 
 ## Milestone ladder
 
-- **M12 — remote executor (podman-remote).** `smith run --remote ssh://host`:
-  the podman CLI's own remote mode carries the container lifecycle and exec;
-  file tools move container-side; the egress stack (sidecar + nftables) runs
-  on the remote machine. Proves tool-calls-over-wire and the latency budget
-  with the smallest possible diff. Stepping stone to M13/M14.
-- **M13 — `smith serve` controller daemon.** The harness plane becomes a
-  place, not a process on the prompting device: agent loops run headlessly on
-  a controller host, the TUI becomes a thin client over an event stream
-  (SSE/WS), approvals round-trip over the same wire. Also the prerequisite
-  for fleets: a scheduler cannot be a desktop process.
+- **M12 — remote executor (podman-remote).** *Done.* `smith run --remote
+  ssh://host`: the podman CLI's own remote mode carries the container
+  lifecycle and exec; file tools move container-side; the egress stack
+  (sidecar + nftables) runs on the remote machine. Proves
+  tool-calls-over-wire and the latency budget with the smallest possible
+  diff. Stepping stone to M13/M14.
+- **M13 — `smith serve` controller daemon.** *Done.* The harness plane is a
+  place, not a process on the prompting device: `smith-server` hosts agent
+  loops, session logs, approval routing and the model keys; the TUI attaches
+  as a thin client over the frozen wire contract (`docs/SERVE_PROTOCOL.md` —
+  versioned envelopes, SSE event stream, journal replay, first-decision-wins
+  approvals with timeout-deny). Loopback today, reverse proxy when it leaves
+  the box. Also the prerequisite for fleets: a scheduler cannot be a desktop
+  process.
 - **M14 — worker daemon + fleet scheduler.** `smith-worker` enrols, dials the
   controller outbound, heartbeats capability, and leases tasks from the board.
   Workspace materialisation via git; streamed exec events as the wire format;
@@ -82,18 +86,24 @@ flowchart LR
 
 ## Open decisions (to settle as the arc proceeds)
 
-- **Controller colocation.** Where the harness runs: on the prompting device
-  (Tier-1 style, fine while models are remote via linguine) or on its own
-  box. Latency rule of thumb: the harness wants to be near the execution
-  plane (the loop is chatty), the prompting plane can be anywhere.
+- **Controller colocation.** *Partially settled at M13.* The harness runs
+  wherever `smith serve` runs — by default on the prompting device (loopback,
+  fine while models are remote via linguine), with `--bind` + a reverse
+  proxy when it moves to its own box. The latency rule of thumb stands: the
+  harness wants to be near the execution plane (the loop is chatty), the
+  prompting plane can be anywhere.
 - **Repo topology for materialisation.** Self-hosted Forgejo/Gitea vs GitHub;
   how workers authenticate (deploy keys scoped per workspace vs a forge token
   broker on the controller).
-- **Wire protocol.** SSE + REST vs WebSocket vs an NNG-style mesh in Rust;
-  linguine's wss-through-reverse-proxy deployment is the proven homelab
-  pattern and the default lean.
-- **Streaming exec event format.** M13's wire format is the compatibility
-  freeze point — design the event stream as the contract.
+- **Wire protocol.** *Settled at M13, loopback scope.* Hand-rolled HTTP/1.1
+  + REST + SSE, no framework (the egress sidecar's pattern; zero new
+  dependencies). The message shapes are the freeze
+  (`docs/SERVE_PROTOCOL.md`); a WebSocket carrier can transport the same
+  envelopes in M14+ if the mesh needs bidirectional multiplexing. TLS via
+  reverse proxy when the daemon leaves the box — linguine's homelab pattern.
+- **Streaming exec event format.** *M13's harness stream is frozen*
+  (envelope + replay semantics). The worker-mesh exec event format is still
+  open until M14.
 - **Observability.** Prometheus/OpenTelemetry from the first worker
   (requests, exec duration, queue wait, lease churn, clearance denials) —
   the same advice linguine's review gave, taken.

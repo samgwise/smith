@@ -322,7 +322,9 @@ mod tests {
             name: "list_dir".into(),
             arguments: r#"{"path":"."}"#.into(),
         };
-        logger.log_assistant("", &[call.clone()]).unwrap();
+        logger
+            .log_assistant("", std::slice::from_ref(&call))
+            .unwrap();
         logger.log_tool(&call, true, "Cargo.toml\nsrc/").unwrap();
         logger
             .log_assistant("The workspace has Cargo.toml and src/.", &[])
