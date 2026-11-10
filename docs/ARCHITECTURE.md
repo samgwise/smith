@@ -160,6 +160,23 @@ workers enforce nftables natively (a third `root_shell` transport, sudo);
 the scheduler is capability-aware, least-loaded, and queues sessions when
 no worker fits. Metrics (Prometheus text, hand-rolled) at `/v1/metrics`.
 
+## The orchestration plane (M15)
+
+M15 closes the fleet arc: **one prompt in, many agents out**. An
+orchestration parent is just an agent with five more tools — the
+planner tools are controller-level `Tool` impls over an orchestrator
+handle (no core-trait change, no new execution paths). Children are
+created **queued** (journal, gate and labels exist immediately) and
+assembled **lazily**: a dispatcher grants leases as workers free up and
+builds the harness in place, so parallel spawns never serialise. A
+tool-less judge reviews each child's report + diff before the planner
+sees it (the verify gate's bounded-feedback pattern applied to finding
+quality), and worker-side **merge gates** converge the branches onto a
+per-parent integration branch (`merge --no-ff`, conflicts surfaced to the
+planner, `auto_push` off by default — the fleet produces reviewable
+branches). Full model, limits and worked example:
+`docs/ORCHESTRATION.md`.
+
 ## History
 
 The build proceeded in milestones (see `git log`): v1 vertical slice
@@ -169,5 +186,5 @@ exact-action approvals, M7 MCP client, M8 egress proxy, M9 nftables
 enforcement, M10 doctor + conformance, M11 per-destination clearance,
 M12 remote executor (podman-remote), M13 `smith serve` daemon + thin-client
 TUI (wire contract frozen in `docs/SERVE_PROTOCOL.md`). The fleet arc
-continues in `docs/FLEET_ROADMAP.md`: worker daemon + scheduler (M14),
+completed in `docs/FLEET_ROADMAP.md`: worker daemon + scheduler (M14),
 multi-agent orchestration (M15).

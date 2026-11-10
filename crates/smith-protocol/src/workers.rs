@@ -43,6 +43,8 @@ pub enum LeaseState {
     /// The worker went stale, was revoked or disconnected; the checkpoint
     /// branch holds the work.
     Lost,
+    /// Explicitly released (M15 orchestration finish). Terminal.
+    Released,
 }
 
 // ----------------------------------------------------- executor shapes --
@@ -112,8 +114,23 @@ pub enum OpResult {
     ExecShell(ExecResultDto),
     ReadFile(smith_core::FileContents),
     WriteFile,
-    ListDir { entries: Vec<String> },
-    Failed { message: String },
+    ListDir {
+        entries: Vec<String>,
+    },
+    /// Merge-gate outcome (M15). `conflict` marks a git merge failure; a
+    /// gate-command failure has `ok = false` with the command's output.
+    MergeGate {
+        ok: bool,
+        conflict: bool,
+        output: String,
+    },
+    /// Generic success for non-executor ops (e.g. PushBranch).
+    Done {
+        output: String,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// One streamed exec telemetry event — the M14 freeze. Deltas are
@@ -196,6 +213,34 @@ pub enum WorkerCommand {
     },
     Checkpoint {
         session_id: String,
+    },
+    /// Merge gate (M15): in the session's bare cache, merge the session's
+    /// checkpoint branch into the integration branch and (optionally) run a
+    /// gate command on the merged tree. Never destructive — the result
+    /// reports conflict/gate output for the planner to rework.
+    MergeGate {
+        session_id: String,
+        /// Ack correlation: the worker reports the outcome via op-result
+        /// with this id.
+        exec_id: String,
+        /// Integration branch ref, e.g. `smith/integration/<parent>`.
+        /// Seeded from the session's materialisation ref when missing.
+        integration_ref: String,
+        /// Command run in a fresh sandbox on the merged tree (empty =
+        /// merge-only).
+        #[serde(default)]
+        gate_command: String,
+    },
+    /// Push one ref onto another on the origin (M15 convergence: the
+    /// integration branch onto the base ref when `auto_push` is opted in).
+    PushBranch {
+        session_id: String,
+        exec_id: String,
+        /// Local ref in the session's bare cache, e.g. the integration
+        /// branch.
+        from_ref: String,
+        /// Destination branch on the origin, e.g. the base ref.
+        to_ref: String,
     },
 }
 
@@ -398,6 +443,19 @@ mod tests {
         };
         let back: OpResult = serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
         assert_eq!(back, list);
+
+        let gate = OpResult::MergeGate {
+            ok: false,
+            conflict: true,
+            output: "CONFLICT (content): Merge conflict in lib.rs".into(),
+        };
+        let json = serde_json::to_string(&gate).unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"merge_gate","ok":false,"conflict":true,"output":"CONFLICT (content): Merge conflict in lib.rs"}"#
+        );
+        let back: OpResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, gate);
     }
 
     #[test]
@@ -438,6 +496,42 @@ mod tests {
         assert!(json.contains(r#""op":"list_dir""#));
         let back: WorkerCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(back, exec);
+
+        let gate = WorkerCommand::MergeGate {
+            session_id: "abc".into(),
+            exec_id: "e10".into(),
+            integration_ref: "smith/integration/p1".into(),
+            gate_command: "cargo test -q".into(),
+        };
+        let json = serde_json::to_string(&gate).unwrap();
+        assert!(json.contains(r#""cmd":"merge_gate""#));
+        let back: WorkerCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, gate);
+
+        let push = WorkerCommand::PushBranch {
+            session_id: "abc".into(),
+            exec_id: "e11".into(),
+            from_ref: "smith/integration/p1".into(),
+            to_ref: "main".into(),
+        };
+        let json = serde_json::to_string(&push).unwrap();
+        assert!(json.contains(r#""cmd":"push_branch""#));
+        let back: WorkerCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, push);
+        // An empty gate command (merge-only) survives the wire too.
+        let plain: WorkerCommand = serde_json::from_str(
+            r#"{"cmd":"merge_gate","session_id":"abc","exec_id":"e10","integration_ref":"smith/integration/p1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plain,
+            WorkerCommand::MergeGate {
+                session_id: "abc".into(),
+                exec_id: "e10".into(),
+                integration_ref: "smith/integration/p1".into(),
+                gate_command: String::new(),
+            }
+        );
     }
 
     #[test]

@@ -187,6 +187,33 @@ See [`docs/WORKER_MESH.md`](docs/WORKER_MESH.md) for the trust model (the
 controller mints keys; workers verify the controller by its TLS cert), the
 lease semantics, and the streamed-exec wire format.
 
+## Orchestration: one prompt in, many agents out
+
+With `--orchestrate`, a session becomes a **planner**: it decomposes work
+into subtasks, each executed by its own agent on its own worker lease and
+git worktree. A tool-less **judge** reviews every sub-agent's report before
+the planner sees it (bounded rework rounds), and worker-side **merge gates**
+converge the checkpoint branches onto a reviewable integration branch
+(`smith/integration/<session>`) — conflicts come back to the planner for
+rework; nothing is pushed without opting in.
+
+```sh
+smith serve                                   # the controller
+smith attach --orchestrate --repo https://... # a planner session (interactive)
+smith run --serve --orchestrate --repo https://... "refactor config + docs + tests"
+```
+
+```toml
+[orchestrate]           # ~/.smith/config.toml
+max_children = 8        # spawn caps are config, not model judgement
+judge_rounds = 2        # 0 disables judging (plain parallel spawning)
+gate_command = "cargo test -q"   # empty = merge-only
+auto_push = false       # humans review the integration branch by default
+```
+
+See [`docs/ORCHESTRATION.md`](docs/ORCHESTRATION.md) for the model, the
+limits, and a worked example.
+
 ## MCP servers
 
 smith connects to stdio MCP servers and exposes their tools to the agent as
@@ -258,6 +285,9 @@ smith attach
 
 # The fleet: lease a worker, materialise from git (see the fleet section)
 smith run --serve --worker gpu-box --repo https://... "task"
+
+# Multi-agent orchestration (see the orchestration section)
+smith run --serve --orchestrate --repo https://... "refactor these three modules"
 
 # One-shot task, auto-approved, gated by the verify command
 smith run "explain what this project does"

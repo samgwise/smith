@@ -12,9 +12,10 @@ pub mod factory;
 pub mod gate;
 pub mod http;
 pub mod journal;
+pub mod orchestrator;
 pub mod workers;
 
-pub use config::{Config, ServeSection, WorkerSection};
+pub use config::{Config, OrchestrateSection, ServeSection, WorkerSection};
 pub use controller::{ApiError, Controller, WorkerDefaults};
 pub use factory::{
     ConfigFactory, SessionFactory, SessionParts, build_provider, connect_mcp, environment_notes,

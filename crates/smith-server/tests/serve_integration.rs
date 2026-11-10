@@ -2,6 +2,7 @@
 //! surface and protocol client end-to-end over loopback — no podman, no
 //! model service.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,8 +15,12 @@ use smith_core::{
     Agent, ApprovalDecision, ApprovalGate, LlmProvider, Message, ProviderEvent, ToolDef,
 };
 use smith_protocol::http::{read_request, write_json_response};
-use smith_protocol::{Envelope, EventStream, ServeClient, WireEvent};
+use smith_protocol::{
+    Capability, EnrolRequest, Envelope, EventStream, OpResult, OpResultRequest, ServeClient,
+    WireEvent, WorkerCommand,
+};
 use smith_server::Controller;
+use smith_server::OrchestrateSection;
 use smith_server::factory::{SessionFactory, SessionParts};
 
 const TOKEN: &str = "test-token";
@@ -51,6 +56,9 @@ use smith_core::testing::{
 struct FakeFactory {
     script: Vec<MockResponse>,
     hang: bool,
+    /// Script for the ORCHESTRATION judge (built when the orchestrator
+    /// asks for its `judge_model` provider).
+    judge_script: Vec<MockResponse>,
 }
 
 #[async_trait]
@@ -95,6 +103,9 @@ impl SessionFactory for FakeFactory {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> anyhow::Result<Arc<dyn LlmProvider>> {
+        if model == Some("judge") {
+            return Ok(Arc::new(ScriptedProvider::new(self.judge_script.clone())));
+        }
         Ok(Arc::new(ScriptedProvider::new(vec![MockResponse {
             text: format!(
                 "{}:{}",
@@ -122,6 +133,7 @@ async fn harness(script: Vec<MockResponse>, approval_timeout: Duration) -> Harne
         FakeFactory {
             script,
             hang: false,
+            judge_script: vec![],
         },
         approval_timeout,
     )
@@ -161,6 +173,7 @@ fn harness_controller(
         fleet,
         metrics,
         smith_server::WorkerDefaults::default(),
+        smith_server::OrchestrateSection::default(),
     )
 }
 
@@ -296,6 +309,7 @@ async fn second_turn_while_busy_is_409_and_cancel_works() {
         FakeFactory {
             script: vec![],
             hang: true,
+            judge_script: vec![],
         },
         Duration::from_secs(60),
     )
@@ -612,6 +626,7 @@ async fn clearance_requests_fan_out_and_decisions_are_forwarded() {
         FakeFactory {
             script: vec![],
             hang: false,
+            judge_script: vec![],
         },
         Duration::from_secs(60),
     );
@@ -654,4 +669,447 @@ async fn clearance_requests_fan_out_and_decisions_are_forwarded() {
     let body: serde_json::Value = serde_json::from_str(&recorded).unwrap();
     assert_eq!(body["id"], 7);
     assert_eq!(body["decision"], "allow");
+}
+
+// ---- M15: orchestration over the mesh -------------------------------
+
+/// A fake worker: enrols, dials the command stream and answers commands
+/// with scripted/canned results (no podman, no real materialisation).
+/// Records received MergeGate commands for assertions.
+async fn spawn_fake_worker(
+    client: &ServeClient,
+    port: u16,
+    name: &str,
+    merge_results: Arc<Mutex<VecDeque<OpResult>>>,
+    gate_commands: Arc<Mutex<Vec<String>>>,
+) {
+    let issue = client.worker_issue(name).await.unwrap();
+    let enrol = ServeClient::new("127.0.0.1", port, issue.clone());
+    let cred = enrol
+        .worker_enrol(&EnrolRequest {
+            name: name.into(),
+            enrolment_token: issue,
+            // Empty image matches every session's pick.
+            capability: Capability {
+                image: String::new(),
+                toolchains: vec![],
+                cpus: 1,
+                mem_mb: 1,
+                os: "linux".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let worker_client = ServeClient::new("127.0.0.1", port, cred.worker_token);
+    tokio::spawn(async move {
+        'reconnect: loop {
+            let Ok(mut stream) = worker_client.stream("/v1/worker/events").await else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue 'reconnect;
+            };
+            loop {
+                match stream.next_raw().await {
+                    Ok(Some(payload)) => {
+                        let Ok(cmd) = serde_json::from_str::<WorkerCommand>(&payload) else {
+                            continue;
+                        };
+                        let (session_id, exec_id, result) = match &cmd {
+                            WorkerCommand::StartSession {
+                                session_id,
+                                exec_id,
+                                ..
+                            } => (session_id.clone(), exec_id.clone(), OpResult::WriteFile),
+                            WorkerCommand::Exec {
+                                session_id,
+                                exec_id,
+                                ..
+                            } => (
+                                session_id.clone(),
+                                exec_id.clone(),
+                                OpResult::Failed {
+                                    message: "fake worker does not execute ops".into(),
+                                },
+                            ),
+                            WorkerCommand::MergeGate {
+                                session_id,
+                                exec_id,
+                                integration_ref,
+                                ..
+                            } => {
+                                gate_commands.lock().unwrap().push(integration_ref.clone());
+                                let result = merge_results.lock().unwrap().pop_front().unwrap_or(
+                                    OpResult::Failed {
+                                        message: "no scripted merge result".into(),
+                                    },
+                                );
+                                (session_id.clone(), exec_id.clone(), result)
+                            }
+                            WorkerCommand::PushBranch {
+                                session_id,
+                                exec_id,
+                                ..
+                            } => (
+                                session_id.clone(),
+                                exec_id.clone(),
+                                OpResult::Done {
+                                    output: "pushed".into(),
+                                },
+                            ),
+                            // Fire-and-forget commands: nothing to answer.
+                            WorkerCommand::StopSession { .. }
+                            | WorkerCommand::Checkpoint { .. } => continue,
+                        };
+                        let _ = worker_client
+                            .post_body(
+                                "/v1/worker/op-result",
+                                serde_json::to_string(&OpResultRequest {
+                                    session_id,
+                                    exec_id,
+                                    result,
+                                })
+                                .unwrap(),
+                            )
+                            .await;
+                    }
+                    _ => continue 'reconnect,
+                }
+            }
+        }
+    });
+}
+
+fn accept_verdict() -> MockResponse {
+    MockResponse {
+        text: r#"{"verdict":"accept","critique":"task complete, diff reviewed"}"#.into(),
+        calls: vec![],
+    }
+}
+
+fn rework_verdict() -> MockResponse {
+    MockResponse {
+        text: r#"{"verdict":"rework","critique":"the report lacks the test results"}"#.into(),
+        calls: vec![],
+    }
+}
+
+/// Full planner/judge/worker flow over loopback: a scripted planner spawns
+/// two children, both execute (one needs a judge rework round), findings
+/// are collected, merge gates run (one clean, one conflict reworked), and
+/// finish releases the fleet. Journals, branch names, states and metrics
+/// are asserted.
+#[tokio::test]
+async fn orchestration_end_to_end_over_the_mesh() {
+    let ws = tempfile::tempdir().unwrap();
+    let repo = "https://git.example.com/org/repo.git";
+    let planner_script = vec![
+        MockResponse {
+            text: String::new(),
+            calls: vec![tool_named(
+                "c1",
+                "spawn_subtasks",
+                serde_json::json!({ "subtasks": [
+                    { "title": "alpha", "instructions": "do alpha", "repo": repo },
+                    { "title": "beta", "instructions": "do beta", "repo": repo },
+                ]}),
+            )],
+        },
+        MockResponse {
+            text: "plan laid out".into(),
+            calls: vec![],
+        },
+    ];
+    let judge_script = vec![
+        accept_verdict(), // child 1
+        rework_verdict(), // child 2, first attempt
+        accept_verdict(), // child 2 after its rework turn
+    ];
+    let merge_results = Arc::new(Mutex::new(VecDeque::from(vec![
+        OpResult::MergeGate {
+            ok: true,
+            conflict: false,
+            output: "merged clean".into(),
+        },
+        OpResult::MergeGate {
+            ok: false,
+            conflict: true,
+            output: "CONFLICT (content): Merge conflict in lib.rs".into(),
+        },
+        OpResult::MergeGate {
+            ok: true,
+            conflict: false,
+            output: "reworked and merged".into(),
+        },
+    ])));
+    let gate_commands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+
+    // The test constructor takes the orchestration section directly: a
+    // judge model override and short, test-friendly timeouts.
+    let controller = {
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(smith_server::Fleet::new(
+            ws.path().join("workers2.json"),
+            metrics.clone(),
+        ));
+        smith_server::Controller::with_parts(
+            Arc::new(FakeFactory {
+                script: planner_script,
+                hang: false,
+                judge_script,
+            }),
+            Duration::from_secs(60),
+            fleet,
+            metrics,
+            smith_server::WorkerDefaults::default(),
+            OrchestrateSection {
+                max_children: 8,
+                judge_rounds: 2,
+                judge_model: "judge".into(),
+                gate_command: String::new(),
+                auto_push: false,
+                collect_timeout_secs: 30,
+            },
+        )
+    };
+    let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener,
+        controller.clone(),
+        TOKEN.to_string(),
+    ));
+    let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
+    spawn_fake_worker(
+        &client,
+        port,
+        "fake-1",
+        merge_results,
+        gate_commands.clone(),
+    )
+    .await;
+
+    // The planner: a local session with orchestration opt-in.
+    let parent = client
+        .create_session_req(&smith_protocol::CreateSession {
+            workspace: ws.path().to_str().unwrap().to_string(),
+            provider: None,
+            model: None,
+            approval_mode: smith_protocol::ApprovalMode::Auto,
+            worker: None,
+            repo: None,
+            git_ref: None,
+            orchestrate: true,
+        })
+        .await
+        .unwrap();
+    let mut events = client.events(&parent, 0).await.unwrap();
+    client
+        .start_turn(&parent, "orchestrate this")
+        .await
+        .unwrap();
+
+    // The planner's spawn tool call lands: two children queued then granted.
+    collect_until(&mut events, |e| {
+        matches!(
+            &e.event,
+            WireEvent::Orchestration {
+                kind: smith_protocol::OrchestrationKind::Spawned,
+                ..
+            }
+        )
+    })
+    .await;
+    // Wait for BOTH children to start (granted + first turns running).
+    loop {
+        let status = client.status(&parent).await.unwrap();
+        if status.children.len() == 2
+            && status
+                .children
+                .iter()
+                .all(|c| c.state == smith_protocol::ChildState::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let children: Vec<String> = client
+        .status(&parent)
+        .await
+        .unwrap()
+        .children
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+
+    // One level deep: the children's agents have no orchestration tools.
+    for child in &children {
+        let agent = controller.get(child).unwrap().agent().unwrap();
+        assert_eq!(
+            agent.tools.len(),
+            4,
+            "builtin tools only, got {}",
+            agent.tools.len()
+        );
+        assert!(!agent.tools.iter().any(|t| t.def().name == "spawn_subtasks"));
+    }
+
+    let orch = controller
+        .get(&parent)
+        .unwrap()
+        .orchestration
+        .clone()
+        .expect("parent carries an orchestrator");
+
+    // Collect child 1: the judge accepts.
+    let f1 = orch.collect(&children[0]).await.unwrap();
+    assert!(f1.contains("verdict: accept"), "{f1}");
+    // Collect child 2: rework round, then accept.
+    let f2 = orch.collect(&children[1]).await.unwrap();
+    assert!(f2.contains("verdict: accept"), "{f2}");
+
+    // Merge gates: clean, conflict, reworked.
+    let m1 = orch.merge(&children[0]).await.unwrap();
+    assert!(m1.contains("OK"), "{m1}");
+    assert!(m1.contains("smith/"), "{m1}");
+    let m2 = orch.merge(&children[1]).await.unwrap();
+    assert!(m2.contains("CONFLICT"), "{m2}");
+    let m3 = orch.merge(&children[1]).await.unwrap();
+    assert!(m3.contains("OK"), "{m3}");
+
+    // The gates merged against the parent's integration branch.
+    let gates = gate_commands.lock().unwrap().clone();
+    assert_eq!(gates, vec![format!("smith/integration/{parent}"); 3]);
+
+    // Finish: releases leases, closes the orchestration.
+    let fin = orch.finish("everything merged").await.unwrap();
+    assert!(fin.contains("orchestration closed"), "{fin}");
+
+    // Children's leases are Released; the parent status lists them done.
+    for child in &children {
+        let st = client.status(child).await.unwrap();
+        assert_eq!(st.lease_state, Some(smith_protocol::LeaseState::Released));
+    }
+    let parent_status = client.status(&parent).await.unwrap();
+    assert_eq!(parent_status.children.len(), 2);
+    assert!(
+        parent_status
+            .children
+            .iter()
+            .all(|c| c.state == smith_protocol::ChildState::Completed)
+    );
+
+    // The parent's journal tells the whole story (fresh stream = replay).
+    let mut journal = client.events(&parent, 0).await.unwrap();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(5), journal.next())
+            .await
+            .expect("timed out reading the journal")
+            .expect("journal error")
+            .expect("journal ended");
+        let mut done = false;
+        if let WireEvent::Orchestration { child, kind, .. } = &next.event {
+            *counts.entry(format!("{:?}", kind)).or_default() += 1;
+            done = *child == parent && *kind == smith_protocol::OrchestrationKind::Released;
+        }
+        if done {
+            break;
+        }
+    }
+    assert_eq!(counts["Spawned"], 2);
+    assert_eq!(counts["Started"], 2);
+    assert_eq!(counts["Judged"], 3);
+    assert_eq!(counts["Merged"], 2);
+    assert_eq!(counts["Failed"], 1);
+    assert_eq!(counts["Released"], 3); // two children + the closing parent event
+
+    // Judge verdict metrics.
+    let metrics = client.metrics().await.unwrap();
+    assert!(
+        metrics.contains("smith_judge_total{verdict=\"accept\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("smith_judge_total{verdict=\"rework\"} 1"),
+        "{metrics}"
+    );
+}
+
+/// Caps are config, not model judgement: spawn beyond max_children errors,
+/// children stay queued without workers, and finish releases cleanly.
+#[tokio::test]
+async fn spawn_caps_are_enforced_and_finish_releases_queued_children() {
+    let ws = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+    let fleet = Arc::new(smith_server::Fleet::new(
+        ws.path().join("workers3.json"),
+        metrics.clone(),
+    ));
+    let controller = smith_server::Controller::with_parts(
+        Arc::new(FakeFactory {
+            script: vec![],
+            hang: false,
+            judge_script: vec![],
+        }),
+        Duration::from_secs(60),
+        fleet,
+        metrics,
+        smith_server::WorkerDefaults::default(),
+        OrchestrateSection {
+            max_children: 1,
+            ..Default::default()
+        },
+    );
+    let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener,
+        controller.clone(),
+        TOKEN.to_string(),
+    ));
+    let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
+
+    let parent = client
+        .create_session_req(&smith_protocol::CreateSession {
+            workspace: ws.path().to_str().unwrap().to_string(),
+            provider: None,
+            model: None,
+            approval_mode: smith_protocol::ApprovalMode::Auto,
+            worker: None,
+            repo: None,
+            git_ref: None,
+            orchestrate: true,
+        })
+        .await
+        .unwrap();
+    let orch = controller
+        .get(&parent)
+        .unwrap()
+        .orchestration
+        .clone()
+        .expect("parent carries an orchestrator");
+
+    let spec = |title: &str| smith_server::orchestrator::SubtaskSpec {
+        title: title.into(),
+        instructions: format!("do {title}"),
+        repo: Some("https://git.example.com/org/repo.git".into()),
+        git_ref: None,
+    };
+
+    // Over the cap (1): refused.
+    let err = orch.spawn(vec![spec("a"), spec("b")]).await.unwrap_err();
+    assert!(err.message.contains("max_children"), "{err}");
+
+    // Within the cap: queued immediately (no workers exist).
+    orch.spawn(vec![spec("a")]).await.unwrap();
+    let status = client.status(&parent).await.unwrap();
+    assert_eq!(status.children.len(), 1);
+    assert_eq!(status.children[0].state, smith_protocol::ChildState::Queued);
+
+    // A closed orchestration refuses further spawns.
+    orch.finish("abandoned").await.unwrap();
+    let err = orch.spawn(vec![spec("z")]).await.unwrap_err();
+    assert!(err.message.contains("closed"), "{err}");
+    // And the queued child was released with no lease to free.
+    let st = client.status(&status.children[0].id).await.unwrap();
+    assert_eq!(st.lease_state, Some(smith_protocol::LeaseState::Released));
 }

@@ -333,6 +333,78 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                 tracing::info!("session {session_id} stopped");
             }
         }
+        WorkerCommand::MergeGate {
+            session_id,
+            exec_id,
+            integration_ref,
+            gate_command,
+        } => {
+            let result = run_merge_gate(&state, &session_id, &integration_ref, &gate_command).await;
+            let reply = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("merge_gate {session_id}: {e:#}");
+                    OpResult::Failed {
+                        message: format!("{e:#}"),
+                    }
+                }
+            };
+            let cred = state.credential.lock().await.clone();
+            let _ = controller_client(&cred)
+                .post_body(
+                    "/v1/worker/op-result",
+                    serde_json::to_string(&smith_protocol::OpResultRequest {
+                        session_id: session_id.clone(),
+                        exec_id,
+                        result: reply,
+                    })
+                    .unwrap_or_else(|_| "{\"result\":\"failed\"}".into()),
+                )
+                .await;
+        }
+        WorkerCommand::PushBranch {
+            session_id,
+            exec_id,
+            from_ref,
+            to_ref,
+        } => {
+            let record = state
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|s| s.source.clone());
+            let reply = match record {
+                Some(source) => {
+                    let result = tokio::task::spawn_blocking(move || {
+                        materialise::push_branch(&source, &from_ref, &to_ref)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("push_branch join failed")));
+                    match result {
+                        Ok(output) => OpResult::Done { output },
+                        Err(e) => OpResult::Failed {
+                            message: format!("{e:#}"),
+                        },
+                    }
+                }
+                None => OpResult::Failed {
+                    message: "session not found on this worker".into(),
+                },
+            };
+            let cred = state.credential.lock().await.clone();
+            let _ = controller_client(&cred)
+                .post_body(
+                    "/v1/worker/op-result",
+                    serde_json::to_string(&smith_protocol::OpResultRequest {
+                        session_id,
+                        exec_id,
+                        result: reply,
+                    })
+                    .unwrap_or_else(|_| "{\"result\":\"failed\"}".into()),
+                )
+                .await;
+        }
         WorkerCommand::Checkpoint { session_id } => {
             let record = state
                 .sessions
@@ -407,6 +479,138 @@ async fn start_session(
         },
     );
     Ok(())
+}
+
+/// Merge gate (M15): git half on the blocking pool, then the optional
+/// gate command in a fresh sandbox over the merged tree. The result is
+/// always planner-actionable — `{ok, conflict, output}` — and nothing is
+/// destructive: a failed gate leaves the integration branch untouched.
+async fn run_merge_gate(
+    state: &Arc<WorkerState>,
+    session_id: &str,
+    integration_ref: &str,
+    gate_command: &str,
+) -> anyhow::Result<OpResult> {
+    let (_worktree, source) = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|s| (s.worktree.clone(), s.source.clone()))
+        .context("session not found on this worker")?;
+
+    // Git half: fetch, seed, worktree, merge --no-ff.
+    let source_for_task = source.clone();
+    let sid = session_id.to_string();
+    let iref = integration_ref.to_string();
+    let step = tokio::task::spawn_blocking(move || {
+        materialise::merge_for_gate(&source_for_task, &sid, &iref)
+    })
+    .await
+    .context("merge gate join failed")??;
+    let step = match step {
+        materialise::GateStep::Failed { conflict, output } => {
+            return Ok(OpResult::MergeGate {
+                ok: false,
+                conflict,
+                output,
+            });
+        }
+        step => step,
+    };
+    let materialise::GateStep::Merged(gate) = step else {
+        anyhow::bail!("merge gate reported no outcome");
+    };
+    let merge_output = gate.output.clone();
+
+    let command = gate_command.trim().to_string();
+    if command.is_empty() {
+        // Merge-only gate: the merge result IS the outcome.
+        let source_for_task = source.clone();
+        let iref = integration_ref.to_string();
+        let pushed = tokio::task::spawn_blocking(move || {
+            materialise::commit_gate(&source_for_task, &gate, &iref)
+        })
+        .await
+        .context("merge gate join failed")??;
+        return Ok(OpResult::MergeGate {
+            ok: true,
+            conflict: false,
+            output: merge_output + &push_note(pushed),
+        });
+    }
+
+    // Verification gate: a fresh disposable sandbox over the merged tree
+    // (the child's own container still holds its session worktree).
+    let sandbox = Arc::new(smith_sandbox::Sandbox::new(sandbox_config(state)));
+    sandbox.ensure_ready().await?;
+    sandbox.reap_stopped_sessions().await?;
+    let gate_session = sandbox.start_session(&gate.worktree).await?;
+    let outcome = sandbox
+        .exec(&gate_session, &command, Some(Duration::from_secs(600)))
+        .await;
+    let _ = sandbox.stop_session(&gate_session).await;
+
+    let (source_for_task, iref) = (source.clone(), integration_ref.to_string());
+    match outcome {
+        Ok(out) if out.exit_code == 0 => {
+            let pushed = tokio::task::spawn_blocking(move || {
+                materialise::commit_gate(&source_for_task, &gate, &iref)
+            })
+            .await
+            .context("merge gate join failed")??;
+            Ok(OpResult::MergeGate {
+                ok: true,
+                conflict: false,
+                output: clamp_gate_output(&format!(
+                    "gate `{command}` passed (exit 0):\n{}",
+                    out.stdout + &out.stderr
+                )) + &push_note(pushed),
+            })
+        }
+        Ok(out) => {
+            tokio::task::spawn_blocking(move || materialise::abort_gate(&source_for_task, &gate))
+                .await
+                .context("merge gate join failed")??;
+            Ok(OpResult::MergeGate {
+                ok: false,
+                conflict: false,
+                output: clamp_gate_output(&format!(
+                    "gate `{command}` failed (exit {}):\n{}",
+                    out.exit_code,
+                    out.stdout + &out.stderr
+                )),
+            })
+        }
+        Err(e) => {
+            tokio::task::spawn_blocking(move || materialise::abort_gate(&source_for_task, &gate))
+                .await
+                .context("merge gate join failed")??;
+            Ok(OpResult::MergeGate {
+                ok: false,
+                conflict: false,
+                output: clamp_gate_output(&format!("gate `{command}` could not run: {e:#}")),
+            })
+        }
+    }
+}
+
+fn push_note(pushed: bool) -> String {
+    if pushed {
+        " (integration branch pushed)".to_string()
+    } else {
+        " (integration branch advanced locally only)".to_string()
+    }
+}
+
+/// Tool-output budget for the gate result the planner sees.
+fn clamp_gate_output(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= 6000 {
+        return text.to_string();
+    }
+    let start = chars.len() - 6000;
+    format!("…{}", chars[start..].iter().collect::<String>())
 }
 
 /// Execute one op against the leased sandbox; report via op-result (+ exec

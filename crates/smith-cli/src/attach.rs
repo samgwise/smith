@@ -55,6 +55,7 @@ pub async fn run_attach(
     worker: Option<&str>,
     repo: Option<&str>,
     git_ref: Option<&str>,
+    orchestrate: bool,
 ) -> anyhow::Result<()> {
     let client = resolve_client(url, token)?;
     client
@@ -105,6 +106,7 @@ pub async fn run_attach(
                             worker: worker.map(str::to_string),
                             repo: repo.map(str::to_string),
                             git_ref: git_ref.map(str::to_string),
+                            orchestrate,
                         })
                         .await?
                 }

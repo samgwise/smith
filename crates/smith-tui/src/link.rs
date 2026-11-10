@@ -336,6 +336,18 @@ impl SessionLink for LocalLink {
     }
 }
 
+/// One-word verb for an orchestration event kind.
+fn kind_word(kind: smith_protocol::OrchestrationKind) -> &'static str {
+    match kind {
+        smith_protocol::OrchestrationKind::Spawned => "spawned",
+        smith_protocol::OrchestrationKind::Started => "started",
+        smith_protocol::OrchestrationKind::Judged => "judged",
+        smith_protocol::OrchestrationKind::Merged => "merged",
+        smith_protocol::OrchestrationKind::Failed => "failed",
+        smith_protocol::OrchestrationKind::Released => "released",
+    }
+}
+
 // ----------------------------------------------------------- RemoteLink --
 
 pub struct RemoteLink {
@@ -377,6 +389,21 @@ impl RemoteLink {
                                         text: format!(
                                             "  {mark}{text}",
                                             mark = if is_stderr { "!" } else { "" }
+                                        ),
+                                    }),
+                                    // Orchestration lifecycle (M15): a
+                                    // Notice via replay today; the TUI can
+                                    // style it as a tree later.
+                                    WireEvent::Orchestration {
+                                        child,
+                                        kind,
+                                        detail,
+                                        ..
+                                    } => LinkEvent::Core(CoreEvent::Notice {
+                                        text: format!(
+                                            "[fleet {} {}…] {detail}",
+                                            kind_word(kind),
+                                            &child[..8.min(child.len())]
                                         ),
                                     }),
                                 };

@@ -49,6 +49,45 @@ pub struct SessionStatus {
     /// Scheduler's lease view (absent = local session).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_state: Option<workers::LeaseState>,
+    /// Orchestration children (parent sessions only; empty = omit, keeping
+    /// the M14 bytes unchanged for every other session).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ChildSummary>,
+}
+
+/// A child session in the parent status snapshot (M15).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildSummary {
+    pub id: String,
+    pub title: String,
+    pub state: ChildState,
+}
+
+/// The orchestrator's view of a child session's lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildState {
+    /// Created; waiting for a worker lease.
+    Queued,
+    /// Leased and executing (turns running or pending).
+    Running,
+    /// Findings collected (judge-gated); work merged or accepted.
+    Completed,
+    /// Spawn failed, judge rounds exhausted unproductively, or lease lost.
+    Failed,
+}
+
+/// What happened in an orchestration (M15) — journalled on the parent so
+/// replay tells the whole planner/judge/worker story.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationKind {
+    Spawned,
+    Started,
+    Judged,
+    Merged,
+    Failed,
+    Released,
 }
 
 /// One row of `GET /v1/sessions`.
@@ -112,6 +151,15 @@ pub enum WireEvent {
         is_stderr: bool,
         text: String,
     },
+    /// An orchestration lifecycle event (M15) — published on the PARENT's
+    /// journal; viewers see the planner's fleet at work.
+    Orchestration {
+        parent: String,
+        child: String,
+        kind: OrchestrationKind,
+        /// Human-readable detail (tool output shape; keep it short).
+        detail: String,
+    },
 }
 
 // ------------------------------------------------------- request bodies --
@@ -134,6 +182,10 @@ pub struct CreateSession {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
+    /// Multi-agent orchestration: the session becomes a planner with the
+    /// five orchestration tools (M15; absent/false keeps the old bytes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orchestrate: bool,
 }
 
 /// `POST /v1/sessions/:id/turns` body.
@@ -299,7 +351,23 @@ mod tests {
             worker: None,
             repo: None,
             lease_state: None,
+            children: vec![ChildSummary {
+                id: "child".into(),
+                title: "t".into(),
+                state: ChildState::Running,
+            }],
         };
+        // The orchestration event keeps the house tag style.
+        assert_eq!(
+            serde_json::to_string(&WireEvent::Orchestration {
+                parent: "p".into(),
+                child: "c".into(),
+                kind: OrchestrationKind::Judged,
+                detail: "accept".into(),
+            })
+            .unwrap(),
+            r#"{"type":"orchestration","parent":"p","child":"c","kind":"judged","detail":"accept"}"#
+        );
         let events = vec![
             WireEvent::Status(status.clone()),
             WireEvent::ClearanceRequested {

@@ -365,6 +365,17 @@ impl LeaseBoard {
         Some(record.worker.clone())
     }
 
+    /// Explicit release (M15 orchestration finish): remove the record;
+    /// returns the worker that held it, if any.
+    pub fn release(&self, session_id: &str) -> Option<String> {
+        self.leases
+            .lock()
+            .expect("board poisoned")
+            .remove(session_id)
+            .map(|r| r.worker)
+            .filter(|w| !w.is_empty())
+    }
+
     /// Sessions waiting for a worker.
     pub fn queued(&self) -> Vec<String> {
         self.leases

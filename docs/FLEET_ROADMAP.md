@@ -85,9 +85,16 @@ flowchart LR
   `smith/<session>`; streamed `ExecEvent` telemetry as the wire freeze;
   native nftables enforcement on Linux workers; metrics at `/v1/metrics`.
   See `docs/WORKER_MESH.md`.
-- **M15 — multi-agent orchestration.** Planner/worker separation running *on*
-  the fleet: sub-agent spawning, judge-gated finding exchange, worktree
-  isolation per agent, merge gates on convergence.
+- **M15 — multi-agent orchestration.** *Done.* Planner/worker separation
+  running *on* the fleet: `spawn_subtasks` creates queued children that
+  assemble lazily when their worker lease lands (parallel spawns never
+  serialise); a tool-less judge gates every finding (bounded rework rounds,
+  pass-through flagged `unjudged`); worker-side merge gates converge
+  checkpoint branches onto `smith/integration/<parent>` (`--no-ff`, one
+  gate in flight per parent+repo, conflicts surfaced for rework);
+  `finish_orchestration` releases the fleet and reports the integration
+  branch (`auto_push = false` — humans review by default). One level deep,
+  `max_children` as config. See `docs/ORCHESTRATION.md`.
 
 ## Open decisions (to settle as the arc proceeds)
 

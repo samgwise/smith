@@ -172,6 +172,8 @@ pub struct Metrics {
     pub worker_heartbeats_total: AtomicU64,
     /// Sessions by `executor="local|worker"`.
     pub sessions: GaugeMap,
+    /// Judge verdicts by `verdict="accept|rework|unjudged"` (M15).
+    pub judge_total: LabelCounter,
 }
 
 impl Metrics {
@@ -202,6 +204,7 @@ impl Metrics {
             .render("smith_exec_duration_seconds", &mut out);
         self.queue_wait_seconds
             .render("smith_queue_wait_seconds", &mut out);
+        self.judge_total.render("smith_judge_total", &mut out);
         out
     }
 }

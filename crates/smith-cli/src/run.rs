@@ -228,6 +228,9 @@ pub struct ServeRun<'a> {
     pub git_ref: Option<&'a str>,
     pub provider: Option<&'a str>,
     pub model: Option<&'a str>,
+    /// Multi-agent orchestration: the session becomes a planner that
+    /// spawns sub-agents on the fleet.
+    pub orchestrate: bool,
 }
 
 /// Submit a task to a `smith serve` daemon and print the streamed events —
@@ -252,6 +255,7 @@ pub async fn run_via_serve(opts: ServeRun<'_>) -> anyhow::Result<i32> {
             worker: opts.worker.map(str::to_string),
             repo: opts.repo.map(str::to_string),
             git_ref: opts.git_ref.map(str::to_string),
+            orchestrate: opts.orchestrate,
         })
         .await?;
     println!("session: {session_id}");

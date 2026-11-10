@@ -12,15 +12,17 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use smith_core::{Agent, ApprovalDecision, ApprovalGate, CoreEvent, Message, ToolExecutor};
+use smith_core::{Agent, ApprovalDecision, ApprovalGate, CoreEvent, Message, Tool, ToolExecutor};
 use smith_protocol::{
     ApprovalMode, CreateSession, ExecutorKind, LeaseState, SessionStatus, SessionSummary,
     WireEvent, WorkerCommand, WorkspaceSource, render_diff,
 };
 
+use crate::config::OrchestrateSection;
 use crate::factory::{ConfigFactory, SessionFactory};
 use crate::gate::{GateSlot, WireGate};
 use crate::journal::Journal;
+use crate::orchestrator::{Orchestrator, PLANNER_BRIEFING, orchestration_tools};
 use crate::workers::{Fleet, WorkerExecutor};
 
 /// An operation failed at the API level (status + message for the client).
@@ -74,6 +76,22 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// Resolved workspace source for a create (request > config default).
+pub(crate) struct ResolvedSource {
+    pub source: Option<WorkspaceSource>,
+    pub repo_label: String,
+}
+
+/// The assembled harness pieces of a worker session (from
+/// [`Controller::assemble_worker_harness`]).
+pub(crate) struct AssembledWorker {
+    pub agent: Agent,
+    pub executor: Arc<dyn ToolExecutor>,
+    pub mcp_status: Vec<String>,
+    pub provider_label: String,
+    pub model_label: String,
+}
+
 /// Worker-mode defaults, resolved from `[worker]` config at daemon start.
 #[derive(Clone, Debug)]
 pub struct WorkerDefaults {
@@ -123,7 +141,9 @@ struct Labels {
 /// One daemon-hosted session: the harness pieces plus the event plumbing.
 pub struct SessionHandle {
     pub id: String,
-    pub agent: Arc<Agent>,
+    /// The agent — `None` while a queued orchestrated child waits for its
+    /// worker lease (assembled in place at grant time).
+    agent: std::sync::Mutex<Option<Arc<Agent>>>,
     pub journal: Arc<Journal>,
     pub gate_slot: Arc<GateSlot>,
     pub metrics: Arc<smith_protocol::metrics::Metrics>,
@@ -138,6 +158,8 @@ pub struct SessionHandle {
     created_ms: u64,
     /// The fleet for worker-mode sessions (checkpointing, lease state).
     fleet: Option<Arc<Fleet>>,
+    /// Orchestrator for planning sessions (None for everyone else).
+    pub orchestration: Option<Arc<Orchestrator>>,
     /// Keeps the sandbox handle alive (None in worker-mode and tests).
     _sandbox: Option<Arc<smith_sandbox::Sandbox>>,
 }
@@ -145,6 +167,24 @@ pub struct SessionHandle {
 impl SessionHandle {
     fn labels(&self) -> std::sync::MutexGuard<'_, Labels> {
         self.labels.lock().expect("labels mutex poisoned")
+    }
+
+    /// The agent, once assembled. Queued orchestrated children have none.
+    pub fn agent(&self) -> Result<Arc<Agent>, ApiError> {
+        self.agent
+            .lock()
+            .expect("agent mutex poisoned")
+            .clone()
+            .ok_or_else(|| ApiError::busy("session is queued — no worker lease granted yet"))
+    }
+
+    pub fn install_agent(&self, agent: Agent) {
+        *self.agent.lock().expect("agent mutex poisoned") = Some(Arc::new(agent));
+    }
+
+    /// The tool executor seam (diffs, orchestration finding gathering).
+    pub fn executor(&self) -> Arc<dyn ToolExecutor> {
+        self.executor.clone()
     }
 
     pub fn busy(&self) -> bool {
@@ -167,6 +207,11 @@ impl SessionHandle {
             worker: labels.worker.clone(),
             repo: labels.repo.clone(),
             lease_state: labels.lease_state,
+            children: self
+                .orchestration
+                .as_ref()
+                .map(|o| o.child_summaries())
+                .unwrap_or_default(),
         }
     }
 
@@ -184,7 +229,7 @@ impl SessionHandle {
         }
     }
 
-    fn publish_status(self: &Arc<Self>) {
+    pub(crate) fn publish_status(self: &Arc<Self>) {
         let this = self.clone();
         tokio::spawn(async move {
             let status = this.status().await;
@@ -204,6 +249,8 @@ pub struct Controller {
     pub fleet: Arc<Fleet>,
     /// `[worker]` defaults.
     worker_defaults: WorkerDefaults,
+    /// `[orchestrate]` bounds and knobs (M15).
+    pub(crate) orchestrate: OrchestrateSection,
     pub(crate) metrics: Arc<smith_protocol::metrics::Metrics>,
 }
 
@@ -236,6 +283,7 @@ impl Controller {
             fleet,
             metrics,
             defaults,
+            config.orchestrate.clone(),
         )
     }
 
@@ -246,6 +294,7 @@ impl Controller {
         fleet: Arc<Fleet>,
         metrics: Arc<smith_protocol::metrics::Metrics>,
         worker_defaults: WorkerDefaults,
+        orchestrate: OrchestrateSection,
     ) -> Arc<Self> {
         Arc::new(Self {
             sessions: std::sync::Mutex::new(HashMap::new()),
@@ -257,6 +306,7 @@ impl Controller {
             )),
             fleet,
             worker_defaults,
+            orchestrate,
             metrics,
         })
     }
@@ -288,18 +338,46 @@ impl Controller {
     }
 
     /// Create a hosted session (local or worker-mode per the request).
-    pub async fn create_session(&self, req: CreateSession) -> Result<String, ApiError> {
+    /// Orchestration opt-ins get the five planner tools and a planner
+    /// briefing; the `Arc<Self>` receiver lets the orchestrator spawn its
+    /// dispatcher against the same controller (Weak, no cycle).
+    pub async fn create_session(self: &Arc<Self>, req: CreateSession) -> Result<String, ApiError> {
         let worker_mode =
             req.worker.is_some() || req.repo.is_some() || self.worker_defaults.executor == "worker";
+        // Common harness plumbing: identity, journal, approval routing.
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let journal = Arc::new(Journal::new());
+        let gate_slot = GateSlot::new();
+        let gate: Arc<dyn ApprovalGate> = self.build_gate(&req, gate_slot.clone(), &journal);
+        let orchestration = req.orchestrate.then(|| {
+            Orchestrator::new(
+                id.clone(),
+                self.orchestrate.clone(),
+                self.factory.clone(),
+                journal.clone(),
+                Arc::downgrade(self),
+            )
+        });
         if worker_mode {
-            self.create_worker_session(req).await
+            self.create_worker_session(req, id, journal, gate_slot, gate, orchestration)
+                .await
         } else {
-            self.create_local_session(req).await
+            self.create_local_session(req, id, journal, gate_slot, gate, orchestration)
+                .await
         }
     }
 
     /// Local (M13) path: the daemon's own podman assembles the sandbox.
-    async fn create_local_session(&self, req: CreateSession) -> Result<String, ApiError> {
+    #[allow(clippy::too_many_arguments)]
+    async fn create_local_session(
+        &self,
+        req: CreateSession,
+        id: String,
+        journal: Arc<Journal>,
+        gate_slot: Arc<GateSlot>,
+        gate: Arc<dyn ApprovalGate>,
+        orchestration: Option<Arc<Orchestrator>>,
+    ) -> Result<String, ApiError> {
         let trimmed = req.workspace.trim();
         if trimmed.is_empty() {
             return Err(ApiError::bad_request("workspace path is required"));
@@ -311,11 +389,7 @@ impl Controller {
             )));
         }
 
-        let journal = Arc::new(Journal::new());
-        let gate_slot = GateSlot::new();
-        let gate: Arc<dyn ApprovalGate> = self.build_gate(&req, gate_slot.clone(), &journal);
-
-        let parts = self
+        let mut parts = self
             .factory
             .create(
                 &workspace_path,
@@ -327,15 +401,25 @@ impl Controller {
             .map_err(ApiError::from)?;
         let canon = dunce::canonicalize(&workspace_path).unwrap_or(workspace_path);
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        // Planner opt-in: the orchestration tools join the registry and the
+        // briefing joins the system prompt (computed below, after mutation).
+        if let Some(orch) = &orchestration {
+            parts.agent.tools.extend(orchestration_tools(orch.clone()));
+            parts.agent.environment_notes = Some(match parts.agent.environment_notes.take() {
+                Some(notes) => format!("{notes}\n{PLANNER_BRIEFING}"),
+                None => PLANNER_BRIEFING.to_string(),
+            });
+        }
+        let system = parts.agent.system_prompt().await;
+
         let handle = Arc::new(SessionHandle {
             id: id.clone(),
-            agent: Arc::new(parts.agent),
-            journal,
+            agent: std::sync::Mutex::new(Some(Arc::new(parts.agent))),
+            journal: journal.clone(),
             gate_slot,
             metrics: self.metrics.clone(),
             executor: parts.executor,
-            history: tokio::sync::Mutex::new(Vec::new()),
+            history: tokio::sync::Mutex::new(vec![Message::system(system)]),
             busy: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             labels: std::sync::Mutex::new(Labels {
@@ -352,12 +436,9 @@ impl Controller {
             }),
             created_ms: now_ms(),
             fleet: None,
+            orchestration,
             _sandbox: parts.sandbox,
         });
-
-        // Seed the history with the system prompt (same as every front-end).
-        let system = handle.agent.system_prompt().await;
-        *handle.history.lock().await = vec![Message::system(system)];
 
         self.sessions
             .lock()
@@ -374,11 +455,10 @@ impl Controller {
         Ok(id)
     }
 
-    /// Worker-mode path: the sandbox lives on a leased worker; the daemon
-    /// holds only the harness (agent, history, approvals, keys).
-    async fn create_worker_session(&self, req: CreateSession) -> Result<String, ApiError> {
-        // Source: request > config default. No repo configured → a scratch
-        // workspace on the worker (still disposable; nothing to checkpoint).
+    /// Resolve the workspace source for a create (request > config default).
+    /// No repo configured → a scratch workspace on the worker (still
+    /// disposable; nothing to checkpoint).
+    pub(crate) fn resolve_source(&self, req: &CreateSession) -> ResolvedSource {
         let repo = req
             .repo
             .clone()
@@ -403,16 +483,20 @@ impl Controller {
                     .to_string()
             })
             .unwrap_or_else(|| "scratch".into());
+        ResolvedSource { source, repo_label }
+    }
 
-        // Wait for a matching live worker (create is already a long call).
+    /// Wait for a matching live worker (the blocking single-session create;
+    /// the dispatcher polls `pick_worker` instead).
+    pub(crate) async fn wait_for_worker(&self, req: &CreateSession) -> Result<String, ApiError> {
         let deadline = std::time::Instant::now()
             + Duration::from_secs(self.worker_defaults.dispatch_timeout_secs);
-        let worker = loop {
+        loop {
             if let Some(name) = self
                 .fleet
                 .pick_worker(&self.worker_defaults.image, req.worker.as_deref())
             {
-                break name;
+                return Ok(name);
             }
             if std::time::Instant::now() > deadline {
                 return Err(ApiError::unavailable(
@@ -420,26 +504,27 @@ impl Controller {
                 ));
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
-        };
+        }
+    }
 
-        let journal = Arc::new(Journal::new());
-        let gate_slot = GateSlot::new();
-        let gate: Arc<dyn ApprovalGate> = self.build_gate(&req, gate_slot.clone(), &journal);
-
-        let id = uuid::Uuid::new_v4().simple().to_string();
-
-        // Dispatch the start and await the worker's ack (materialisation can
-        // clone a large repo — generous budget).
+    /// Dispatch the session start and await the worker's ack (materialising
+    /// can clone a large repo — generous budget).
+    pub(crate) async fn dispatch_start(
+        &self,
+        worker: &str,
+        id: &str,
+        source: Option<WorkspaceSource>,
+    ) -> Result<(), ApiError> {
         let ack_id = uuid::Uuid::new_v4().simple().to_string();
         let rx = self.fleet.streams.await_op_result(&ack_id);
         self.fleet
             .streams
             .send(
-                &worker,
+                worker,
                 WorkerCommand::StartSession {
-                    session_id: id.clone(),
+                    session_id: id.to_string(),
                     exec_id: ack_id,
-                    source: source.clone(),
+                    source,
                 },
             )
             .map_err(|e| {
@@ -462,17 +547,25 @@ impl Controller {
                 "worker `{worker}` failed to start the session: {message}"
             )));
         }
+        Ok(())
+    }
 
-        // Sticky lease granted.
-        self.fleet.board.grant(&id, &worker);
-        self.fleet
-            .metrics
-            .leases_active
-            .fetch_add(1, Ordering::Relaxed);
-
-        // Harness-side assembly: agent over a mesh executor, keys stay here.
+    /// Harness-side assembly for a worker session: agent over the mesh
+    /// executor, keys stay here. Extra tools join the registry (orchestration
+    /// parents); a briefing suffix joins the system prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn assemble_worker_harness(
+        &self,
+        req: &CreateSession,
+        id: &str,
+        gate: Arc<dyn ApprovalGate>,
+        worker: &str,
+        resolved: &ResolvedSource,
+        extra_tools: Vec<Box<dyn Tool>>,
+        briefing: Option<&str>,
+    ) -> Result<AssembledWorker, ApiError> {
         let executor: Arc<dyn ToolExecutor> =
-            Arc::new(WorkerExecutor::new(self.fleet.clone(), id.clone()));
+            Arc::new(WorkerExecutor::new(self.fleet.clone(), id.to_string()));
 
         let provider_impl = self
             .factory
@@ -481,8 +574,10 @@ impl Controller {
         let model_label = provider_impl.model().to_string();
 
         let logger = smith_core::SessionLogger::new_labelled(
-            &repo_label,
-            smith_core::workspace_identity_of(source.as_ref().map_or("scratch", |s| &s.git_url)),
+            &resolved.repo_label,
+            smith_core::workspace_identity_of(
+                resolved.source.as_ref().map_or("scratch", |s| &s.git_url),
+            ),
             req.provider
                 .as_deref()
                 .unwrap_or(&self.worker_defaults.provider),
@@ -494,6 +589,7 @@ impl Controller {
         let mcp_status = mcp_session.status_lines();
         let mut tools = smith_core::builtin_tools();
         tools.extend(mcp_session.take_tools());
+        tools.extend(extra_tools);
 
         let mut agent = Agent::new(
             provider_impl,
@@ -505,45 +601,99 @@ impl Controller {
         agent.environment_notes = Some(format!(
             "executor: worker `{worker}` (egress enforced on the worker)"
         ));
+        if let Some(briefing) = briefing {
+            let notes = agent.environment_notes.take().unwrap_or_default();
+            agent.environment_notes = Some(format!("{notes}\n{briefing}"));
+        }
         // Project instructions live in the materialised repo — fetch over
         // the mesh, best-effort.
         for candidate in ["AGENTS.md", "CLAUDE.md"] {
-            if let Ok(contents) = executor.read_file(candidate, None, None).await {
+            if let Ok(contents) = agent.executor.read_file(candidate, None, None).await {
                 agent.project_instructions = Some(contents.text);
                 break;
             }
         }
-        let system = agent.system_prompt().await;
+        Ok(AssembledWorker {
+            agent,
+            executor,
+            mcp_status,
+            provider_label: req
+                .provider
+                .clone()
+                .unwrap_or_else(|| self.worker_defaults.provider.clone()),
+            model_label,
+        })
+    }
+
+    /// Worker-mode path: the sandbox lives on a leased worker; the daemon
+    /// holds only the harness (agent, history, approvals, keys). Blocking
+    /// create: waits for a matching worker (single-session creates keep
+    /// today's behaviour; orchestrated children use the queued path).
+    #[allow(clippy::too_many_arguments)]
+    async fn create_worker_session(
+        &self,
+        req: CreateSession,
+        id: String,
+        journal: Arc<Journal>,
+        gate_slot: Arc<GateSlot>,
+        gate: Arc<dyn ApprovalGate>,
+        orchestration: Option<Arc<Orchestrator>>,
+    ) -> Result<String, ApiError> {
+        let resolved = self.resolve_source(&req);
+        let worker = self.wait_for_worker(&req).await?;
+        self.dispatch_start(&worker, &id, resolved.source.clone())
+            .await?;
+
+        // Sticky lease granted.
+        self.fleet.board.grant(&id, &worker);
+        self.fleet
+            .metrics
+            .leases_active
+            .fetch_add(1, Ordering::Relaxed);
+
+        let briefing = orchestration.as_ref().map(|_| PLANNER_BRIEFING);
+        let extra_tools = orchestration
+            .as_ref()
+            .map(|orch| orchestration_tools(orch.clone()))
+            .unwrap_or_default();
+        let assembled = self
+            .assemble_worker_harness(&req, &id, gate, &worker, &resolved, extra_tools, briefing)
+            .await?;
+        let system = assembled.agent.system_prompt().await;
+        let repo_label = resolved.repo_label.clone();
+        let repo_url = resolved
+            .source
+            .as_ref()
+            .map(|s| s.git_url.clone())
+            .unwrap_or_else(|| "scratch".into());
 
         let handle = Arc::new(SessionHandle {
             id: id.clone(),
-            agent: Arc::new(agent),
+            agent: std::sync::Mutex::new(Some(Arc::new(assembled.agent))),
             journal,
             gate_slot,
             metrics: self.metrics.clone(),
-            executor,
+            executor: assembled.executor,
             history: tokio::sync::Mutex::new(vec![Message::system(system)]),
             busy: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             labels: std::sync::Mutex::new(Labels {
-                provider: req
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| self.worker_defaults.provider.clone()),
-                model: model_label,
+                provider: assembled.provider_label,
+                model: assembled.model_label,
                 container: None,
-                mcp_status,
+                mcp_status: assembled.mcp_status,
                 workspace: repo_label.clone(),
                 workspace_id: smith_core::workspace_identity_of(
-                    source.as_ref().map_or("scratch", |s| &s.git_url),
+                    resolved.source.as_ref().map_or("scratch", |s| &s.git_url),
                 ),
                 executor: ExecutorKind::Worker,
                 worker: Some(worker.clone()),
-                repo: source.map(|s| s.git_url),
+                repo: Some(repo_url),
                 lease_state: Some(LeaseState::Granted),
             }),
             created_ms: now_ms(),
             fleet: Some(self.fleet.clone()),
+            orchestration,
             _sandbox: None,
         });
 
@@ -565,6 +715,166 @@ impl Controller {
         let status = handle.status().await;
         handle.journal.publish(WireEvent::Status(status));
         Ok(id)
+    }
+
+    /// Create a queued orchestrated child: journal, gate and labels exist
+    /// immediately; the agent/executor assembly happens when a lease is
+    /// granted (lazy assembly — parallel spawns never serialise on worker
+    /// availability).
+    pub(crate) async fn create_queued_child(
+        &self,
+        req: &CreateSession,
+        title: &str,
+    ) -> Result<String, ApiError> {
+        let resolved = self.resolve_source(req);
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let journal = Arc::new(Journal::new());
+        let gate_slot = GateSlot::new();
+        // The approval gate itself is built at grant time (the dispatcher
+        // rebuilds it from the same slot and journal — no turn can run
+        // before assembly anyway).
+
+        let handle = Arc::new(SessionHandle {
+            id: id.clone(),
+            agent: std::sync::Mutex::new(None),
+            journal,
+            gate_slot,
+            metrics: self.metrics.clone(),
+            executor: Arc::new(WorkerExecutor::new(self.fleet.clone(), id.clone())),
+            history: tokio::sync::Mutex::new(Vec::new()),
+            busy: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+            labels: std::sync::Mutex::new(Labels {
+                provider: req
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| self.worker_defaults.provider.clone()),
+                model: req
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.worker_defaults.model.clone()),
+                container: None,
+                mcp_status: vec![],
+                workspace: resolved.repo_label.clone(),
+                workspace_id: smith_core::workspace_identity_of(
+                    resolved.source.as_ref().map_or("scratch", |s| &s.git_url),
+                ),
+                executor: ExecutorKind::Worker,
+                worker: None,
+                repo: Some(
+                    resolved
+                        .source
+                        .as_ref()
+                        .map(|s| s.git_url.clone())
+                        .unwrap_or_else(|| "scratch".into()),
+                ),
+                lease_state: Some(LeaseState::Queued),
+            }),
+            created_ms: now_ms(),
+            fleet: Some(self.fleet.clone()),
+            orchestration: None,
+            _sandbox: None,
+        });
+
+        self.sessions
+            .lock()
+            .expect("session table mutex poisoned")
+            .insert(id.clone(), handle.clone());
+        handle.journal.publish_core(CoreEvent::Notice {
+            text: format!("[queued subtask `{title}`: waiting for a worker lease]"),
+        });
+        self.metrics
+            .sessions
+            .set("executor=\"worker\"", self.count_worker());
+        handle.publish_status();
+        Ok(id)
+    }
+
+    /// Grant-time assembly for a queued orchestrated child: pick a worker,
+    /// dispatch the start, grant the lease and assemble the harness in
+    /// place. `Ok(false)` = no worker free yet (the dispatcher retries).
+    pub(crate) async fn dispatch_queued_child(
+        &self,
+        req: &CreateSession,
+        id: &str,
+    ) -> Result<bool, ApiError> {
+        let Some(worker) = self
+            .fleet
+            .pick_worker(&self.worker_defaults.image, req.worker.as_deref())
+        else {
+            return Ok(false);
+        };
+        let handle = self.get(id)?;
+        let resolved = self.resolve_source(req);
+        self.dispatch_start(&worker, id, resolved.source.clone())
+            .await?;
+
+        // Sticky lease granted.
+        self.fleet.board.grant(id, &worker);
+        self.fleet
+            .metrics
+            .leases_active
+            .fetch_add(1, Ordering::Relaxed);
+
+        let gate = self.build_gate(req, handle.gate_slot.clone(), &handle.journal);
+        let assembled = self
+            .assemble_worker_harness(req, id, gate, &worker, &resolved, vec![], None)
+            .await?;
+        let system = assembled.agent.system_prompt().await;
+        handle.install_agent(assembled.agent);
+        *handle.history.lock().await = vec![Message::system(system)];
+        {
+            let mut labels = handle.labels();
+            labels.worker = Some(worker.clone());
+            labels.lease_state = Some(LeaseState::Granted);
+            labels.mcp_status = assembled.mcp_status;
+            labels.provider = assembled.provider_label;
+            labels.model = assembled.model_label;
+        }
+        tracing::info!("child session {id} leased to worker `{worker}`");
+        handle.journal.publish_core(CoreEvent::Notice {
+            text: format!(
+                "[executing on worker `{worker}`; checkpoint branch smith/{}]",
+                &id[..8.min(id.len())]
+            ),
+        });
+        self.metrics
+            .sessions
+            .set("executor=\"worker\"", self.count_worker());
+        handle.publish_status();
+        Ok(true)
+    }
+
+    /// Release a session's lease explicitly (orchestration finish): stop
+    /// the worker-side sandbox (best-effort), free the board slot, publish
+    /// the final status. Returns the worker that held it, if any.
+    pub(crate) fn release_session(&self, id: &str) -> Result<Option<String>, ApiError> {
+        let handle = self.get(id)?;
+        // A queued child has a label-lease but no board record yet; a
+        // granted one has both. Release clears what exists.
+        let worker = self.fleet.board.release(id).filter(|w| !w.is_empty());
+        if worker.is_some() {
+            self.fleet
+                .metrics
+                .leases_active
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        {
+            let mut labels = handle.labels();
+            if labels.executor == ExecutorKind::Worker {
+                labels.lease_state = Some(LeaseState::Released);
+            }
+        }
+        if let Some(worker) = &worker {
+            let _ = self.fleet.streams.send(
+                worker,
+                WorkerCommand::StopSession {
+                    session_id: id.to_string(),
+                },
+            );
+        }
+        handle.publish_status();
+        Ok(worker)
     }
 
     fn build_gate(
@@ -643,6 +953,8 @@ impl Controller {
         if input.trim().is_empty() {
             return Err(ApiError::bad_request("empty prompt"));
         }
+        // A queued orchestrated child has no agent to run a turn with yet.
+        handle.agent()?;
         // Exclusive claim: exactly one of racing POSTs proceeds.
         if handle
             .busy
@@ -741,7 +1053,7 @@ impl Controller {
             .factory
             .build_provider(provider, model)
             .map_err(ApiError::from)?;
-        handle.agent.set_provider(new_provider);
+        handle.agent()?.set_provider(new_provider);
 
         {
             let mut labels = handle.labels();
@@ -820,7 +1132,7 @@ impl Controller {
             .first()
             .is_some_and(|m| m.role == smith_core::Role::System)
         {
-            let system = handle.agent.system_prompt().await;
+            let system = handle.agent()?.system_prompt().await;
             history.insert(0, Message::system(system));
         }
         let count = history.len();
@@ -855,6 +1167,16 @@ impl Controller {
             let Ok(handle) = self.get(session_id) else {
                 continue;
             };
+            // Orchestrators hear about their children's losses.
+            for parent in self
+                .sessions
+                .lock()
+                .expect("session table mutex poisoned")
+                .values()
+                .filter_map(|h| h.orchestration.clone())
+            {
+                parent.note_lease_loss(session_id);
+            }
             {
                 let mut labels = handle.labels();
                 labels.lease_state = Some(LeaseState::Lost);
@@ -909,11 +1231,18 @@ async fn turn_task(handle: Arc<SessionHandle>, input: String, cancel: Cancellati
         }
     });
 
+    let Ok(agent) = handle.agent() else {
+        // Queued orchestrated child: no worker yet; surface and stop.
+        handle.journal.publish_core(CoreEvent::Error {
+            message: "turn rejected: session is queued (no worker lease yet)".into(),
+        });
+        handle.busy.store(false, Ordering::SeqCst);
+        let status = handle.status().await;
+        handle.journal.publish(WireEvent::Status(status));
+        return;
+    };
     let mut history = handle.history.lock().await;
-    let result = handle
-        .agent
-        .run_turn(&mut history, &input, tx, cancel)
-        .await;
+    let result = agent.run_turn(&mut history, &input, tx, cancel).await;
     drop(history);
 
     // Drain the forwarder so the closing status follows every core event.

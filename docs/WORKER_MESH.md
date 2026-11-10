@@ -42,8 +42,8 @@ smith worker list / smith worker revoke gpu-box
 
 - **Controller → worker**: the worker holds an SSE stream
   (`GET /v1/worker/events`) carrying commands: `start_session`,
-  `exec`, `stop_session`, `checkpoint`. Commands queue (bounded) while the
-  worker reconnects.
+  `exec`, `stop_session`, `checkpoint`, and (M15) `merge_gate` +
+  `push_branch`. Commands queue (bounded) while the worker reconnects.
 - **Worker → controller**: POSTs — `heartbeat` (capability + load + live
   leases, every 10s), `op-result` (correlated by exec id), `exec-events`
   (batched streamed output), `checkpoint` (commit + pushed flag).
@@ -57,7 +57,17 @@ One turn at a time per session; one lease per session; sessions **stick**
 to their worker. A worker-mode session waits (queued) until a live worker
 matches the capability request (image match + name pin + least-loaded).
 Lease loss (stale/revoked/disconnect) marks the session `lease_state: lost`
-in its status stream — the work is on the checkpoint branch.
+in its status stream — the work is on the checkpoint branch. Orchestration
+finish releases leases explicitly (`lease_state: released`).
+
+M15 merge gates run here too: in the session's bare cache, the worker
+merges `smith/<child>` into the parent's integration branch
+(`smith/integration/<parent>`, `--no-ff` in a temp worktree), runs the
+configured gate command in a fresh sandbox on the merged tree, and reports
+`{ok, conflict, output}` — a failed gate leaves the integration branch
+untouched. A successful gate pushes the integration branch to the origin,
+so gates on other workers of the same repo converge. See
+`docs/ORCHESTRATION.md`.
 
 ## ExecEvent (the M14 freeze)
 

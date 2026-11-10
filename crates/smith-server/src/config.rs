@@ -30,6 +30,42 @@ pub struct Config {
     pub serve: ServeSection,
     /// Fleet/scheduler defaults (M14).
     pub worker: WorkerSection,
+    /// Multi-agent orchestration (M15).
+    pub orchestrate: OrchestrateSection,
+}
+
+/// Orchestration bounds and knobs (`[orchestrate]`). Resource limits are
+/// config, not model judgement.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct OrchestrateSection {
+    /// Maximum children per orchestration (spawn beyond this errors).
+    pub max_children: usize,
+    /// Judge rework rounds per child (0 disables judging entirely).
+    pub judge_rounds: usize,
+    /// Model for the judge turn (empty = inherit the session's provider).
+    pub judge_model: String,
+    /// Command run on the merged tree at each merge gate (empty =
+    /// merge-only).
+    pub gate_command: String,
+    /// Push the integration branch onto the base ref at finish. Off by
+    /// default: the fleet produces reviewable branches, not direct pushes.
+    pub auto_push: bool,
+    /// Bounded wait for a child's completion (collect and gate ops).
+    pub collect_timeout_secs: u64,
+}
+
+impl Default for OrchestrateSection {
+    fn default() -> Self {
+        Self {
+            max_children: 8,
+            judge_rounds: 2,
+            judge_model: String::new(),
+            gate_command: String::new(),
+            auto_push: false,
+            collect_timeout_secs: 1800,
+        }
+    }
 }
 
 /// Worker-mode defaults for session creation.
@@ -139,6 +175,7 @@ impl Default for Config {
             mcp: Default::default(),
             serve: ServeSection::default(),
             worker: WorkerSection::default(),
+            orchestrate: OrchestrateSection::default(),
         }
     }
 }
@@ -311,6 +348,17 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              git_ref = \"main\"\n\
              git_token_env = \"SMITH_GIT_TOKEN\"  # env var on the WORKER\n\
              dispatch_timeout_secs = 300\n\
+             \n\
+             [orchestrate]\n\
+             # multi-agent orchestration (see docs/ORCHESTRATION.md):\n\
+             # `smith run --serve --orchestrate` turns a session into a planner\n\
+             # that spawns sub-agents on the fleet\n\
+             max_children = 8\n\
+             judge_rounds = 2        # judge rework rounds per child (0 = no judging)\n\
+             judge_model = \"\"        # empty = inherit the session's provider\n\
+             gate_command = \"\"       # e.g. \"cargo test -q\"; empty = merge-only\n\
+             auto_push = false       # push the integration branch at finish (opt-in)\n\
+             collect_timeout_secs = 1800\n\
              \n\
              # MCP servers (stdio); workspace-level servers go in .smith/mcp.toml\n\
              # [mcp.servers.github]\n\

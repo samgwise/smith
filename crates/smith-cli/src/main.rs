@@ -152,6 +152,10 @@ enum Command {
         /// Workspace path on the remote host.
         #[arg(long)]
         remote_workspace: Option<String>,
+        /// Multi-agent orchestration (with --serve): the session becomes a
+        /// planner that spawns sub-agents on the fleet.
+        #[arg(long)]
+        orchestrate: bool,
     },
     /// Continue a previous session.
     Resume {
@@ -237,6 +241,10 @@ enum Command {
         /// Git ref for the worker workspace (with --repo).
         #[arg(long)]
         git_ref: Option<String>,
+        /// Multi-agent orchestration: the new session becomes a planner
+        /// that spawns sub-agents on the fleet.
+        #[arg(long)]
+        orchestrate: bool,
     },
     /// Manage fleet workers (admin over the daemon).
     Worker {
@@ -318,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
             verify,
             connection,
             remote_workspace,
+            orchestrate,
         }) => {
             if serve {
                 let code = run::run_via_serve(run::ServeRun {
@@ -329,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
                     git_ref: git_ref.as_deref(),
                     provider: provider.as_deref(),
                     model: model.as_deref(),
+                    orchestrate,
                 })
                 .await?;
                 if code != 0 {
@@ -439,6 +449,7 @@ async fn main() -> anyhow::Result<()> {
             worker,
             repo,
             git_ref,
+            orchestrate,
         }) => {
             attach::run_attach(
                 url.as_deref(),
@@ -447,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
                 worker.as_deref(),
                 repo.as_deref(),
                 git_ref.as_deref(),
+                orchestrate,
             )
             .await?;
         }

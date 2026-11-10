@@ -42,13 +42,20 @@ Every streamed event is wrapped:
 - `exec_output` — `{exec_id, is_stderr, text}` (M14): streamed worker exec
   output, journalled for audit/live tails; the tool result itself is the
   buffered op result.
+- `orchestration` — `{parent, child, kind, detail}` (M15): an orchestration
+  lifecycle event, journalled on the **parent's** stream; `kind` =
+  `spawned | started | judged | merged | failed | released`. The TUI renders
+  it as a notice; see docs/ORCHESTRATION.md.
 
 ## SessionStatus extensions (M14)
 
 `SessionStatus` gains optional fields, skipped when default so M13 wire
 bytes are unchanged for local sessions: `executor` (`local`|`worker`,
 absent = local), `worker` (holding worker name), `repo` (materialised git
-URL), `lease_state` (`queued`|`granted`|`lost`).
+URL), `lease_state` (`queued`|`granted`|`lost`; M15 adds `released`).
+M15 also adds `children` — `[{id, title, state}]` with `state` =
+`queued|running|completed|failed` — present only on orchestration parent
+sessions (skipped when empty; every other session's bytes unchanged).
 
 ## Auth
 
@@ -133,7 +140,10 @@ Full semantics in `docs/WORKER_MESH.md`; the wire shapes:
   bearer). Each event is one `WorkerCommand`:
   `{"cmd":"start_session","session_id":…,"exec_id":…,"source":{git_url,
   git_ref, token_env?}|absent}` / `{"cmd":"exec","session_id":…,
-  "exec_id":…, op…}` / `{"cmd":"stop_session",…}` / `{"cmd":"checkpoint",…}`.
+  "exec_id":…, op…}` / `{"cmd":"stop_session",…}` / `{"cmd":"checkpoint",…}` /
+  (M15) `{"cmd":"merge_gate","session_id":…,"exec_id":…,
+  "integration_ref":…,"gate_command":…}` and `{"cmd":"push_branch",…,
+  "from_ref":…,"to_ref":…}`.
   The `op` object is an `ExecOp` (`{"op":"exec_shell","command":…,
   "timeout_secs":…}` | `read_file` | `write_file` | `list_dir`) mirroring
   smith-core's `ToolExecutor`.
@@ -143,6 +153,8 @@ Full semantics in `docs/WORKER_MESH.md`; the wire shapes:
 - `POST /v1/worker/op-result` — `{session_id, exec_id, result}`; `result`
   is `{"result":"exec_shell", dto}` | `read_file` (FileContents) |
   `write_file` | `{"result":"list_dir","entries":[…]}` |
+  (M15) `{"result":"merge_gate","ok":…,"conflict":…,"output":…}` |
+  `{"result":"done","output":…}` |
   `{"result":"failed","message":…}`.
 - `POST /v1/worker/exec-events` — `{events: [ExecEvent]}`; each is
   `{lease_id, exec_id, seq, kind: started | stdout_delta{text} |
@@ -153,10 +165,12 @@ Full semantics in `docs/WORKER_MESH.md`; the wire shapes:
 - Fleet admin (daemon token): `POST /v1/workers {name}` → one-time
   `enrolment_token`; `GET /v1/workers` → `[WorkerSummary]`;
   `DELETE /v1/workers/:name` → revoke (leases lost).
-- `GET /v1/metrics` — Prometheus text format (daemon token).
+- `GET /v1/metrics` — Prometheus text format (daemon token; M15 adds
+  `smith_judge_total{verdict="accept|rework|unjudged"}`).
 - `POST /v1/sessions` gains optional M14 fields: `approval_mode`
   (`ask`|`auto` — auto for CI issuers), `worker`, `repo`, `git_ref`
-  (worker-mode execution; see WORKER_MESH.md).
+  (worker-mode execution; see WORKER_MESH.md) — and the M15 flag
+  `orchestrate` (the session becomes a planner; see ORCHESTRATION.md).
 
 ## Test anchors
 
