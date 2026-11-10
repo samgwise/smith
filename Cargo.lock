@@ -1882,6 +1882,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "sha2",
  "smith-core",
  "smith-egress",
  "smith-mcp",
@@ -1910,6 +1911,27 @@ dependencies = [
  "smith-protocol",
  "tokio",
  "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "smith-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "dunce",
+ "serde",
+ "serde_json",
+ "smith-core",
+ "smith-egress",
+ "smith-protocol",
+ "smith-sandbox",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

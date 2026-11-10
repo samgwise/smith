@@ -44,8 +44,14 @@ pub enum SessionRecord {
 
 /// Stable logical identity of a workspace directory (fnv-64 of the path).
 pub fn workspace_identity(canon: &Path) -> String {
+    workspace_identity_of(&canon.display().to_string())
+}
+
+/// Workspace identity over an arbitrary label — worker-mode sessions key
+/// off the materialised repo URL instead of a local path.
+pub fn workspace_identity_of(label: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // fnv offset basis
-    for byte in canon.display().to_string().as_bytes() {
+    for byte in label.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // fnv prime
     }
@@ -95,6 +101,43 @@ impl SessionLogger {
         provider: &str,
         model: &str,
     ) -> anyhow::Result<Self> {
+        Self::new_labelled_in(
+            dir,
+            &workspace_canon
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "workspace".into()),
+            workspace_identity(workspace_canon),
+            provider,
+            model,
+        )
+    }
+
+    /// Create a session file for a labelled workspace — worker-mode sessions
+    /// key their identity off the materialised repo URL, not a local path.
+    pub fn new_labelled(
+        workspace_name: &str,
+        workspace_id: String,
+        provider: &str,
+        model: &str,
+    ) -> anyhow::Result<Self> {
+        Self::new_labelled_in(
+            &sessions_dir()?,
+            workspace_name,
+            workspace_id,
+            provider,
+            model,
+        )
+    }
+
+    /// [`new_in`](Self::new_in) with the identity/name given directly.
+    pub fn new_labelled_in(
+        dir: &Path,
+        workspace_name: &str,
+        workspace_id: String,
+        provider: &str,
+        model: &str,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let path = dir.join(format!("{id}.jsonl"));
@@ -108,11 +151,8 @@ impl SessionLogger {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
                 id: id.clone(),
-                workspace_id: workspace_identity(workspace_canon),
-                workspace_name: workspace_canon
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "workspace".into()),
+                workspace_id,
+                workspace_name: workspace_name.to_string(),
                 provider: provider.to_string(),
                 model: model.to_string(),
             },

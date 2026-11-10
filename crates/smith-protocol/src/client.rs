@@ -132,11 +132,19 @@ impl ServeClient {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> anyhow::Result<String> {
-        let body = serde_json::to_string(&CreateSession {
+        self.create_session_req(&CreateSession {
             workspace: workspace.to_string(),
             provider: provider.map(str::to_string),
             model: model.map(str::to_string),
-        })?;
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Create with the full M14 surface (see `CreateSession`): approval mode
+    /// and worker-mode execution (worker name prefix, repo URL, git ref).
+    pub async fn create_session_req(&self, req: &CreateSession) -> anyhow::Result<String> {
+        let body = serde_json::to_string(req)?;
         let reply: CreateReply = self
             .call_json("POST", "/v1/sessions", Some(body), CREATE_TIMEOUT)
             .await?;
@@ -266,15 +274,78 @@ impl ServeClient {
     /// Subscribe to a session's event stream, replaying everything after
     /// `since` first.
     pub async fn events(&self, id: &str, since: u64) -> anyhow::Result<EventStream> {
+        self.stream(&format!("/v1/sessions/{id}/events?since={since}"))
+            .await
+    }
+
+    /// Open an SSE stream on an arbitrary path (worker mesh command streams).
+    pub async fn stream(&self, path: &str) -> anyhow::Result<EventStream> {
         let stream = self.connect().await?;
-        let reader = open_chunked_response(
-            stream,
-            "GET",
-            &format!("/v1/sessions/{id}/events?since={since}"),
-            &self.token,
-        )
-        .await?;
+        let reader = open_chunked_response(stream, "GET", path, &self.token).await?;
         Ok(EventStream::new(reader))
+    }
+
+    /// POST a body to an arbitrary path (worker mesh routes), requiring
+    /// 200/202.
+    pub async fn post_body(&self, path: &str, body: String) -> anyhow::Result<()> {
+        self.call("POST", path, Some(&body), REQUEST_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    /// `POST /v1/worker/enrol` — exchange a one-time enrolment token for a
+    /// worker credential (the bearer here is the enrolment token).
+    pub async fn worker_enrol(
+        &self,
+        req: &crate::workers::EnrolRequest,
+    ) -> anyhow::Result<crate::workers::EnrolReply> {
+        let body = serde_json::to_string(req)?;
+        let raw = self
+            .call("POST", "/v1/worker/enrol", Some(&body), REQUEST_TIMEOUT)
+            .await?;
+        serde_json::from_str(&raw).context("parsing enrolment reply")
+    }
+
+    // ---------------------------------------------------- fleet admin --
+
+    /// Mint a single-use enrolment token for a worker name (daemon token).
+    pub async fn worker_issue(&self, name: &str) -> anyhow::Result<String> {
+        let raw = self
+            .call(
+                "POST",
+                "/v1/workers",
+                Some(&serde_json::json!({ "name": name }).to_string()),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        let v: serde_json::Value = serde_json::from_str(&raw).context("parsing issue reply")?;
+        Ok(v.get("enrolment_token")
+            .and_then(serde_json::Value::as_str)
+            .context("no enrolment_token in reply")?
+            .to_string())
+    }
+
+    /// List registered workers (daemon token).
+    pub async fn workers(&self) -> anyhow::Result<Vec<crate::workers::WorkerSummary>> {
+        self.call_json("GET", "/v1/workers", None, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Revoke a worker (daemon token). Its leases are lost.
+    pub async fn worker_revoke(&self, name: &str) -> anyhow::Result<()> {
+        self.call(
+            "DELETE",
+            &format!("/v1/workers/{name}"),
+            None,
+            REQUEST_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Scrape the daemon's metrics text.
+    pub async fn metrics(&self) -> anyhow::Result<String> {
+        self.call("GET", "/v1/metrics", None, REQUEST_TIMEOUT).await
     }
 }
 
@@ -291,10 +362,12 @@ pub fn read_token_file() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Decoded envelope stream over the daemon's SSE response.
+/// Decoded stream over the daemon's SSE response: envelopes for client
+/// event streams, raw payloads for worker command streams.
 pub struct EventStream {
     chunks: crate::http::ChunkedReader<TcpStream>,
     pending: VecDeque<Envelope>,
+    pending_raw: VecDeque<String>,
     raw: Vec<u8>,
     done: bool,
 }
@@ -304,8 +377,33 @@ impl EventStream {
         Self {
             chunks,
             pending: VecDeque::new(),
+            pending_raw: VecDeque::new(),
             raw: Vec::new(),
             done: false,
+        }
+    }
+
+    /// Next raw SSE data payload; `None` when the daemon ends the stream.
+    /// Used by the worker command stream (whose payloads are commands, not
+    /// envelopes).
+    pub async fn next_raw(&mut self) -> anyhow::Result<Option<String>> {
+        loop {
+            if let Some(payload) = self.pending_raw.pop_front() {
+                return Ok(Some(payload));
+            }
+            if self.done {
+                return Ok(None);
+            }
+            let bytes = self.chunks.next_bytes(8192).await?;
+            match bytes {
+                None => self.done = true,
+                Some(b) => {
+                    self.raw.extend_from_slice(&b);
+                    let (payloads, rest) = crate::http::parse_sse_data(&self.raw);
+                    self.raw = rest;
+                    self.pending_raw.extend(payloads);
+                }
+            }
         }
     }
 
@@ -325,6 +423,7 @@ impl EventStream {
                     self.raw.extend_from_slice(&b);
                     let (payloads, rest) = crate::http::parse_sse_data(&self.raw);
                     self.raw = rest;
+                    self.pending_raw.extend(payloads.iter().cloned());
                     for payload in payloads {
                         let env: Envelope = serde_json::from_str(&payload)
                             .context("malformed event in the daemon stream")?;

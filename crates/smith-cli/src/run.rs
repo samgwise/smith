@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use smith_core::{
     Agent, ApprovalDecision, ApprovalGate, ApprovalRequest, CoreEvent, Message, SessionLogger,
     ToolExecutor, clamp_output,
@@ -55,7 +56,7 @@ pub async fn run_headless(
     println!("session: {}", session_path.display());
 
     let workspace_canon = executor.session().workspace_host.clone();
-    let mut mcp_session = connect_mcp(config, &workspace_canon).await;
+    let mut mcp_session = connect_mcp(config, Some(&workspace_canon)).await;
     let mut tools = smith_core::builtin_tools();
     tools.extend(mcp_session.take_tools());
 
@@ -156,7 +157,7 @@ pub async fn resume_headless(
     println!("resumed session {} ({})", meta.id, path.display());
 
     let workspace_canon = executor.session().workspace_host.clone();
-    let mut mcp_session = connect_mcp(config, &workspace_canon).await;
+    let mut mcp_session = connect_mcp(config, Some(&workspace_canon)).await;
     let mut tools = smith_core::builtin_tools();
     tools.extend(mcp_session.take_tools());
 
@@ -215,6 +216,94 @@ pub async fn resume_headless(
         session_path: path,
         container,
     })
+}
+
+/// The CI issuer's submission: a task for a daemon-hosted session.
+pub struct ServeRun<'a> {
+    pub url: Option<&'a str>,
+    pub token: Option<&'a str>,
+    pub task: &'a str,
+    pub worker: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub git_ref: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+}
+
+/// Submit a task to a `smith serve` daemon and print the streamed events —
+/// the CI issuer shape of the prompting plane. The session runs on the
+/// daemon (auto-approved, like local headless runs), optionally leased to a
+/// fleet worker with a git-materialised workspace. Returns the exit code.
+pub async fn run_via_serve(opts: ServeRun<'_>) -> anyhow::Result<i32> {
+    let client = crate::attach::resolve_client(opts.url, opts.token)?;
+    client
+        .health()
+        .await
+        .context("daemon unreachable — is `smith serve` running?")?;
+
+    let workspace = std::env::current_dir().context("cannot resolve working directory")?;
+    let canon = dunce::canonicalize(&workspace)?;
+    let session_id = client
+        .create_session_req(&smith_protocol::CreateSession {
+            workspace: canon.to_str().context("cwd path")?.to_string(),
+            provider: opts.provider.map(str::to_string),
+            model: opts.model.map(str::to_string),
+            approval_mode: smith_protocol::ApprovalMode::Auto,
+            worker: opts.worker.map(str::to_string),
+            repo: opts.repo.map(str::to_string),
+            git_ref: opts.git_ref.map(str::to_string),
+        })
+        .await?;
+    println!("session: {session_id}");
+
+    // Subscribe first, then submit: the turn streams live.
+    let mut events = client.events(&session_id, 0).await?;
+    client.start_turn(&session_id, opts.task).await?;
+
+    let mut exit = 0i32;
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(1800), events.next())
+            .await
+            .context("timed out waiting for the turn (30m)")??;
+        let Some(env) = env else { break };
+        let stop = match &env.event {
+            smith_protocol::WireEvent::Core { core } => match core {
+                // The task line is already visible to the issuer.
+                CoreEvent::UserMessage { .. } => false,
+                CoreEvent::TurnCompleted => {
+                    println!("\n[done]");
+                    true
+                }
+                CoreEvent::TurnCancelled => {
+                    println!("\n[cancelled]");
+                    true
+                }
+                CoreEvent::Error { .. } => {
+                    exit = 1;
+                    print_event(core);
+                    true
+                }
+                _ => {
+                    print_event(core);
+                    false
+                }
+            },
+            smith_protocol::WireEvent::ExecOutput {
+                is_stderr, text, ..
+            } => {
+                // Live remote exec output; stderr tagged.
+                let tag = if *is_stderr { "!" } else { "" };
+                print!("{tag}{text}");
+                let _ = std::io::stdout().flush();
+                false
+            }
+            _ => false,
+        };
+        if stop {
+            break;
+        }
+    }
+    Ok(exit)
 }
 
 /// Run one turn with the live event printer attached.

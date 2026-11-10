@@ -12,7 +12,7 @@ const DEFAULT_URL: &str = "127.0.0.1:9240";
 
 /// Resolve the client from explicit flags, falling back to the environment
 /// and finally the defaults.
-fn resolve_client(url: Option<&str>, token: Option<&str>) -> anyhow::Result<ServeClient> {
+pub fn resolve_client(url: Option<&str>, token: Option<&str>) -> anyhow::Result<ServeClient> {
     let url = url
         .map(str::to_string)
         .or_else(|| std::env::var("SMITH_SERVE_URL").ok())
@@ -46,17 +46,22 @@ fn parse_url(url: &str) -> anyhow::Result<(String, u16)> {
 }
 
 /// Run the attach flow: health check, find-or-create the session, then the
-/// TUI over a `RemoteLink`.
+/// TUI over a `RemoteLink`. Worker-mode flags (`--worker/--repo/--ref`)
+/// lease a fleet worker for the session.
 pub async fn run_attach(
     url: Option<&str>,
     token: Option<&str>,
     id: Option<&str>,
+    worker: Option<&str>,
+    repo: Option<&str>,
+    git_ref: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = resolve_client(url, token)?;
     client
         .health()
         .await
         .context("daemon unreachable — is `smith serve` running?")?;
+    let worker_mode = worker.is_some() || repo.is_some();
 
     let cwd = std::env::current_dir().context("cannot resolve working directory")?;
     let canon = dunce::canonicalize(&cwd)?;
@@ -83,11 +88,24 @@ pub async fn run_attach(
                 .filter(|s| s.workspace_id == identity)
                 .max_by_key(|s| s.created_ms);
             match existing {
-                Some(s) => s.id,
-                None => {
-                    println!("starting a session for {} ...", canon.display());
+                Some(s) if !worker_mode => s.id,
+                // Worker mode always creates a fresh lease (a new task, a
+                // fresh worktree); a path-based reuse makes no sense.
+                _ => {
+                    println!(
+                        "starting a session for {} ...",
+                        repo.unwrap_or(&canon.display().to_string())
+                    );
                     client
-                        .create_session(canon.to_str().context("cwd path")?, None, None)
+                        .create_session_req(&smith_protocol::CreateSession {
+                            workspace: canon.to_str().context("cwd path")?.to_string(),
+                            provider: None,
+                            model: None,
+                            approval_mode: smith_protocol::ApprovalMode::Ask,
+                            worker: worker.map(str::to_string),
+                            repo: repo.map(str::to_string),
+                            git_ref: git_ref.map(str::to_string),
+                        })
                         .await?
                 }
             }
@@ -114,6 +132,64 @@ pub async fn run_attach(
         mcp_status: status.mcp_status,
     };
     App::new(params).run().await
+}
+
+// ------------------------------------------------------------ fleet admin --
+
+/// Mint a single-use enrolment token for a worker (daemon token).
+pub async fn worker_issue(
+    url: Option<&str>,
+    token: Option<&str>,
+    name: &str,
+) -> anyhow::Result<()> {
+    let client = resolve_client(url, token)?;
+    let enrolment = client.worker_issue(name).await?;
+    println!("enrolment token for `{name}` (single use, hand to the worker):\n{enrolment}");
+    Ok(())
+}
+
+/// List registered workers.
+pub async fn workers_list(url: Option<&str>, token: Option<&str>) -> anyhow::Result<()> {
+    let client = resolve_client(url, token)?;
+    let workers = client.workers().await?;
+    if workers.is_empty() {
+        println!("no workers enrolled (smith worker issue <name>)");
+        return Ok(());
+    }
+    for w in workers {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let seen = if w.last_seen_ms == 0 {
+            "never".to_string()
+        } else {
+            format!("{:>3}s ago", (now_ms.saturating_sub(w.last_seen_ms)) / 1000)
+        };
+        println!(
+            "{}  {}  {:?}  leases {}  cpus {}  {}  seen {}",
+            w.name,
+            &w.id[..8.min(w.id.len())],
+            w.status,
+            w.load.leases,
+            w.capability.cpus,
+            w.capability.os,
+            seen
+        );
+    }
+    Ok(())
+}
+
+/// Revoke a worker; its leases are lost (checkpoint branches hold the work).
+pub async fn worker_revoke(
+    url: Option<&str>,
+    token: Option<&str>,
+    name: &str,
+) -> anyhow::Result<()> {
+    let client = resolve_client(url, token)?;
+    client.worker_revoke(name).await?;
+    println!("worker `{name}` revoked");
+    Ok(())
 }
 
 #[cfg(test)]

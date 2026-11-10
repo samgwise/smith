@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use smith_core::{ApprovalDecision, CoreEvent, ExecResult};
 
+use crate::workers;
+
 /// Protocol version carried in every envelope. Bumped on any breaking shape
 /// change; clients and daemons must agree on the major.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -19,6 +21,9 @@ pub const DEFAULT_SERVE_PORT: u16 = 9240;
 
 /// Status snapshot of one daemon-hosted session. Also the body of
 /// `GET /v1/sessions/:id/status` and the payload of `WireEvent::Status`.
+///
+/// The M14 fields (executor/worker/repo/lease_state) are optional and
+/// skipped when default, so M13 wire bytes are unchanged for local sessions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionStatus {
     pub id: String,
@@ -32,6 +37,18 @@ pub struct SessionStatus {
     pub container: Option<String>,
     pub mcp_status: Vec<String>,
     pub created_ms: u64,
+    /// Where the session executes (absent = local).
+    #[serde(default, skip_serializing_if = "workers::ExecutorKind::is_default")]
+    pub executor: workers::ExecutorKind,
+    /// Worker holding the lease (worker-mode sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// Materialised repo URL (worker-mode sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Scheduler's lease view (absent = local session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_state: Option<workers::LeaseState>,
 }
 
 /// One row of `GET /v1/sessions`.
@@ -88,17 +105,35 @@ pub enum WireEvent {
         call_id: String,
         decision: ApprovalDecision,
     },
+    /// Streamed worker exec output (M14 worker mesh) — journalled for
+    /// audit/live tails; the tool result itself is the buffered op result.
+    ExecOutput {
+        exec_id: String,
+        is_stderr: bool,
+        text: String,
+    },
 }
 
 // ------------------------------------------------------- request bodies --
 
 /// `POST /v1/sessions` body: create a daemon-hosted session for a workspace
 /// (daemon-side path; sandbox cold start makes this a long call).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateSession {
     pub workspace: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// `auto` mirrors local headless runs (CI issuers); default asks.
+    #[serde(default)]
+    pub approval_mode: crate::workers::ApprovalMode,
+    /// Worker-mode execution: pin a worker by name prefix, materialise the
+    /// workspace from a git URL (executor defaults to config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
 }
 
 /// `POST /v1/sessions/:id/turns` body.
@@ -260,6 +295,10 @@ mod tests {
             container: Some("smith-x".into()),
             mcp_status: vec![],
             created_ms: 1,
+            executor: workers::ExecutorKind::Local,
+            worker: None,
+            repo: None,
+            lease_state: None,
         };
         let events = vec![
             WireEvent::Status(status.clone()),

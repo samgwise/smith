@@ -46,12 +46,15 @@ pub async fn start_executor(
     Ok((sandbox.clone(), LocalExecutor::new(sandbox, session)))
 }
 
-/// Load layered MCP config (user + workspace) and connect; never fatal.
-pub async fn connect_mcp(config: &Config, workspace_canon: &Path) -> smith_mcp::McpSession {
+/// Load layered MCP config (user + workspace when there is one) and
+/// connect; never fatal. Worker-mode sessions have no daemon-side workspace
+/// and use the global layer only.
+pub async fn connect_mcp(config: &Config, workspace_canon: Option<&Path>) -> smith_mcp::McpSession {
     let mut mcp_config = config.mcp.clone();
-    match smith_mcp::McpConfig::load_workspace(workspace_canon) {
-        Ok(workspace_config) => mcp_config = mcp_config.merged(workspace_config),
-        Err(e) => tracing::warn!("could not load workspace MCP config: {e:#}"),
+    match workspace_canon.map(smith_mcp::McpConfig::load_workspace) {
+        Some(Ok(workspace_config)) => mcp_config = mcp_config.merged(workspace_config),
+        Some(Err(e)) => tracing::warn!("could not load workspace MCP config: {e:#}"),
+        None => {}
     }
     smith_mcp::McpSession::connect(&mcp_config).await
 }
@@ -132,6 +135,10 @@ pub trait SessionFactory: Send + Sync {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> anyhow::Result<Arc<dyn LlmProvider>>;
+
+    /// The MCP config for hosted sessions (global layer; worker-mode
+    /// sessions have no daemon-side workspace to layer over).
+    fn mcp_config(&self) -> smith_mcp::McpConfig;
 }
 
 /// The production factory: config-driven, exactly what `smith run` does.
@@ -175,7 +182,7 @@ impl SessionFactory for ConfigFactory {
             .collect::<String>();
 
         let logger = SessionLogger::new(&canon, &config.provider, &config.model)?;
-        let mut mcp_session = connect_mcp(&config, &canon).await;
+        let mut mcp_session = connect_mcp(&config, Some(&canon)).await;
         let mcp_status = mcp_session.status_lines();
         let mut tools = smith_core::builtin_tools();
         tools.extend(mcp_session.take_tools());
@@ -215,5 +222,9 @@ impl SessionFactory for ConfigFactory {
         model: Option<&str>,
     ) -> anyhow::Result<Arc<dyn LlmProvider>> {
         build_provider(&self.config_for(provider, model))
+    }
+
+    fn mcp_config(&self) -> smith_mcp::McpConfig {
+        self.config.mcp.clone()
     }
 }

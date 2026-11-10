@@ -76,6 +76,10 @@ pub struct SandboxConfig {
     pub podman_connection: Option<String>,
     /// Workspace path on the remote host (required when connected).
     pub remote_workspace: Option<String>,
+    /// Enforcement-shell transport override: `machine` | `ssh` | `local`.
+    /// `None` auto-detects: connection → ssh, running machine → machine,
+    /// otherwise native sudo (a Linux worker's own podman).
+    pub enforce_transport: Option<String>,
 }
 
 impl Default for SandboxConfig {
@@ -93,6 +97,7 @@ impl Default for SandboxConfig {
             egress_clearance: "ask".to_string(),
             podman_connection: None,
             remote_workspace: None,
+            enforce_transport: None,
         }
     }
 }
@@ -547,6 +552,39 @@ impl Sandbox {
             .await
     }
 
+    /// The `podman exec` argument list shared by the buffered and streaming
+    /// paths.
+    fn exec_args(
+        &self,
+        session: &Session,
+        user: Option<&str>,
+        command: &str,
+        timeout_secs: u64,
+    ) -> Vec<String> {
+        let secs = timeout_secs.max(1).to_string();
+        let mut args: Vec<String> = vec![];
+        if let Some(connection) = &self.config.podman_connection {
+            args.push("--connection".into());
+            args.push(connection.clone());
+        }
+        args.extend([
+            "exec".into(),
+            // -i: keep stdin attached — required for exec_stdin_as.
+            "-i".into(),
+            "--user".into(),
+            user.unwrap_or("dev").into(),
+            "--workdir".into(),
+            session.workspace_container.into(),
+            session.name.clone(),
+            "timeout".into(),
+            secs,
+            "sh".into(),
+            "-c".into(),
+            command.into(),
+        ]);
+        args
+    }
+
     async fn exec_inner(
         &self,
         session: &Session,
@@ -559,27 +597,7 @@ impl Sandbox {
         // Slightly generous outer guard: the in-container `timeout` should fire first.
         let outer = timeout_dur + Duration::from_secs(10);
 
-        let secs = timeout_dur.as_secs().max(1).to_string();
-        let mut args: Vec<&str> = vec![];
-        if let Some(connection) = &self.config.podman_connection {
-            args.push("--connection");
-            args.push(connection);
-        }
-        args.extend_from_slice(&[
-            "exec",
-            // -i: keep stdin attached — required for exec_stdin_as.
-            "-i",
-            "--user",
-            user.unwrap_or("dev"),
-            "--workdir",
-            session.workspace_container,
-            &session.name,
-            "timeout",
-            &secs,
-            "sh",
-            "-c",
-            command,
-        ]);
+        let args = self.exec_args(session, user, command, timeout_dur.as_secs());
 
         let started = Instant::now();
         let mut child = Command::new(&self.podman)
@@ -637,6 +655,62 @@ impl Sandbox {
             let _ = task.await;
         }
         outcome
+    }
+
+    /// Execute a shell command, streaming stdout/stderr deltas as they
+    /// arrive (`(is_stderr, text)`) while returning the same buffered
+    /// [`ExecOutcome`] as [`exec`](Self::exec) — identical in-container
+    /// `timeout`, wall-clock guard and kill semantics. The worker mesh uses
+    /// this so the controller sees live output.
+    pub async fn exec_streaming(
+        &self,
+        session: &Session,
+        command: &str,
+        timeout_dur: Option<Duration>,
+        deltas: tokio::sync::mpsc::UnboundedSender<(bool, String)>,
+    ) -> anyhow::Result<ExecOutcome> {
+        let timeout_dur = timeout_dur.unwrap_or(self.config.exec_timeout);
+        let outer = timeout_dur + Duration::from_secs(10);
+        let args = self.exec_args(session, None, command, timeout_dur.as_secs());
+
+        let started = Instant::now();
+        let mut child = Command::new(&self.podman)
+            .args(&args)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to spawn `podman exec`")?;
+
+        let stdout_pipe = child.stdout.take().context("exec stdout pipe")?;
+        let stderr_pipe = child.stderr.take().context("exec stderr pipe")?;
+        let out_task = tokio::spawn(read_piped(stdout_pipe, false, deltas.clone()));
+        let err_task = tokio::spawn(read_piped(stderr_pipe, true, deltas));
+
+        let (exit_code, timed_out) = match timeout(outer, child.wait()).await {
+            Ok(Ok(status)) => {
+                let code = status.code().unwrap_or(-1);
+                // 124 = in-container `timeout` fired; 137 = SIGKILL.
+                (code, code == 124 || code == 137)
+            }
+            Ok(Err(e)) => anyhow::bail!("failed while waiting for `podman exec`: {e}"),
+            // Guard fired: dropping the child kills it (kill_on_drop); the
+            // readers then reach EOF on their own.
+            Err(_) => {
+                drop(child);
+                (-1, true)
+            }
+        };
+        let stdout = out_task.await.context("exec stdout reader")?;
+        let stderr = err_task.await.context("exec stderr reader")?;
+        Ok(ExecOutcome {
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+            duration: started.elapsed(),
+        })
     }
 
     /// Remove a session container.
@@ -773,36 +847,82 @@ impl Sandbox {
             .context("no running podman machine")
     }
 
-    /// Run a shell command as root where the podman server lives: inside the
-    /// podman machine (local setups) or over SSH on the remote host
-    /// (connection mode).
+    /// Run a shell command as root where the podman server lives: natively
+    /// with sudo (a Linux worker's own podman), inside the podman machine
+    /// (local setups), or over SSH on the remote host (connection mode).
     ///
-    /// Both transports join their arguments and run the result through a
-    /// remote shell, so pipes inside `command` are protected by quoting the
-    /// whole thing as one remote argument.
+    /// The machine/ssh transports join their arguments and run the result
+    /// through a remote shell, so pipes inside `command` are protected by
+    /// quoting the whole thing as one remote argument.
     async fn root_shell(&self, command: &str) -> anyhow::Result<std::process::Output> {
         let remote_shell = format!("sudo sh -c \"{command}\"");
-        if let Some(connection) = &self.config.podman_connection {
-            let (user, host, port, identity) = self.connection_ssh_target(connection).await?;
-            let mut cmd = Command::new("ssh");
-            if let Some(identity) = identity {
-                cmd.arg("-i").arg(&identity);
+        // Explicit override first, then auto-detect.
+        match self.config.enforce_transport.as_deref() {
+            Some("ssh") => {
+                let connection = self
+                    .config
+                    .podman_connection
+                    .clone()
+                    .context("enforce_transport = ssh needs sandbox.podman_connection")?;
+                return self.root_shell_ssh(&connection, &remote_shell).await;
             }
-            cmd.arg("-p")
-                .arg(port.to_string())
-                .arg(format!("{user}@{host}"))
-                .arg(remote_shell);
-            return cmd
-                .output()
-                .await
-                .context("failed to run ssh to the remote podman host");
+            Some("machine") => return self.root_shell_machine(&remote_shell).await,
+            Some("local") => return Self::root_shell_local(command).await,
+            Some(other) => {
+                bail!("unknown enforce_transport `{other}` (expected machine | ssh | local)")
+            }
+            None => {}
         }
+        if let Some(connection) = &self.config.podman_connection {
+            return self.root_shell_ssh(connection, &remote_shell).await;
+        }
+        if self.machine_running().await.unwrap_or(false) {
+            return self.root_shell_machine(&remote_shell).await;
+        }
+        Self::root_shell_local(command).await
+    }
+
+    /// Native sudo — the Linux worker transport (no podman machine).
+    async fn root_shell_local(command: &str) -> anyhow::Result<std::process::Output> {
+        anyhow::ensure!(
+            cfg!(target_os = "linux"),
+            "no podman connection/machine and not a Linux host; cannot run the enforcement shell locally"
+        );
+        Command::new("sudo")
+            .arg("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .await
+            .context("failed to run the local enforcement shell (sudo)")
+    }
+
+    async fn root_shell_machine(&self, remote_shell: &str) -> anyhow::Result<std::process::Output> {
         let machine = self.running_machine().await?;
         Command::new(&self.podman)
-            .args(["machine", "ssh", &machine, "--", &remote_shell])
+            .args(["machine", "ssh", &machine, "--", remote_shell])
             .output()
             .await
             .context("failed to run `podman machine ssh`")
+    }
+
+    async fn root_shell_ssh(
+        &self,
+        connection: &str,
+        remote_shell: &str,
+    ) -> anyhow::Result<std::process::Output> {
+        let (user, host, port, identity) = self.connection_ssh_target(connection).await?;
+        let mut cmd = Command::new("ssh");
+        if let Some(identity) = identity {
+            cmd.arg("-i").arg(&identity);
+        }
+        cmd.arg("-p")
+            .arg(port.to_string())
+            .arg(format!("{user}@{host}"))
+            .arg(remote_shell);
+        cmd.output()
+            .await
+            .context("failed to run ssh to the remote podman host")
     }
 
     /// `(user, host, port, identity)` from a podman system connection.
@@ -947,6 +1067,28 @@ impl Sandbox {
     }
 }
 
+/// Incrementally read one exec pipe, forwarding `(is_stderr, text)` deltas
+/// and accumulating the full buffer for the buffered result.
+async fn read_piped(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    is_stderr: bool,
+    deltas: tokio::sync::mpsc::UnboundedSender<(bool, String)>,
+) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = vec![];
+    let mut chunk = [0u8; 4096];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let _ = deltas.send((is_stderr, String::from_utf8_lossy(&chunk[..n]).into_owned()));
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Generate (or reuse) the clearance token and write it to
 /// `~/.smith/egress-token`. All local smith sessions read this to talk to
 /// the sidecar's control API.
@@ -1055,5 +1197,39 @@ mod tests {
 
         sandbox.stop_session(&session).await.unwrap();
         sandbox.stop_egress_sidecar().await.unwrap();
+    }
+
+    /// Live streaming-exec test: deltas arrive while the buffered result is
+    /// intact. Requires podman; run with `cargo test --ignored`.
+    #[tokio::test]
+    #[ignore = "requires podman; run with --ignored"]
+    async fn exec_streaming_emits_deltas_and_buffers() {
+        let sandbox = Sandbox::new(Default::default());
+        sandbox.ensure_ready().await.unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let session = sandbox.start_session(ws.path()).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = sandbox
+            .exec_streaming(
+                &session,
+                "echo one; echo two; echo err >&2",
+                Some(Duration::from_secs(30)),
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.stdout.contains("one") && outcome.stdout.contains("two"));
+        assert!(outcome.stderr.contains("err"));
+
+        let mut deltas = vec![];
+        while let Ok(d) = rx.try_recv() {
+            deltas.push(d);
+        }
+        assert!(deltas.iter().any(|(err, t)| !err && t.contains("one")));
+        assert!(deltas.iter().any(|(err, t)| *err && t.contains("err")));
+
+        sandbox.stop_session(&session).await.unwrap();
     }
 }

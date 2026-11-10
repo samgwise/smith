@@ -36,8 +36,9 @@ impl ExecResult {
     }
 }
 
-/// Paged file content returned by `read_file`.
-#[derive(Clone, Debug)]
+/// Paged file content returned by `read_file`. Serde support: the type
+/// crosses the worker mesh (M14).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileContents {
     /// The requested page of the file, lines joined with `\n`.
     pub text: String,

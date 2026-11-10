@@ -1,9 +1,11 @@
 # The smith serve protocol (v1)
 
-The wire contract between `smith serve` and its thin clients (`smith attach`,
-CI issuers). This is the **M13 compatibility freeze point** from
-`docs/FLEET_ROADMAP.md`: the message shapes below are pinned by round-trip
-tests (`smith-protocol`); any breaking change bumps `v` and this document.
+The wire contract between `smith serve` and its clients — thin clients
+(`smith attach`, CI issuers) **and workers** (`smith-worker`, M14). This is
+the **M13 compatibility freeze point** from `docs/FLEET_ROADMAP.md` (M14
+appends the worker-mesh section below): message shapes are pinned by
+round-trip tests (`smith-protocol`); any breaking change bumps `v` and this
+document.
 
 Transport note: v1 rides hand-rolled HTTP/1.1 over TCP (the same
 framework-free pattern as the egress sidecar's control API) with SSE for
@@ -37,6 +39,16 @@ Every streamed event is wrapped:
 - `approval_decided` — `{call_id, decision}`: an approval was resolved
   (delivered decisions echo the client's `call_id`; timeout-denies echo an
   empty string). Viewers close their modals on this.
+- `exec_output` — `{exec_id, is_stderr, text}` (M14): streamed worker exec
+  output, journalled for audit/live tails; the tool result itself is the
+  buffered op result.
+
+## SessionStatus extensions (M14)
+
+`SessionStatus` gains optional fields, skipped when default so M13 wire
+bytes are unchanged for local sessions: `executor` (`local`|`worker`,
+absent = local), `worker` (holding worker name), `repo` (materialised git
+URL), `lease_state` (`queued`|`granted`|`lost`).
 
 ## Auth
 
@@ -109,6 +121,42 @@ Semantics:
   (default `127.0.0.1:9240`). No TLS at this layer — loopback today; put a
   TLS reverse proxy in front when the daemon leaves the box (the same
   deployment shape as linguine's `/v1`).
+
+## Worker mesh (M14)
+
+Full semantics in `docs/WORKER_MESH.md`; the wire shapes:
+
+- `POST /v1/worker/enrol` — body `{name, enrolment_token, capability}`
+  (one-time token, body-carried; the bearer is irrelevant here) →
+  `{"worker_id": …, "worker_token": …}`. Single use; failure is `403`.
+- `GET /v1/worker/events` — SSE command stream (worker credential as
+  bearer). Each event is one `WorkerCommand`:
+  `{"cmd":"start_session","session_id":…,"exec_id":…,"source":{git_url,
+  git_ref, token_env?}|absent}` / `{"cmd":"exec","session_id":…,
+  "exec_id":…, op…}` / `{"cmd":"stop_session",…}` / `{"cmd":"checkpoint",…}`.
+  The `op` object is an `ExecOp` (`{"op":"exec_shell","command":…,
+  "timeout_secs":…}` | `read_file` | `write_file` | `list_dir`) mirroring
+  smith-core's `ToolExecutor`.
+- `POST /v1/worker/heartbeat` — `{worker_id, live_leases, capability,
+  load}`; the `live_leases` list reconciles the controller's board (worker
+  state wins). Three missed beats → stale → leases lost.
+- `POST /v1/worker/op-result` — `{session_id, exec_id, result}`; `result`
+  is `{"result":"exec_shell", dto}` | `read_file` (FileContents) |
+  `write_file` | `{"result":"list_dir","entries":[…]}` |
+  `{"result":"failed","message":…}`.
+- `POST /v1/worker/exec-events` — `{events: [ExecEvent]}`; each is
+  `{lease_id, exec_id, seq, kind: started | stdout_delta{text} |
+  stderr_delta{text} | finished{exit_code, timed_out, duration_ms}}` —
+  **the M14 freeze** (telemetry only; results travel via op-result).
+- `POST /v1/worker/checkpoint` — `{session_id, commit, pushed}`; the daemon
+  journals a notice.
+- Fleet admin (daemon token): `POST /v1/workers {name}` → one-time
+  `enrolment_token`; `GET /v1/workers` → `[WorkerSummary]`;
+  `DELETE /v1/workers/:name` → revoke (leases lost).
+- `GET /v1/metrics` — Prometheus text format (daemon token).
+- `POST /v1/sessions` gains optional M14 fields: `approval_mode`
+  (`ask`|`auto` — auto for CI issuers), `worker`, `repo`, `git_ref`
+  (worker-mode execution; see WORKER_MESH.md).
 
 ## Test anchors
 

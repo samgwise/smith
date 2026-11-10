@@ -368,6 +368,17 @@ impl RemoteLink {
                                     WireEvent::ApprovalDecided { call_id, decision } => {
                                         LinkEvent::ApprovalDecided { call_id, decision }
                                     }
+                                    // Journalled worker exec output: shown as
+                                    // a dim tail line (the tool pane already
+                                    // shows start/finish).
+                                    WireEvent::ExecOutput {
+                                        is_stderr, text, ..
+                                    } => LinkEvent::Core(CoreEvent::Notice {
+                                        text: format!(
+                                            "  {mark}{text}",
+                                            mark = if is_stderr { "!" } else { "" }
+                                        ),
+                                    }),
                                 };
                                 if event_tx.send(event).is_err() {
                                     return; // the App is gone

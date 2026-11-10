@@ -75,11 +75,16 @@ flowchart LR
   approvals with timeout-deny). Loopback today, reverse proxy when it leaves
   the box. Also the prerequisite for fleets: a scheduler cannot be a desktop
   process.
-- **M14 — worker daemon + fleet scheduler.** `smith-worker` enrols, dials the
-  controller outbound, heartbeats capability, and leases tasks from the board.
-  Workspace materialisation via git; streamed exec events as the wire format;
-  native nftables enforcement (closing the machine-ssh limitation on Linux
-  workers); git credentials scoped per workspace.
+- **M14 — worker daemon + fleet scheduler.** *Done.* `smith-worker` enrols
+  (controller-minted one-time tokens → revocable credentials), dials the
+  controller outbound (SSE command stream + POSTs), heartbeats capability,
+  and leases sessions from the board (capability match, least-loaded,
+  queueing, sticky leases, staleness → lease loss). Workspace
+  materialisation via git (bare-clone cache + worktree, per-invocation
+  credential-helper env) with per-turn checkpoint commits on
+  `smith/<session>`; streamed `ExecEvent` telemetry as the wire freeze;
+  native nftables enforcement on Linux workers; metrics at `/v1/metrics`.
+  See `docs/WORKER_MESH.md`.
 - **M15 — multi-agent orchestration.** Planner/worker separation running *on*
   the fleet: sub-agent spawning, judge-gated finding exchange, worktree
   isolation per agent, merge gates on convergence.

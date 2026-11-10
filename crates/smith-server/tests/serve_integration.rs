@@ -104,6 +104,10 @@ impl SessionFactory for FakeFactory {
             calls: vec![],
         }])))
     }
+
+    fn mcp_config(&self) -> smith_mcp::McpConfig {
+        smith_mcp::McpConfig::default()
+    }
 }
 
 // ---- harness ---------------------------------------------------------
@@ -125,8 +129,8 @@ async fn harness(script: Vec<MockResponse>, approval_timeout: Duration) -> Harne
 }
 
 async fn harness_custom(factory: FakeFactory, approval_timeout: Duration) -> Harness {
-    let controller = Controller::with_factory(Arc::new(factory), approval_timeout);
     let ws = tempfile::tempdir().unwrap();
+    let controller = harness_controller(ws.path(), factory, approval_timeout);
     let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(smith_server::http::accept_loop(
@@ -138,6 +142,26 @@ async fn harness_custom(factory: FakeFactory, approval_timeout: Duration) -> Har
         client: ServeClient::new("127.0.0.1", port, TOKEN.to_string()),
         _ws: ws,
     }
+}
+
+/// Build a controller over a temp-dir fleet registry.
+fn harness_controller(
+    ws: &std::path::Path,
+    factory: FakeFactory,
+    approval_timeout: Duration,
+) -> Arc<Controller> {
+    let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+    let fleet = Arc::new(smith_server::Fleet::new(
+        ws.join("workers.json"),
+        metrics.clone(),
+    ));
+    Controller::with_parts(
+        Arc::new(factory),
+        approval_timeout,
+        fleet,
+        metrics,
+        smith_server::WorkerDefaults::default(),
+    )
 }
 
 impl Harness {
@@ -582,15 +606,16 @@ async fn clearance_requests_fan_out_and_decisions_are_forwarded() {
 
     // Harness with the clearance target pointed at the stub (interior-mutable,
     // so it goes through the shared Arc) before the poller starts.
-    let controller = Controller::with_factory(
-        Arc::new(FakeFactory {
+    let ws = tempfile::tempdir().unwrap();
+    let controller = harness_controller(
+        ws.path(),
+        FakeFactory {
             script: vec![],
             hang: false,
-        }),
+        },
         Duration::from_secs(60),
     );
     controller.set_clearance_target(stub_port, Some("stub-token".into()));
-    let ws = tempfile::tempdir().unwrap();
     let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(smith_server::http::accept_loop(

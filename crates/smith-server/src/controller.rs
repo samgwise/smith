@@ -1,6 +1,7 @@
 //! The controller: the daemon's session table and the harness operations
 //! clients invoke over the wire — starting turns, deciding approvals,
-//! switching providers, answering clearance requests, resuming logs.
+//! switching providers, answering clearance requests, resuming logs, and
+//! (M14) leasing workers from the fleet.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,12 +12,16 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use smith_core::{Agent, ApprovalDecision, CoreEvent, Message, ToolExecutor};
-use smith_protocol::{ResumeReply, SessionStatus, SessionSummary, WireEvent, render_diff};
+use smith_core::{Agent, ApprovalDecision, ApprovalGate, CoreEvent, Message, ToolExecutor};
+use smith_protocol::{
+    ApprovalMode, CreateSession, ExecutorKind, LeaseState, SessionStatus, SessionSummary,
+    WireEvent, WorkerCommand, WorkspaceSource, render_diff,
+};
 
 use crate::factory::{ConfigFactory, SessionFactory};
 use crate::gate::{GateSlot, WireGate};
 use crate::journal::Journal;
+use crate::workers::{Fleet, WorkerExecutor};
 
 /// An operation failed at the API level (status + message for the client).
 #[derive(Clone, Debug)]
@@ -44,6 +49,12 @@ impl ApiError {
             message: message.into(),
         }
     }
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: 503,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -63,7 +74,39 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-/// Display labels for one hosted session (mutated by provider switches).
+/// Worker-mode defaults, resolved from `[worker]` config at daemon start.
+#[derive(Clone, Debug)]
+pub struct WorkerDefaults {
+    /// `local` | `worker`.
+    pub executor: String,
+    pub repo_url: String,
+    pub git_ref: String,
+    pub git_token_env: String,
+    pub dispatch_timeout_secs: u64,
+    /// Sandbox image capability-matched against workers.
+    pub image: String,
+    /// Display defaults for hosted-session labels.
+    pub provider: String,
+    pub model: String,
+}
+
+impl Default for WorkerDefaults {
+    fn default() -> Self {
+        Self {
+            executor: "local".into(),
+            repo_url: String::new(),
+            git_ref: "main".into(),
+            git_token_env: "SMITH_GIT_TOKEN".into(),
+            dispatch_timeout_secs: 300,
+            image: "docker.io/library/ubuntu:24.04".into(),
+            provider: "ollama".into(),
+            model: "unset".into(),
+        }
+    }
+}
+
+/// Display labels for one hosted session (mutated by provider switches
+/// and the scheduler).
 struct Labels {
     provider: String,
     model: String,
@@ -71,6 +114,10 @@ struct Labels {
     mcp_status: Vec<String>,
     workspace: String,
     workspace_id: String,
+    executor: ExecutorKind,
+    worker: Option<String>,
+    repo: Option<String>,
+    lease_state: Option<LeaseState>,
 }
 
 /// One daemon-hosted session: the harness pieces plus the event plumbing.
@@ -79,6 +126,7 @@ pub struct SessionHandle {
     pub agent: Arc<Agent>,
     pub journal: Arc<Journal>,
     pub gate_slot: Arc<GateSlot>,
+    pub metrics: Arc<smith_protocol::metrics::Metrics>,
     executor: Arc<dyn ToolExecutor>,
     history: tokio::sync::Mutex<Vec<Message>>,
     busy: AtomicBool,
@@ -88,7 +136,9 @@ pub struct SessionHandle {
     /// Never held across an await (field reads/updates only).
     labels: std::sync::Mutex<Labels>,
     created_ms: u64,
-    /// Keeps the sandbox handle alive (None in tests).
+    /// The fleet for worker-mode sessions (checkpointing, lease state).
+    fleet: Option<Arc<Fleet>>,
+    /// Keeps the sandbox handle alive (None in worker-mode and tests).
     _sandbox: Option<Arc<smith_sandbox::Sandbox>>,
 }
 
@@ -113,6 +163,10 @@ impl SessionHandle {
             container: labels.container.clone(),
             mcp_status: labels.mcp_status.clone(),
             created_ms: self.created_ms,
+            executor: labels.executor,
+            worker: labels.worker.clone(),
+            repo: labels.repo.clone(),
+            lease_state: labels.lease_state,
         }
     }
 
@@ -146,19 +200,53 @@ pub struct Controller {
     /// Egress sidecar control API (port + token) for clearance forwarding;
     /// interior-mutable so tests can retarget it through a shared Arc.
     clearance: std::sync::Mutex<(u16, Option<String>)>,
+    /// The worker fleet (M14).
+    pub fleet: Arc<Fleet>,
+    /// `[worker]` defaults.
+    worker_defaults: WorkerDefaults,
+    pub(crate) metrics: Arc<smith_protocol::metrics::Metrics>,
 }
 
 impl Controller {
     pub fn new(config: &crate::config::Config) -> Arc<Self> {
-        Self::with_factory(
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(Fleet::new(
+            crate::workers::workers_registry_path()
+                .unwrap_or_else(|_| PathBuf::from("workers.json")),
+            metrics.clone(),
+        ));
+        let defaults = WorkerDefaults {
+            executor: config.worker.executor.clone(),
+            repo_url: config.worker.repo_url.clone(),
+            git_ref: config.worker.git_ref.clone(),
+            git_token_env: config.worker.git_token_env.clone(),
+            dispatch_timeout_secs: config.worker.dispatch_timeout_secs,
+            image: config
+                .sandbox_config()
+                .map(|s| s.image)
+                .unwrap_or_else(|_| WorkerDefaults::default().image),
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+        };
+        Self::with_parts(
             Arc::new(ConfigFactory {
                 config: config.clone(),
             }),
             Duration::from_secs(config.serve.approval_timeout_secs.max(1)),
+            fleet,
+            metrics,
+            defaults,
         )
     }
 
-    pub fn with_factory(factory: Arc<dyn SessionFactory>, approval_timeout: Duration) -> Arc<Self> {
+    /// Test constructor: explicit factory, timeout, fleet and defaults.
+    pub fn with_parts(
+        factory: Arc<dyn SessionFactory>,
+        approval_timeout: Duration,
+        fleet: Arc<Fleet>,
+        metrics: Arc<smith_protocol::metrics::Metrics>,
+        worker_defaults: WorkerDefaults,
+    ) -> Arc<Self> {
         Arc::new(Self {
             sessions: std::sync::Mutex::new(HashMap::new()),
             factory,
@@ -167,6 +255,9 @@ impl Controller {
                 smith_egress::client::CLEARANCE_CONTROL_PORT,
                 smith_egress::client::read_token(),
             )),
+            fleet,
+            worker_defaults,
+            metrics,
         })
     }
 
@@ -196,15 +287,20 @@ impl Controller {
         all
     }
 
-    /// Create a hosted session for a daemon-side workspace. Long call:
-    /// sandbox cold start (image pull, sidecar) happens here.
-    pub async fn create_session(
-        &self,
-        workspace: &str,
-        provider: Option<&str>,
-        model: Option<&str>,
-    ) -> Result<String, ApiError> {
-        let trimmed = workspace.trim();
+    /// Create a hosted session (local or worker-mode per the request).
+    pub async fn create_session(&self, req: CreateSession) -> Result<String, ApiError> {
+        let worker_mode =
+            req.worker.is_some() || req.repo.is_some() || self.worker_defaults.executor == "worker";
+        if worker_mode {
+            self.create_worker_session(req).await
+        } else {
+            self.create_local_session(req).await
+        }
+    }
+
+    /// Local (M13) path: the daemon's own podman assembles the sandbox.
+    async fn create_local_session(&self, req: CreateSession) -> Result<String, ApiError> {
+        let trimmed = req.workspace.trim();
         if trimmed.is_empty() {
             return Err(ApiError::bad_request("workspace path is required"));
         }
@@ -217,15 +313,16 @@ impl Controller {
 
         let journal = Arc::new(Journal::new());
         let gate_slot = GateSlot::new();
-        let gate: Arc<dyn smith_core::ApprovalGate> = Arc::new(WireGate::new(
-            gate_slot.clone(),
-            self.approval_timeout,
-            journal.clone(),
-        ));
+        let gate: Arc<dyn ApprovalGate> = self.build_gate(&req, gate_slot.clone(), &journal);
 
         let parts = self
             .factory
-            .create(&workspace_path, provider, model, gate)
+            .create(
+                &workspace_path,
+                req.provider.as_deref(),
+                req.model.as_deref(),
+                gate,
+            )
             .await
             .map_err(ApiError::from)?;
         let canon = dunce::canonicalize(&workspace_path).unwrap_or(workspace_path);
@@ -236,6 +333,7 @@ impl Controller {
             agent: Arc::new(parts.agent),
             journal,
             gate_slot,
+            metrics: self.metrics.clone(),
             executor: parts.executor,
             history: tokio::sync::Mutex::new(Vec::new()),
             busy: AtomicBool::new(false),
@@ -247,8 +345,13 @@ impl Controller {
                 mcp_status: parts.mcp_status,
                 workspace: parts.workspace_name,
                 workspace_id: smith_core::session::workspace_identity(&canon),
+                executor: ExecutorKind::Local,
+                worker: None,
+                repo: None,
+                lease_state: None,
             }),
             created_ms: now_ms(),
+            fleet: None,
             _sandbox: parts.sandbox,
         });
 
@@ -264,8 +367,274 @@ impl Controller {
         // Announce the session so the first attacher sees it on replay.
         let status = handle.status().await;
         tracing::info!("session {id} created for workspace `{}`", status.workspace);
+        self.metrics
+            .sessions
+            .set("executor=\"local\"", self.count_local());
         handle.journal.publish(WireEvent::Status(status));
         Ok(id)
+    }
+
+    /// Worker-mode path: the sandbox lives on a leased worker; the daemon
+    /// holds only the harness (agent, history, approvals, keys).
+    async fn create_worker_session(&self, req: CreateSession) -> Result<String, ApiError> {
+        // Source: request > config default. No repo configured → a scratch
+        // workspace on the worker (still disposable; nothing to checkpoint).
+        let repo = req
+            .repo
+            .clone()
+            .or_else(|| non_empty(self.worker_defaults.repo_url.clone()));
+        let git_ref = req
+            .git_ref
+            .clone()
+            .or_else(|| non_empty(self.worker_defaults.git_ref.clone()))
+            .unwrap_or_else(|| "main".into());
+        let source = repo.map(|git_url| WorkspaceSource {
+            git_url,
+            git_ref,
+            token_env: Some(self.worker_defaults.git_token_env.clone()),
+        });
+        let repo_label = source
+            .as_ref()
+            .map(|s| {
+                s.git_url
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&s.git_url)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "scratch".into());
+
+        // Wait for a matching live worker (create is already a long call).
+        let deadline = std::time::Instant::now()
+            + Duration::from_secs(self.worker_defaults.dispatch_timeout_secs);
+        let worker = loop {
+            if let Some(name) = self
+                .fleet
+                .pick_worker(&self.worker_defaults.image, req.worker.as_deref())
+            {
+                break name;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(ApiError::unavailable(
+                    "no live worker matched this session (image capability or pinning)",
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+
+        let journal = Arc::new(Journal::new());
+        let gate_slot = GateSlot::new();
+        let gate: Arc<dyn ApprovalGate> = self.build_gate(&req, gate_slot.clone(), &journal);
+
+        let id = uuid::Uuid::new_v4().simple().to_string();
+
+        // Dispatch the start and await the worker's ack (materialisation can
+        // clone a large repo — generous budget).
+        let ack_id = uuid::Uuid::new_v4().simple().to_string();
+        let rx = self.fleet.streams.await_op_result(&ack_id);
+        self.fleet
+            .streams
+            .send(
+                &worker,
+                WorkerCommand::StartSession {
+                    session_id: id.clone(),
+                    exec_id: ack_id,
+                    source: source.clone(),
+                },
+            )
+            .map_err(|e| {
+                ApiError::unavailable(format!(
+                    "worker `{worker}` took the lease but is unreachable: {e:#}"
+                ))
+            })?;
+        let ack = tokio::time::timeout(Duration::from_secs(600), rx)
+            .await
+            .map_err(|_| {
+                ApiError::unavailable(format!(
+                    "worker `{worker}` did not acknowledge session start in time"
+                ))
+            })?
+            .map_err(|_| {
+                ApiError::unavailable(format!("worker `{worker}` dropped the session start"))
+            })?;
+        if let smith_protocol::OpResult::Failed { message } = ack {
+            return Err(ApiError::bad_request(format!(
+                "worker `{worker}` failed to start the session: {message}"
+            )));
+        }
+
+        // Sticky lease granted.
+        self.fleet.board.grant(&id, &worker);
+        self.fleet
+            .metrics
+            .leases_active
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Harness-side assembly: agent over a mesh executor, keys stay here.
+        let executor: Arc<dyn ToolExecutor> =
+            Arc::new(WorkerExecutor::new(self.fleet.clone(), id.clone()));
+
+        let provider_impl = self
+            .factory
+            .build_provider(req.provider.as_deref(), req.model.as_deref())
+            .map_err(ApiError::from)?;
+        let model_label = provider_impl.model().to_string();
+
+        let logger = smith_core::SessionLogger::new_labelled(
+            &repo_label,
+            smith_core::workspace_identity_of(source.as_ref().map_or("scratch", |s| &s.git_url)),
+            req.provider
+                .as_deref()
+                .unwrap_or(&self.worker_defaults.provider),
+            &model_label,
+        )
+        .map_err(ApiError::from)?;
+
+        let mut mcp_session = smith_mcp::McpSession::connect(&self.factory.mcp_config()).await;
+        let mcp_status = mcp_session.status_lines();
+        let mut tools = smith_core::builtin_tools();
+        tools.extend(mcp_session.take_tools());
+
+        let mut agent = Agent::new(
+            provider_impl,
+            executor.clone(),
+            tools,
+            gate,
+            Some(Arc::new(logger)),
+        );
+        agent.environment_notes = Some(format!(
+            "executor: worker `{worker}` (egress enforced on the worker)"
+        ));
+        // Project instructions live in the materialised repo — fetch over
+        // the mesh, best-effort.
+        for candidate in ["AGENTS.md", "CLAUDE.md"] {
+            if let Ok(contents) = executor.read_file(candidate, None, None).await {
+                agent.project_instructions = Some(contents.text);
+                break;
+            }
+        }
+        let system = agent.system_prompt().await;
+
+        let handle = Arc::new(SessionHandle {
+            id: id.clone(),
+            agent: Arc::new(agent),
+            journal,
+            gate_slot,
+            metrics: self.metrics.clone(),
+            executor,
+            history: tokio::sync::Mutex::new(vec![Message::system(system)]),
+            busy: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+            labels: std::sync::Mutex::new(Labels {
+                provider: req
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| self.worker_defaults.provider.clone()),
+                model: model_label,
+                container: None,
+                mcp_status,
+                workspace: repo_label.clone(),
+                workspace_id: smith_core::workspace_identity_of(
+                    source.as_ref().map_or("scratch", |s| &s.git_url),
+                ),
+                executor: ExecutorKind::Worker,
+                worker: Some(worker.clone()),
+                repo: source.map(|s| s.git_url),
+                lease_state: Some(LeaseState::Granted),
+            }),
+            created_ms: now_ms(),
+            fleet: Some(self.fleet.clone()),
+            _sandbox: None,
+        });
+
+        self.sessions
+            .lock()
+            .expect("session table mutex poisoned")
+            .insert(id.clone(), handle.clone());
+
+        tracing::info!("session {id} leased to worker `{worker}` (repo {repo_label})");
+        handle.journal.publish_core(CoreEvent::Notice {
+            text: format!(
+                "[executing on worker `{worker}`; checkpoint branch smith/{}]",
+                &id[..8.min(id.len())]
+            ),
+        });
+        self.metrics
+            .sessions
+            .set("executor=\"worker\"", self.count_worker());
+        let status = handle.status().await;
+        handle.journal.publish(WireEvent::Status(status));
+        Ok(id)
+    }
+
+    fn build_gate(
+        &self,
+        req: &CreateSession,
+        slot: Arc<GateSlot>,
+        journal: &Arc<Journal>,
+    ) -> Arc<dyn ApprovalGate> {
+        match req.approval_mode {
+            ApprovalMode::Auto => {
+                // Headless/CI semantics: everything allowed, sandbox (or the
+                // worker's own enforcement) is the boundary.
+                Arc::new(smith_core::AlwaysAllowGate)
+            }
+            ApprovalMode::Ask => Arc::new(WireGate::new(
+                slot,
+                self.approval_timeout,
+                journal.clone(),
+                self.metrics.clone(),
+            )),
+        }
+    }
+
+    fn count_local(&self) -> u64 {
+        self.count_by(|labels| labels.executor == ExecutorKind::Local)
+    }
+
+    fn count_worker(&self) -> u64 {
+        self.count_by(|labels| labels.executor == ExecutorKind::Worker)
+    }
+
+    fn count_by(&self, pred: impl Fn(&Labels) -> bool) -> u64 {
+        self.sessions
+            .lock()
+            .expect("session table mutex poisoned")
+            .values()
+            .filter(|h| pred(&h.labels()))
+            .count() as u64
+    }
+
+    /// Refresh the fleet gauges (workers by state, sessions by executor).
+    pub fn refresh_fleet_gauges(&self) {
+        let mut live = 0u64;
+        let mut stale = 0u64;
+        let mut revoked = 0u64;
+        for w in self.fleet.registry.list() {
+            match w.status {
+                smith_protocol::WorkerStatus::Revoked => revoked += 1,
+                _ if self.fleet.streams.connected(&w.name)
+                    && std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                        .saturating_sub(w.last_seen_ms)
+                        < crate::workers::HEARTBEAT_SECS * 3 * 1000 =>
+                {
+                    live += 1
+                }
+                _ => stale += 1,
+            }
+        }
+        self.metrics.workers.set("state=\"live\"", live);
+        self.metrics.workers.set("state=\"stale\"", stale);
+        self.metrics.workers.set("state=\"revoked\"", revoked);
+        self.metrics
+            .sessions
+            .set("executor=\"local\"", self.count_local());
+        self.metrics
+            .sessions
+            .set("executor=\"worker\"", self.count_worker());
     }
 
     /// Start a turn (exclusive per session; a busy session answers 409).
@@ -308,6 +677,14 @@ impl Controller {
         let handle = self.get(id)?;
         let delivered = handle.gate_slot.deliver(decision).await;
         if delivered {
+            handle.metrics.approvals_total.inc(&format!(
+                "decision=\"{}\"",
+                match decision {
+                    ApprovalDecision::AllowOnce => "allow_once",
+                    ApprovalDecision::AllowAlways => "allow_always",
+                    ApprovalDecision::Deny => "deny",
+                }
+            ));
             handle.journal.publish(WireEvent::ApprovalDecided {
                 call_id: call_id.unwrap_or_default().to_string(),
                 decision,
@@ -334,6 +711,10 @@ impl Controller {
                 "no egress sidecar token on the daemon host",
             ));
         };
+        self.metrics.clearance_total.inc(&format!(
+            "decision=\"{}\"",
+            smith_protocol::decision_word(decision)
+        ));
         let word = smith_protocol::decision_word(decision);
         tokio::task::spawn_blocking(move || {
             smith_egress::client::post_decide(port, &token, clearance_id, word)
@@ -393,7 +774,11 @@ impl Controller {
     /// Load a saved session log into the hosted session (daemon-side
     /// history). Fails when busy, the prefix is ambiguous, or the log
     /// belongs to a different workspace.
-    pub async fn resume(&self, id: &str, prefix: &str) -> Result<ResumeReply, ApiError> {
+    pub async fn resume(
+        &self,
+        id: &str,
+        prefix: &str,
+    ) -> Result<smith_protocol::ResumeReply, ApiError> {
         let handle = self.get(id)?;
         if handle.busy() {
             return Err(ApiError::busy("cannot resume while a turn is running"));
@@ -445,7 +830,7 @@ impl Controller {
             text: format!("[resumed session {}: {count} messages]", meta.id),
         });
         handle.publish_status();
-        Ok(ResumeReply {
+        Ok(smith_protocol::ResumeReply {
             resumed_id: meta.id,
             messages: count,
         })
@@ -464,6 +849,31 @@ impl Controller {
         }
     }
 
+    /// Mark sessions' leases lost (fleet sweeper / revocation).
+    pub fn handle_lease_loss(&self, worker: &str, session_ids: &[String]) {
+        for session_id in session_ids {
+            let Ok(handle) = self.get(session_id) else {
+                continue;
+            };
+            {
+                let mut labels = handle.labels();
+                labels.lease_state = Some(LeaseState::Lost);
+                labels.worker = Some(worker.to_string());
+            }
+            self.fleet
+                .metrics
+                .leases_lost_total
+                .fetch_add(1, Ordering::Relaxed);
+            handle.journal.publish_core(CoreEvent::Notice {
+                text: format!(
+                    "[lease lost: worker `{worker}` went away — the checkpoint branch smith/{} holds the work]",
+                    &session_id[..8.min(session_id.len())]
+                ),
+            });
+            handle.publish_status();
+        }
+    }
+
     pub fn clearance_target(&self) -> (u16, Option<String>) {
         self.clearance
             .lock()
@@ -472,8 +882,12 @@ impl Controller {
     }
 }
 
+fn non_empty(s: String) -> Option<String> {
+    (!s.trim().is_empty()).then_some(s.trim().to_string())
+}
+
 /// One agent turn inside the daemon: user echo, event forwarding, busy
-/// bookkeeping and a status snapshot when it ends.
+/// bookkeeping, a closing status — and a git checkpoint on worker sessions.
 async fn turn_task(handle: Arc<SessionHandle>, input: String, cancel: CancellationToken) {
     // The user's prompt is an event so late joiners see it.
     handle.journal.publish_core(CoreEvent::UserMessage {
@@ -482,8 +896,15 @@ async fn turn_task(handle: Arc<SessionHandle>, input: String, cancel: Cancellati
 
     let (tx, mut rx) = mpsc::unbounded_channel::<CoreEvent>();
     let journal = handle.journal.clone();
+    let metrics = handle.metrics.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            if let CoreEvent::ToolFinished { name, ok, .. } = &ev {
+                metrics.tool_calls_total.inc(&format!(
+                    "tool=\"{name}\",ok=\"{}\"",
+                    if *ok { "true" } else { "false" }
+                ));
+            }
             journal.publish_core(ev);
         }
     });
@@ -503,6 +924,18 @@ async fn turn_task(handle: Arc<SessionHandle>, input: String, cancel: Cancellati
         });
     }
     handle.busy.store(false, Ordering::SeqCst);
+
+    // Disposal safety: checkpoint the worker's worktree at the turn end.
+    if let Some(fleet) = &handle.fleet
+        && let Some((worker, LeaseState::Granted)) = fleet.board.lease_of(&handle.id)
+    {
+        let _ = fleet.streams.send(
+            &worker,
+            WorkerCommand::Checkpoint {
+                session_id: handle.id.clone(),
+            },
+        );
+    }
 
     let status = handle.status().await;
     handle.journal.publish(WireEvent::Status(status));
@@ -545,6 +978,24 @@ pub fn spawn_clearance_poller(controller: Arc<Controller>) -> tokio::task::JoinH
                 }
             }
             tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+    })
+}
+
+/// Background sweep: stale workers lose their leases (with notice), and the
+/// fleet gauges stay fresh.
+pub fn spawn_fleet_sweeper(controller: Arc<Controller>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            for (worker, sessions) in controller.fleet.sweep() {
+                tracing::warn!(
+                    "worker `{worker}` went stale; {} lease(s) lost",
+                    sessions.len()
+                );
+                controller.handle_lease_loss(&worker, &sessions);
+            }
+            controller.refresh_fleet_gauges();
         }
     })
 }

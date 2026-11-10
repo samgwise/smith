@@ -12,15 +12,17 @@ pub mod factory;
 pub mod gate;
 pub mod http;
 pub mod journal;
+pub mod workers;
 
-pub use config::{Config, ServeSection};
-pub use controller::{ApiError, Controller};
+pub use config::{Config, ServeSection, WorkerSection};
+pub use controller::{ApiError, Controller, WorkerDefaults};
 pub use factory::{
     ConfigFactory, SessionFactory, SessionParts, build_provider, connect_mcp, environment_notes,
     set_clearance_mode, start_executor,
 };
 pub use gate::{GateSlot, WireGate};
 pub use journal::Journal;
+pub use workers::{Fleet, WorkerExecutor, WorkerRegistry, workers_registry_path};
 
 use anyhow::Context;
 use smith_protocol::client::token_file;
@@ -48,6 +50,7 @@ pub async fn serve(config: &Config, bind_override: Option<String>) -> anyhow::Re
     let token = ensure_token()?;
     let controller = Controller::new(config);
     controller::spawn_clearance_poller(controller.clone());
+    controller::spawn_fleet_sweeper(controller.clone());
 
     let listener = http::bind(&bind).await?;
     tracing::info!("smith serve listening on {bind}");

@@ -5,17 +5,19 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::error::RecvError;
 
+use smith_core::CoreEvent;
 use smith_protocol::http::{
     read_request, write_json_response, write_sse_end, write_sse_event, write_sse_head,
 };
 use smith_protocol::{
     ApprovalPost, ClearancePost, CreateSession, PROTOCOL_VERSION, ProviderPost, ResumePost,
-    StartTurn,
+    StartTurn, WireEvent,
 };
 
 use crate::controller::{ApiError, Controller};
@@ -53,11 +55,20 @@ async fn handle_conn(
     token: String,
 ) -> anyhow::Result<()> {
     let req = read_request(&mut stream).await?;
-    // Every route requires the token — there are no public endpoints.
-    if req.bearer_token() != Some(token.as_str()) {
+    // There are no public endpoints. Worker routes authenticate with the
+    // worker credential (enrol carries its body-carried one-time token);
+    // everything else — including the fleet admin routes and metrics —
+    // needs the daemon token.
+    let worker_route = req.path.starts_with("/v1/worker/");
+    if !worker_route && req.bearer_token() != Some(token.as_str()) {
         return write_json_response(&mut stream, 401, "{\"error\":\"unauthorised\"}").await;
     }
     route(&controller, &req, &mut stream).await
+}
+
+/// Authenticate a worker credential → worker name, or None (401).
+fn worker_auth(controller: &Controller, req: &smith_protocol::http::Request) -> Option<String> {
+    controller.fleet.registry.authenticate(req.bearer_token()?)
 }
 
 async fn route(
@@ -88,14 +99,7 @@ async fn route(
             let Some(body) = parse_or_reply::<CreateSession>(req, stream).await else {
                 return Ok(());
             };
-            match controller
-                .create_session(
-                    &body.workspace,
-                    body.provider.as_deref(),
-                    body.model.as_deref(),
-                )
-                .await
-            {
+            match controller.create_session(body).await {
                 Ok(id) => {
                     reply(
                         stream,
@@ -106,6 +110,79 @@ async fn route(
                 }
                 Err(e) => reply(stream, e.status, error_json(&e)).await,
             }
+        }
+        // ---- fleet admin (daemon token) ----
+        ("POST", ["v1", "workers"]) => {
+            let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return reply(
+                        stream,
+                        400,
+                        serde_json::json!({ "error": format!("bad body: {e}") }).to_string(),
+                    )
+                    .await;
+                }
+            };
+            let Some(name) = body.get("name").and_then(serde_json::Value::as_str) else {
+                return reply(stream, 400, "{\"error\":\"name is required\"}".into()).await;
+            };
+            match controller.fleet.registry.issue_enrolment(name) {
+                Ok(token) => {
+                    reply(
+                        stream,
+                        200,
+                        serde_json::json!({ "enrolment_token": token }).to_string(),
+                    )
+                    .await
+                }
+                Err(e) => {
+                    reply(
+                        stream,
+                        500,
+                        serde_json::json!({ "error": format!("{e:#}") }).to_string(),
+                    )
+                    .await
+                }
+            }
+        }
+        ("GET", ["v1", "workers"]) => {
+            let list: Vec<smith_protocol::WorkerSummary> = controller
+                .fleet
+                .registry
+                .list()
+                .into_iter()
+                .map(|w| smith_protocol::WorkerSummary {
+                    name: w.name,
+                    id: w.id,
+                    status: w.status,
+                    capability: w.capability,
+                    load: w.load,
+                    last_seen_ms: w.last_seen_ms,
+                })
+                .collect();
+            reply(stream, 200, serde_json::to_string(&list)?).await
+        }
+        ("DELETE", ["v1", "workers", name]) => match controller.fleet.registry.revoke(name) {
+            Ok(true) => {
+                let lost = controller.fleet.board.sessions_of(name);
+                controller.fleet.streams.disconnect(name);
+                controller.handle_lease_loss(name, &lost);
+                reply(stream, 200, "{\"revoked\":true}".into()).await
+            }
+            Ok(false) => reply(stream, 404, "{\"error\":\"no such worker\"}".into()).await,
+            Err(e) => {
+                reply(
+                    stream,
+                    500,
+                    serde_json::json!({ "error": format!("{e:#}") }).to_string(),
+                )
+                .await
+            }
+        },
+        ("GET", ["v1", "metrics"]) => {
+            let text = controller.metrics.render();
+            write_plain_text(stream, &text).await
         }
         (_, ["v1", "sessions", id, rest @ ..]) => match (method, rest.first()) {
             ("POST", Some(&"turns")) => {
@@ -176,8 +253,173 @@ async fn route(
             ("GET", Some(&"events")) => stream_events(controller, id, req, stream).await,
             _ => not_found(stream).await,
         },
+        // ---- worker mesh (worker credential; enrol carries its own token) ----
+        ("POST", ["v1", "worker", "enrol"]) => {
+            let Some(body) = parse_or_reply::<smith_protocol::EnrolRequest>(req, stream).await
+            else {
+                return Ok(());
+            };
+            match controller.fleet.registry.enrol(
+                &body.name,
+                &body.enrolment_token,
+                &body.capability,
+            ) {
+                Ok((worker_id, worker_token)) => {
+                    reply(
+                        stream,
+                        200,
+                        serde_json::to_string(&smith_protocol::EnrolReply {
+                            worker_id,
+                            worker_token,
+                        })?,
+                    )
+                    .await
+                }
+                Err(e) => {
+                    reply(
+                        stream,
+                        403,
+                        serde_json::json!({ "error": format!("{e:#}") }).to_string(),
+                    )
+                    .await
+                }
+            }
+        }
+        ("GET", ["v1", "worker", "events"]) => match worker_auth(controller, req) {
+            Some(worker) => stream_worker_commands(controller, &worker, stream).await,
+            None => reply(stream, 401, "{\"error\":\"unauthorised\"}".into()).await,
+        },
+        ("POST", ["v1", "worker", "heartbeat"]) => match worker_auth(controller, req) {
+            Some(worker) => {
+                let Some(body) =
+                    parse_or_reply::<smith_protocol::HeartbeatRequest>(req, stream).await
+                else {
+                    return Ok(());
+                };
+                controller
+                    .fleet
+                    .metrics
+                    .worker_heartbeats_total
+                    .fetch_add(1, Ordering::Relaxed);
+                controller
+                    .fleet
+                    .registry
+                    .record_heartbeat(&worker, &body.capability, &body.load);
+                // Reconcile: the worker's live-lease list wins.
+                let lost = controller.fleet.reconcile(&worker, &body.live_leases);
+                if !lost.is_empty() {
+                    controller.handle_lease_loss(&worker, &lost);
+                }
+                reply(stream, 200, "{\"ok\":true}".into()).await
+            }
+            None => reply(stream, 401, "{\"error\":\"unauthorised\"}".into()).await,
+        },
+        ("POST", ["v1", "worker", "op-result"]) => match worker_auth(controller, req) {
+            Some(_) => {
+                let Some(body) =
+                    parse_or_reply::<smith_protocol::OpResultRequest>(req, stream).await
+                else {
+                    return Ok(());
+                };
+                let delivered = controller
+                    .fleet
+                    .streams
+                    .deliver_op_result(&body.exec_id, body.result);
+                reply(
+                    stream,
+                    200,
+                    serde_json::json!({ "delivered": delivered }).to_string(),
+                )
+                .await
+            }
+            None => reply(stream, 401, "{\"error\":\"unauthorised\"}".into()).await,
+        },
+        ("POST", ["v1", "worker", "exec-events"]) => match worker_auth(controller, req) {
+            Some(_) => {
+                let Some(body) =
+                    parse_or_reply::<smith_protocol::ExecEventsRequest>(req, stream).await
+                else {
+                    return Ok(());
+                };
+                for event in body.events {
+                    if let smith_protocol::ExecEventKind::Finished { duration_ms, .. } = &event.kind
+                    {
+                        controller
+                            .fleet
+                            .metrics
+                            .exec_duration_seconds
+                            .observe_ms(*duration_ms);
+                    }
+                    if let smith_protocol::ExecEventKind::StdoutDelta { text }
+                    | smith_protocol::ExecEventKind::StderrDelta { text } = &event.kind
+                    {
+                        let is_stderr = matches!(
+                            event.kind,
+                            smith_protocol::ExecEventKind::StderrDelta { .. }
+                        );
+                        if let Ok(handle) = controller.get(&event.lease_id) {
+                            handle.journal.publish(WireEvent::ExecOutput {
+                                exec_id: event.exec_id,
+                                is_stderr,
+                                text: text.clone(),
+                            });
+                        }
+                    }
+                }
+                reply(stream, 200, "{\"ok\":true}".into()).await
+            }
+            None => reply(stream, 401, "{\"error\":\"unauthorised\"}".into()).await,
+        },
+        ("POST", ["v1", "worker", "checkpoint"]) => match worker_auth(controller, req) {
+            Some(_) => {
+                let Some(body) =
+                    parse_or_reply::<smith_protocol::CheckpointRequest>(req, stream).await
+                else {
+                    return Ok(());
+                };
+                if let Ok(handle) = controller.get(&body.session_id) {
+                    handle.journal.publish_core(CoreEvent::Notice {
+                        text: format!(
+                            "[checkpoint {} on smith/{}{}]",
+                            &body.commit[..12.min(body.commit.len())],
+                            &body.session_id[..8.min(body.session_id.len())],
+                            if body.pushed {
+                                " (pushed)"
+                            } else {
+                                " (local only)"
+                            }
+                        ),
+                    });
+                }
+                reply(stream, 200, "{\"ok\":true}".into()).await
+            }
+            None => reply(stream, 401, "{\"error\":\"unauthorised\"}".into()).await,
+        },
         _ => not_found(stream).await,
     }
+}
+
+/// The controller→worker command stream: SSE over the worker's own
+/// connection; commands queue in the registry while the worker reconnects.
+async fn stream_worker_commands(
+    controller: &Arc<Controller>,
+    worker: &str,
+    stream: &mut TcpStream,
+) -> anyhow::Result<()> {
+    let mut rx = controller.fleet.streams.connect(worker);
+    write_sse_head(stream).await.context("worker sse head")?;
+    while let Some(cmd) = rx.recv().await {
+        write_sse_event(stream, &serde_json::to_string(&cmd)?)
+            .await
+            .context("worker sse command")?;
+    }
+    controller.fleet.streams.disconnect(worker);
+    write_sse_end(stream).await.context("worker sse end")
+}
+
+/// A `text/plain` body (metrics) — same one-request-per-connection framing.
+async fn write_plain_text(stream: &mut TcpStream, text: &str) -> anyhow::Result<()> {
+    smith_protocol::http::write_plain_text(stream, text).await
 }
 
 /// SSE event stream: journal replay after `?since=`, then live broadcast.

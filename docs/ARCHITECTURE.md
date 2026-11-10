@@ -142,6 +142,24 @@ Security posture of the daemon: loopback bind by default, bearer token in
 rolled parser, and — the point of the exercise — model keys exist only in
 the daemon's environment, so the prompting device holds no secrets.
 
+## The execution plane: `smith-worker`
+
+M14 gave execution its own daemons. A worker enrols with a single-use token
+(the controller mints keys; workers verify the controller by its TLS cert —
+the linguine split), dials the controller **outbound** (an SSE command
+stream plus POSTs back — no inbound ports, NAT-safe), heartbeats capability,
+and leases sessions from the board. Ops cross the mesh as `ExecOp`s
+mirroring the `ToolExecutor` trait, so the worker just implements it locally
+and the controller wraps the mesh in the same trait — the agent loop is
+none the wiser. Exec output streams as frozen `ExecEvent` telemetry while
+the result keeps the buffered timeout/kill semantics. Workspaces materialise
+from git (bare-clone cache + worktree per session, tokens via per-invocation
+credential-helper env); each turn ends with a checkpoint commit pushed to
+`smith/<session>` — losing a worker loses nothing but the lease. Linux
+workers enforce nftables natively (a third `root_shell` transport, sudo);
+the scheduler is capability-aware, least-loaded, and queues sessions when
+no worker fits. Metrics (Prometheus text, hand-rolled) at `/v1/metrics`.
+
 ## History
 
 The build proceeded in milestones (see `git log`): v1 vertical slice

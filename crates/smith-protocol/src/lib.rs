@@ -8,10 +8,18 @@
 pub mod client;
 pub mod events;
 pub mod http;
+pub mod metrics;
+pub mod workers;
 
 pub use client::{EventStream, ServeClient, decision_word, read_token_file, token_file};
 pub use events::{
     ApprovalPost, ClearancePost, CreateReply, CreateSession, DEFAULT_SERVE_PORT, DiffReply,
     Envelope, PROTOCOL_VERSION, ProviderPost, ResumePost, ResumeReply, SessionStatus,
     SessionSummary, StartTurn, WireEvent, render_diff,
+};
+pub use workers::{
+    ApprovalMode, Capability, CheckpointRequest, EnrolReply, EnrolRequest, ExecEvent,
+    ExecEventKind, ExecEventsRequest, ExecOp, ExecResultDto, ExecutorKind, HeartbeatRequest,
+    LeaseState, Load, OpResult, OpResultRequest, WorkerCommand, WorkerStatus, WorkerSummary,
+    WorkspaceSource,
 };

@@ -1,0 +1,29 @@
+[package]
+name = "smith-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Smith worker daemon: outbound mesh, leased sandboxes, git materialisation"
+
+[[bin]]
+name = "smith-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+dunce.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smith-core.workspace = true
+smith-egress.path = "../smith-egress"
+smith-protocol.workspace = true
+smith-sandbox.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

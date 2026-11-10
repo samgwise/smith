@@ -148,6 +148,21 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Resul
     })
 }
 
+/// A `text/plain` body (metrics), same one-request-per-connection framing.
+pub async fn write_plain_text<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    text: &str,
+) -> anyhow::Result<()> {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// Reason phrase for the statuses smith replies with.
 fn reason(status: u16) -> &'static str {
     match status {

@@ -46,14 +46,21 @@ pub struct WireGate {
     /// decisions are echoed by the route handler instead, which knows the
     /// client's call_id).
     journal: Arc<Journal>,
+    metrics: Arc<smith_protocol::metrics::Metrics>,
 }
 
 impl WireGate {
-    pub fn new(slot: Arc<GateSlot>, timeout: Duration, journal: Arc<Journal>) -> Self {
+    pub fn new(
+        slot: Arc<GateSlot>,
+        timeout: Duration,
+        journal: Arc<Journal>,
+        metrics: Arc<smith_protocol::metrics::Metrics>,
+    ) -> Self {
         Self {
             slot,
             timeout,
             journal,
+            metrics,
         }
     }
 }
@@ -71,6 +78,7 @@ impl ApprovalGate for WireGate {
             _ => {
                 let late = rx.try_recv().unwrap_or(ApprovalDecision::Deny);
                 if matches!(late, ApprovalDecision::Deny) {
+                    self.metrics.approvals_total.inc("decision=\"timeout\"");
                     self.journal.publish(WireEvent::ApprovalDecided {
                         call_id: String::new(),
                         decision: ApprovalDecision::Deny,
@@ -101,7 +109,12 @@ mod tests {
     #[tokio::test]
     async fn timeout_denies_and_echoes() {
         let journal = Arc::new(Journal::new());
-        let gate = WireGate::new(GateSlot::new(), Duration::from_millis(20), journal.clone());
+        let gate = WireGate::new(
+            GateSlot::new(),
+            Duration::from_millis(20),
+            journal.clone(),
+            Arc::new(smith_protocol::metrics::Metrics::default()),
+        );
         let decision = gate
             .decide(ApprovalRequest {
                 tool: "shell".into(),
@@ -124,7 +137,12 @@ mod tests {
     async fn a_just_in_time_delivery_beats_the_timeout() {
         let slot = GateSlot::new();
         let journal = Arc::new(Journal::new());
-        let gate = WireGate::new(slot.clone(), Duration::from_millis(40), journal.clone());
+        let gate = WireGate::new(
+            slot.clone(),
+            Duration::from_millis(40),
+            journal.clone(),
+            Arc::new(smith_protocol::metrics::Metrics::default()),
+        );
         let deliverer = tokio::spawn({
             let slot = slot.clone();
             async move {

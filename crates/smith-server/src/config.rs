@@ -28,6 +28,23 @@ pub struct Config {
     pub mcp: smith_mcp::McpConfig,
     /// `smith serve` daemon settings.
     pub serve: ServeSection,
+    /// Fleet/scheduler defaults (M14).
+    pub worker: WorkerSection,
+}
+
+/// Worker-mode defaults for session creation.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct WorkerSection {
+    /// Default executor for hosted sessions: `local` | `worker`.
+    pub executor: String,
+    /// Default repo to materialise (empty = sessions need `--repo`).
+    pub repo_url: String,
+    pub git_ref: String,
+    /// Env var on the WORKER holding the git token.
+    pub git_token_env: String,
+    /// Seconds to wait for a live worker before a create fails.
+    pub dispatch_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,6 +103,8 @@ pub struct SandboxSection {
     pub podman_connection: Option<String>,
     /// Workspace path on the remote host (required when connected).
     pub remote_workspace: Option<String>,
+    /// Enforcement-shell transport override: `machine` | `ssh` | `local`.
+    pub enforce_transport: Option<String>,
 }
 
 /// `smith serve` daemon settings.
@@ -119,6 +138,19 @@ impl Default for Config {
             verify: VerifyConfig::default(),
             mcp: Default::default(),
             serve: ServeSection::default(),
+            worker: WorkerSection::default(),
+        }
+    }
+}
+
+impl Default for WorkerSection {
+    fn default() -> Self {
+        Self {
+            executor: "local".into(),
+            repo_url: String::new(),
+            git_ref: "main".into(),
+            git_token_env: "SMITH_GIT_TOKEN".into(),
+            dispatch_timeout_secs: 300,
         }
     }
 }
@@ -155,6 +187,7 @@ impl Default for SandboxSection {
             egress_clearance: d.egress_clearance,
             podman_connection: d.podman_connection,
             remote_workspace: d.remote_workspace,
+            enforce_transport: d.enforce_transport,
         }
     }
 }
@@ -200,6 +233,7 @@ impl Config {
             egress_clearance: s.egress_clearance.clone(),
             podman_connection: s.podman_connection.clone(),
             remote_workspace: s.remote_workspace.clone(),
+            enforce_transport: s.enforce_transport.clone(),
         })
     }
 }
@@ -269,6 +303,14 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              # `smith serve` daemon: thin clients attach with `smith attach`\n\
              bind = \"127.0.0.1:{DEFAULT_SERVE_PORT}\"\n\
              approval_timeout_secs = 300  # unanswered approvals auto-deny\n\
+             \n\
+             [worker]\n\
+             # fleet execution (smith-worker; see docs/WORKER_MESH.md)\n\
+             executor = \"local\"          # local | worker\n\
+             # repo_url = \"https://git.example.com/org/repo.git\"\n\
+             git_ref = \"main\"\n\
+             git_token_env = \"SMITH_GIT_TOKEN\"  # env var on the WORKER\n\
+             dispatch_timeout_secs = 300\n\
              \n\
              # MCP servers (stdio); workspace-level servers go in .smith/mcp.toml\n\
              # [mcp.servers.github]\n\

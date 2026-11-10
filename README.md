@@ -13,10 +13,11 @@ code only ever runs in the container, never on your host.
 | `smith-mcp` | MCP client: stdio servers exposed as `mcp_<server>_<tool>` tools |
 | `smith-sandbox` | Podman machine/container lifecycle, exec with timeouts, egress enforcement |
 | `smith-egress` | Allowlist-filtering proxy sidecar (CONNECT filter + bundled Containerfile) |
-| `smith-protocol` | The frozen serve wire contract: envelopes, SSE framing, raw client |
-| `smith-server` | The `smith serve` daemon: hosted sessions, approval routing, clearance poller |
+| `smith-protocol` | The frozen wire contract: envelopes, SSE framing, worker ops, raw client |
+| `smith-server` | The `smith serve` daemon: hosted sessions, approval routing, fleet scheduler |
+| `smith-worker` | The `smith-worker` binary: outbound mesh, leased sandboxes, git workspaces |
 | `smith-tui` | Ratatui interface: transcript, tool activity, approval modal, slash commands |
-| `smith-cli` | `smith` binary: TUI, headless runs, serve/attach, resume, housekeeping |
+| `smith-cli` | `smith` binary: TUI, headless runs, serve/attach, worker admin, housekeeping |
 
 ## Security model (v1)
 
@@ -158,6 +159,34 @@ Default posture: loopback bind, bearer token in `~/.smith/serve-token`, no
 TLS at this layer (put a reverse proxy in front when the daemon leaves the
 box — the same deployment shape as linguine's `/v1`).
 
+## The fleet: `smith-worker`
+
+Execution can also live on its own machines. Workers enrol with a one-time
+token, dial the controller **outbound** (no inbound ports, NAT-safe),
+heartbeat capability, and lease sessions from the board. Workspaces
+materialise from git (bare-clone cache + worktree per session); every turn
+ends with a checkpoint commit pushed to `smith/<session>` — losing a worker
+loses nothing but the lease.
+
+```sh
+# Controller:
+smith serve
+smith worker issue gpu-box        # → one-time enrolment token
+
+# On a worker host (Linux with podman; Windows works for dev):
+smith-worker enrol --url controller:9240 --token <token> --name gpu-box
+smith-worker run                  # metrics on 127.0.0.1:9241/metrics
+
+# Anywhere:
+smith run --serve --worker gpu-box --repo https://... "fix the flaky test"
+smith attach --worker gpu-box --repo https://...   # interactive
+smith worker list                 # or: smith worker revoke gpu-box
+```
+
+See [`docs/WORKER_MESH.md`](docs/WORKER_MESH.md) for the trust model (the
+controller mints keys; workers verify the controller by its TLS cert), the
+lease semantics, and the streamed-exec wire format.
+
 ## MCP servers
 
 smith connects to stdio MCP servers and exposes their tools to the agent as
@@ -226,6 +255,9 @@ smith
 # The harness as a daemon + thin clients (see the daemon section above)
 smith serve
 smith attach
+
+# The fleet: lease a worker, materialise from git (see the fleet section)
+smith run --serve --worker gpu-box --repo https://... "task"
 
 # One-shot task, auto-approved, gated by the verify command
 smith run "explain what this project does"

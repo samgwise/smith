@@ -9,6 +9,7 @@ description = "Smith controller daemon: hosted sessions, approval routing and th
 anyhow.workspace = true
 async-trait.workspace = true
 dunce.workspace = true
+sha2 = "0.11"
 serde.workspace = true
 serde_json.workspace = true
 smith-core.workspace = true

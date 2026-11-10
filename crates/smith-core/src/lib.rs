@@ -24,5 +24,6 @@ pub use model::{FinishReason, Message, ProviderEvent, Role, ToolCall, ToolDef, U
 pub use provider::{LlmProvider, ProviderStream};
 pub use session::{
     SessionLogger, SessionMeta, SessionRecord, list_sessions, load_history, workspace_identity,
+    workspace_identity_of,
 };
 pub use tools::{Tool, builtin_tools};

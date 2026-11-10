@@ -32,7 +32,7 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
 
     // MCP servers: connected for the whole TUI session, tools added to the
     // registry once (cache-stable), shut down when the session ends.
-    let mut mcp_session = smith_server::connect_mcp(config, &workspace_canon).await;
+    let mut mcp_session = smith_server::connect_mcp(config, Some(&workspace_canon)).await;
     let mcp_status = mcp_session.status_lines();
     let mut tools = smith_core::builtin_tools();
     tools.extend(mcp_session.take_tools());
@@ -108,10 +108,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run one task headlessly (auto-approved, sandboxed).
+    /// Run one task headlessly (auto-approved, sandboxed). With --serve,
+    /// submit to a `smith serve` daemon instead (the CI issuer).
     Run {
         /// The task for the agent.
         task: String,
+        /// Submit to the daemon instead of running locally.
+        #[arg(long)]
+        serve: bool,
+        /// Daemon address (with --serve; env SMITH_SERVE_URL).
+        #[arg(long)]
+        url: Option<String>,
+        /// Daemon token (with --serve; env SMITH_SERVE_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        /// Lease a fleet worker for the session (with --serve).
+        #[arg(long)]
+        worker: Option<String>,
+        /// Repo URL to materialise on the worker (with --serve).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Git ref for the worker workspace (with --repo).
+        #[arg(long)]
+        git_ref: Option<String>,
         /// Workspace directory (defaults to the current directory).
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -209,6 +228,20 @@ enum Command {
         /// Daemon token (env SMITH_SERVE_TOKEN; default: the daemon's token file).
         #[arg(long)]
         token: Option<String>,
+        /// Lease a fleet worker for a fresh session.
+        #[arg(long)]
+        worker: Option<String>,
+        /// Repo URL to materialise on the worker.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Git ref for the worker workspace (with --repo).
+        #[arg(long)]
+        git_ref: Option<String>,
+    },
+    /// Manage fleet workers (admin over the daemon).
+    Worker {
+        #[command(subcommand)]
+        cmd: WorkerCmd,
     },
     /// List recent sessions.
     Sessions,
@@ -219,6 +252,16 @@ enum Command {
     },
     /// Remove every smith session container.
     Clean,
+}
+
+#[derive(Subcommand)]
+enum WorkerCmd {
+    /// Mint a single-use enrolment token for a worker.
+    Issue { name: String },
+    /// List registered workers.
+    List,
+    /// Revoke a worker (its leases are lost; checkpoint branches hold the work).
+    Revoke { name: String },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +305,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Run {
             task,
+            serve,
+            url,
+            token,
+            worker,
+            repo,
+            git_ref,
             workspace,
             keep,
             provider,
@@ -270,6 +319,23 @@ async fn main() -> anyhow::Result<()> {
             connection,
             remote_workspace,
         }) => {
+            if serve {
+                let code = run::run_via_serve(run::ServeRun {
+                    url: url.as_deref(),
+                    token: token.as_deref(),
+                    task: &task,
+                    worker: worker.as_deref(),
+                    repo: repo.as_deref(),
+                    git_ref: git_ref.as_deref(),
+                    provider: provider.as_deref(),
+                    model: model.as_deref(),
+                })
+                .await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return Ok(());
+            }
             let mut config = config;
             if let Some(provider) = provider {
                 config.provider = provider;
@@ -366,9 +432,29 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Serve { bind }) => {
             smith_server::serve(&config, bind).await?;
         }
-        Some(Command::Attach { id, url, token }) => {
-            attach::run_attach(url.as_deref(), token.as_deref(), id.as_deref()).await?;
+        Some(Command::Attach {
+            id,
+            url,
+            token,
+            worker,
+            repo,
+            git_ref,
+        }) => {
+            attach::run_attach(
+                url.as_deref(),
+                token.as_deref(),
+                id.as_deref(),
+                worker.as_deref(),
+                repo.as_deref(),
+                git_ref.as_deref(),
+            )
+            .await?;
         }
+        Some(Command::Worker { cmd }) => match cmd {
+            WorkerCmd::Issue { name } => attach::worker_issue(None, None, &name).await?,
+            WorkerCmd::List => attach::workers_list(None, None).await?,
+            WorkerCmd::Revoke { name } => attach::worker_revoke(None, None, &name).await?,
+        },
         Some(Command::Sessions) => {
             for (path, meta) in smith_core::list_sessions()? {
                 println!(
