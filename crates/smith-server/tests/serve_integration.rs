@@ -16,8 +16,8 @@ use smith_core::{
 };
 use smith_protocol::http::{read_request, write_json_response};
 use smith_protocol::{
-    Capability, EnrolRequest, Envelope, EventStream, OpResult, OpResultRequest, ServeClient,
-    WireEvent, WorkerCommand,
+    Capability, EnrolRequest, Envelope, EventStream, HeartbeatRequest, Load, OpResult,
+    OpResultRequest, ServeClient, WireEvent, WorkerCommand,
 };
 use smith_server::Controller;
 use smith_server::OrchestrateSection;
@@ -103,8 +103,15 @@ impl SessionFactory for FakeFactory {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> anyhow::Result<Arc<dyn LlmProvider>> {
+        // The test convention: model "judge" gets the judge script, model
+        // "planner" gets the factory script (a worker-mode parent builds
+        // its provider here, not through `create`); everything else is a
+        // single-reply provider (children).
         if model == Some("judge") {
             return Ok(Arc::new(ScriptedProvider::new(self.judge_script.clone())));
+        }
+        if model == Some("planner") {
+            return Ok(Arc::new(ScriptedProvider::new(self.script.clone())));
         }
         Ok(Arc::new(ScriptedProvider::new(vec![MockResponse {
             text: format!(
@@ -174,6 +181,7 @@ fn harness_controller(
         metrics,
         smith_server::WorkerDefaults::default(),
         smith_server::OrchestrateSection::default(),
+        None,
     )
 }
 
@@ -682,6 +690,10 @@ async fn spawn_fake_worker(
     name: &str,
     merge_results: Arc<Mutex<VecDeque<OpResult>>>,
     gate_commands: Arc<Mutex<Vec<String>>>,
+    // Session ids the worker pretends to hold from the start (a real
+    // worker keeps its sandboxes across a daemon restart and reports them
+    // in heartbeats).
+    pre_hold: Vec<String>,
 ) {
     let issue = client.worker_issue(name).await.unwrap();
     let enrol = ServeClient::new("127.0.0.1", port, issue.clone());
@@ -701,6 +713,34 @@ async fn spawn_fake_worker(
         .await
         .unwrap();
     let worker_client = ServeClient::new("127.0.0.1", port, cred.worker_token);
+
+    // Heartbeat loop: live leases are the sessions this worker started
+    // (plus any pre-held) — the real worker's reconciliation behaviour.
+    let holds = Arc::new(Mutex::new(pre_hold));
+    {
+        let holds = holds.clone();
+        let hb_client = worker_client.clone();
+        let worker_id = cred.worker_id.clone();
+        tokio::spawn(async move {
+            loop {
+                let live = holds.lock().unwrap().clone();
+                let _ = hb_client
+                    .post_body(
+                        "/v1/worker/heartbeat",
+                        serde_json::to_string(&HeartbeatRequest {
+                            worker_id: worker_id.clone(),
+                            live_leases: live,
+                            capability: Capability::default(),
+                            load: Load::default(),
+                        })
+                        .unwrap(),
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+        });
+    }
+
     tokio::spawn(async move {
         'reconnect: loop {
             let Ok(mut stream) = worker_client.stream("/v1/worker/events").await else {
@@ -718,7 +758,10 @@ async fn spawn_fake_worker(
                                 session_id,
                                 exec_id,
                                 ..
-                            } => (session_id.clone(), exec_id.clone(), OpResult::WriteFile),
+                            } => {
+                                holds.lock().unwrap().push(session_id.clone());
+                                (session_id.clone(), exec_id.clone(), OpResult::WriteFile)
+                            }
                             WorkerCommand::Exec {
                                 session_id,
                                 exec_id,
@@ -868,6 +911,7 @@ async fn orchestration_end_to_end_over_the_mesh() {
                 auto_push: false,
                 collect_timeout_secs: 30,
             },
+            None,
         )
     };
     let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
@@ -884,6 +928,7 @@ async fn orchestration_end_to_end_over_the_mesh() {
         "fake-1",
         merge_results,
         gate_commands.clone(),
+        vec![],
     )
     .await;
 
@@ -1058,6 +1103,7 @@ async fn spawn_caps_are_enforced_and_finish_releases_queued_children() {
             max_children: 1,
             ..Default::default()
         },
+        None,
     );
     let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1112,4 +1158,437 @@ async fn spawn_caps_are_enforced_and_finish_releases_queued_children() {
     // And the queued child was released with no lease to free.
     let st = client.status(&status.children[0].id).await.unwrap();
     assert_eq!(st.lease_state, Some(smith_protocol::LeaseState::Released));
+}
+
+// ---- M16: the persistent harness ---------------------------------------
+
+/// Poll until `pred` holds (100ms cadence, 10s budget).
+async fn wait_for(mut pred: impl AsyncFnMut() -> bool, label: &str) {
+    for _ in 0..100 {
+        if pred().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting: {label}");
+}
+
+/// A daemon restart mid-orchestration: sessions, journals, leases and the
+/// orchestrator itself survive. The recovered controller serves the same
+/// state dir; a fresh worker connection (same name) re-learns the leases
+/// via heartbeats; the parent finishes its orchestration.
+#[tokio::test]
+async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let repo = "https://git.example.com/org/repo.git";
+    let registry = ws.path().join("workers.json"); // shared across restarts
+
+    let planner_script = vec![
+        MockResponse {
+            text: String::new(),
+            calls: vec![tool_named(
+                "c1",
+                "spawn_subtasks",
+                serde_json::json!({ "subtasks": [
+                    { "title": "alpha", "instructions": "do alpha", "repo": repo },
+                    { "title": "beta", "instructions": "do beta", "repo": repo },
+                ]}),
+            )],
+        },
+        MockResponse {
+            text: "plan laid out".into(),
+            calls: vec![],
+        },
+    ];
+    let merge_results_1 = Arc::new(Mutex::new(VecDeque::from(vec![OpResult::MergeGate {
+        ok: true,
+        conflict: false,
+        output: "merged clean".into(),
+    }])));
+    let gate_commands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+
+    let controller1 = {
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        smith_server::Controller::with_parts(
+            Arc::new(FakeFactory {
+                script: planner_script,
+                hang: false,
+                judge_script: vec![accept_verdict()],
+            }),
+            Duration::from_secs(60),
+            fleet,
+            metrics,
+            smith_server::WorkerDefaults::default(),
+            OrchestrateSection {
+                judge_model: "judge".into(),
+                collect_timeout_secs: 30,
+                ..Default::default()
+            },
+            Some(state.path().to_path_buf()),
+        )
+    };
+    let listener1 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port1 = listener1.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener1,
+        controller1.clone(),
+        TOKEN.to_string(),
+    ));
+    let client1 = ServeClient::new("127.0.0.1", port1, TOKEN.to_string());
+    spawn_fake_worker(
+        &client1,
+        port1,
+        "fake-1",
+        merge_results_1,
+        gate_commands.clone(),
+        vec![],
+    )
+    .await;
+
+    // Worker-mode planner (recoverable), two children, one collected and
+    // merged before the restart.
+    let parent = client1
+        .create_session_req(&smith_protocol::CreateSession {
+            workspace: ws.path().to_str().unwrap().to_string(),
+            provider: None,
+            model: Some("planner".into()),
+            approval_mode: smith_protocol::ApprovalMode::Auto,
+            worker: None,
+            repo: Some(repo.into()),
+            git_ref: None,
+            orchestrate: true,
+        })
+        .await
+        .unwrap();
+    client1
+        .start_turn(&parent, "orchestrate this")
+        .await
+        .unwrap();
+    wait_for(
+        async || {
+            let status = client1.status(&parent).await.unwrap();
+            status.children.len() == 2
+                && status
+                    .children
+                    .iter()
+                    .all(|c| c.state == smith_protocol::ChildState::Running)
+        },
+        "both children running",
+    )
+    .await;
+    let children: Vec<String> = client1
+        .status(&parent)
+        .await
+        .unwrap()
+        .children
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+
+    let orch1 = controller1
+        .get(&parent)
+        .unwrap()
+        .orchestration
+        .clone()
+        .unwrap();
+    let f1 = orch1.collect(&children[0]).await.unwrap();
+    assert!(f1.contains("verdict: accept"), "{f1}");
+    let m1 = orch1.merge(&children[0]).await.unwrap();
+    assert!(m1.contains("OK"), "{m1}");
+
+    // ---- the restart: a fresh controller over the same state dir ----
+    let controller2 = {
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        smith_server::Controller::with_parts(
+            Arc::new(FakeFactory {
+                script: vec![],
+                hang: false,
+                judge_script: vec![accept_verdict()],
+            }),
+            Duration::from_secs(60),
+            fleet,
+            metrics,
+            smith_server::WorkerDefaults::default(),
+            OrchestrateSection {
+                judge_model: "judge".into(),
+                collect_timeout_secs: 30,
+                ..Default::default()
+            },
+            Some(state.path().to_path_buf()),
+        )
+    };
+    let listener2 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port2 = listener2.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener2,
+        controller2.clone(),
+        TOKEN.to_string(),
+    ));
+    let client2 = ServeClient::new("127.0.0.1", port2, TOKEN.to_string());
+    // The worker re-dials (same name) still holding its sandboxes.
+    spawn_fake_worker(
+        &client2,
+        port2,
+        "fake-1",
+        Arc::new(Mutex::new(VecDeque::from(vec![OpResult::MergeGate {
+            ok: true,
+            conflict: false,
+            output: "merged after restart".into(),
+        }]))),
+        gate_commands.clone(),
+        vec![parent.clone(), children[0].clone(), children[1].clone()],
+    )
+    .await;
+
+    let recovered = controller2.recover().await;
+    assert_eq!(recovered, 3, "parent + two children");
+    assert_eq!(client2.sessions().await.unwrap().len(), 3);
+
+    // Labels survived: the parent still lists its children.
+    let status = client2.status(&parent).await.unwrap();
+    assert_eq!(status.children.len(), 2);
+    // The lease was trusted (re-granted on the recorded worker).
+    assert_eq!(
+        controller2.fleet.board.lease_of(&parent),
+        Some(("fake-1".into(), smith_protocol::LeaseState::Granted))
+    );
+    // The relearn path: dropping the board entry is undone by the worker's
+    // next heartbeat (it still holds the sandbox).
+    controller2.fleet.board.release(&parent);
+    wait_for(
+        async || {
+            controller2.fleet.board.lease_of(&parent)
+                == Some(("fake-1".into(), smith_protocol::LeaseState::Granted))
+        },
+        "heartbeat re-learns the lease",
+    )
+    .await;
+
+    // Pre-restart journal events replay for a fresh attacher.
+    let mut journal = client2.events(&parent, 0).await.unwrap();
+    let mut spawned = 0;
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(5), journal.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let WireEvent::Orchestration { kind, .. } = &next.event {
+            if *kind == smith_protocol::OrchestrationKind::Spawned {
+                spawned += 1;
+                if spawned == 2 {
+                    break;
+                }
+            }
+        }
+    }
+
+    // The recovered orchestrator picks the remaining child up mid-flight.
+    let orch2 = controller2
+        .get(&parent)
+        .unwrap()
+        .orchestration
+        .clone()
+        .expect("parent recovered with its orchestrator");
+    let f2 = orch2.collect(&children[1]).await.unwrap();
+    assert!(f2.contains("verdict: accept"), "{f2}");
+    let m2 = orch2.merge(&children[1]).await.unwrap();
+    assert!(m2.contains("OK"), "{m2}");
+    let fin = orch2.finish("done after restart").await.unwrap();
+    assert!(fin.contains("orchestration closed"), "{fin}");
+
+    // Both gates merged against the parent's integration branch.
+    let gates = gate_commands.lock().unwrap().clone();
+    assert_eq!(
+        gates,
+        vec![format!("smith/integration/{parent}"); 2],
+        "{gates:?}"
+    );
+    let status = client2.status(&parent).await.unwrap();
+    assert!(
+        status
+            .children
+            .iter()
+            .all(|c| c.state == smith_protocol::ChildState::Completed)
+    );
+    for child in &children {
+        let st = client2.status(child).await.unwrap();
+        assert_eq!(st.lease_state, Some(smith_protocol::LeaseState::Released));
+    }
+}
+
+/// A restart between spawn and dispatch: the queued child is recovered and
+/// the recovered dispatcher sends it as soon as a worker appears.
+#[tokio::test]
+async fn requeued_children_dispatch_after_restart() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let repo = "https://git.example.com/org/repo.git";
+    let registry = ws.path().join("workers.json");
+
+    let planner_script = vec![
+        MockResponse {
+            text: String::new(),
+            calls: vec![tool_named(
+                "c1",
+                "spawn_subtasks",
+                serde_json::json!({ "subtasks": [
+                    { "title": "solo", "instructions": "do it", "repo": repo },
+                ]}),
+            )],
+        },
+        MockResponse {
+            text: "plan laid out".into(),
+            calls: vec![],
+        },
+    ];
+
+    let controller1 = {
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        smith_server::Controller::with_parts(
+            Arc::new(FakeFactory {
+                script: planner_script,
+                hang: false,
+                judge_script: vec![],
+            }),
+            Duration::from_secs(60),
+            fleet,
+            metrics,
+            smith_server::WorkerDefaults::default(),
+            OrchestrateSection {
+                judge_model: "judge".into(),
+                collect_timeout_secs: 30,
+                ..Default::default()
+            },
+            Some(state.path().to_path_buf()),
+        )
+    };
+    let listener1 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port1 = listener1.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener1,
+        controller1.clone(),
+        TOKEN.to_string(),
+    ));
+    let client1 = ServeClient::new("127.0.0.1", port1, TOKEN.to_string());
+    spawn_fake_worker(
+        &client1,
+        port1,
+        "fake-1",
+        Arc::new(Mutex::new(VecDeque::from(vec![]))),
+        Arc::new(Mutex::new(vec![])),
+        vec![],
+    )
+    .await;
+
+    // A worker exists for the parent's create, then is revoked: the spawn
+    // has nobody to dispatch to, so the child stays queued.
+    let parent = client1
+        .create_session_req(&smith_protocol::CreateSession {
+            workspace: ws.path().to_str().unwrap().to_string(),
+            provider: None,
+            model: Some("planner".into()),
+            approval_mode: smith_protocol::ApprovalMode::Auto,
+            worker: None,
+            repo: Some(repo.into()),
+            git_ref: None,
+            orchestrate: true,
+        })
+        .await
+        .unwrap();
+    client1.worker_revoke("fake-1").await.unwrap();
+    client1
+        .start_turn(&parent, "orchestrate this")
+        .await
+        .unwrap();
+    wait_for(
+        async || {
+            let status = client1.status(&parent).await.unwrap();
+            status.children.len() == 1
+                && status.children[0].state == smith_protocol::ChildState::Queued
+        },
+        "child queued",
+    )
+    .await;
+    let child = client1.status(&parent).await.unwrap().children.remove(0).id;
+
+    // Restart before any worker shows up.
+    let controller2 = {
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        smith_server::Controller::with_parts(
+            Arc::new(FakeFactory {
+                script: vec![],
+                hang: false,
+                judge_script: vec![accept_verdict()],
+            }),
+            Duration::from_secs(60),
+            fleet,
+            metrics,
+            smith_server::WorkerDefaults::default(),
+            OrchestrateSection {
+                judge_model: "judge".into(),
+                collect_timeout_secs: 30,
+                ..Default::default()
+            },
+            Some(state.path().to_path_buf()),
+        )
+    };
+    let listener2 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port2 = listener2.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener2,
+        controller2.clone(),
+        TOKEN.to_string(),
+    ));
+    let client2 = ServeClient::new("127.0.0.1", port2, TOKEN.to_string());
+    assert_eq!(controller2.recover().await, 2);
+    assert_eq!(
+        client2.status(&child).await.unwrap().lease_state,
+        Some(smith_protocol::LeaseState::Queued)
+    );
+
+    // A worker appears; the recovered dispatcher sends the child.
+    spawn_fake_worker(
+        &client2,
+        port2,
+        "fake-1",
+        Arc::new(Mutex::new(VecDeque::from(vec![]))),
+        Arc::new(Mutex::new(vec![])),
+        vec![],
+    )
+    .await;
+    wait_for(
+        async || {
+            client2.status(&child).await.unwrap().lease_state
+                == Some(smith_protocol::LeaseState::Granted)
+        },
+        "recovered child dispatched",
+    )
+    .await;
+
+    // The relearn path again, on the freshly-dispatched lease.
+    controller2.fleet.board.release(&child);
+    wait_for(
+        async || {
+            controller2.fleet.board.lease_of(&child)
+                == Some(("fake-1".into(), smith_protocol::LeaseState::Granted))
+        },
+        "heartbeat re-learns the dispatched lease",
+    )
+    .await;
+
+    // And the recovered orchestrator can collect the finding.
+    let orch2 = controller2
+        .get(&parent)
+        .unwrap()
+        .orchestration
+        .clone()
+        .unwrap();
+    let finding = orch2.collect(&child).await.unwrap();
+    assert!(finding.contains("verdict: accept"), "{finding}");
 }

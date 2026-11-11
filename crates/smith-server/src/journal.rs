@@ -4,7 +4,16 @@
 //! Replay semantics: `replay(since)` returns every journalled envelope with
 //! `seq > since`. Subscribers deduplicate by sequence (an event published
 //! between subscribing and snapshotting the replay appears in both).
+//!
+//! Durability (M16): a journal opened over a file (one JSONL envelope per
+//! line, the `.wire` file of a hosted session) survives the daemon — on
+//! restart the ring, the seq counter and the last status snapshot rebuild
+//! from it. Sink writes are best-effort: a failed write warns and degrades
+//! to the in-memory ring (replay after that point starts from restart).
 
+use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,7 +21,7 @@ use smith_core::CoreEvent;
 use smith_protocol::{Envelope, WireEvent};
 
 /// Journal capacity: how far back a new/reconnecting viewer can replay.
-const RING_CAPACITY: usize = 10_000;
+pub const RING_CAPACITY: usize = 10_000;
 /// Broadcast queue per subscriber; overflow is recovered from the ring.
 const BROADCAST_QUEUE: usize = 4096;
 
@@ -21,6 +30,8 @@ pub struct Journal {
     cap: usize,
     buffer: Mutex<Vec<Envelope>>,
     tx: tokio::sync::broadcast::Sender<Envelope>,
+    /// The append-only `.wire` sink (None for ephemeral journals).
+    sink: Mutex<Option<BufWriter<File>>>,
 }
 
 impl Journal {
@@ -35,7 +46,38 @@ impl Journal {
             cap: cap.max(1),
             buffer: Mutex::new(Vec::new()),
             tx,
+            sink: Mutex::new(None),
         }
+    }
+
+    /// Open (or resume) a durable journal over `path`: rebuild the ring and
+    /// the seq counter from whatever is on disk (a torn trailing line from a
+    /// crash is skipped), then append. Ring cap trims the loaded window.
+    pub fn load_persisted(path: &Path, cap: usize) -> anyhow::Result<Self> {
+        let cap = cap.max(1);
+        let mut buffer: Vec<Envelope> = Vec::new();
+        let mut seq = 0u64;
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            for line in raw.lines() {
+                let Ok(env) = serde_json::from_str::<Envelope>(line) else {
+                    continue; // torn line (or hand-edit): skip
+                };
+                seq = env.seq;
+                buffer.push(env);
+            }
+        }
+        if buffer.len() > cap {
+            buffer.drain(..buffer.len() - cap);
+        }
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_QUEUE);
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            seq: AtomicU64::new(seq),
+            cap,
+            buffer: Mutex::new(buffer),
+            tx,
+            sink: Mutex::new(Some(BufWriter::new(file))),
+        })
     }
 
     /// Publish an event; returns its assigned sequence number.
@@ -51,9 +93,31 @@ impl Journal {
                 buf.drain(..cut);
             }
         }
+        self.persist(&env);
         // No subscribers is fine (a session nobody is watching).
         let _ = self.tx.send(env);
         seq
+    }
+
+    /// Append one envelope to the `.wire` sink. Best-effort: a failed write
+    /// warns once and degrades the journal to in-memory (restart replay
+    /// then starts from the daemon's next start).
+    fn persist(&self, env: &Envelope) {
+        let mut sink = self.sink.lock().expect("journal sink mutex poisoned");
+        if let Some(w) = sink.as_mut() {
+            let line = match serde_json::to_string(env) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!("journal envelope serialisation failed: {e}");
+                    return;
+                }
+            };
+            use std::io::Write as _;
+            if let Err(e) = writeln!(w, "{line}").and_then(|_| w.flush()) {
+                tracing::warn!("journal sink write failed ({e:#}); degrading to in-memory replay");
+                *sink = None;
+            }
+        }
     }
 
     pub fn publish_core(&self, event: CoreEvent) -> u64 {
@@ -131,5 +195,68 @@ mod tests {
         j.publish(notice("live"));
         let env = rx.recv().await.unwrap();
         assert_eq!(env.seq, 1);
+    }
+
+    #[test]
+    fn persisted_journal_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.wire");
+        {
+            let j = Journal::load_persisted(&path, 100).unwrap();
+            j.publish(notice("a"));
+            j.publish(notice("b"));
+            j.publish(notice("c"));
+        }
+        // A "restart": reload from the same file.
+        let j2 = Journal::load_persisted(&path, 100).unwrap();
+        let replay = j2.replay(0);
+        assert_eq!(replay.len(), 3);
+        assert_eq!(replay[2].seq, 3);
+        // The seq counter continues (no reuse across the restart).
+        assert_eq!(j2.publish(notice("d")), 4);
+        let replay = j2.replay(0);
+        assert_eq!(replay.len(), 4);
+        assert!(
+            matches!(&replay[3].event, WireEvent::Core { core } if matches!(core, CoreEvent::Notice { text } if text == "d"))
+        );
+    }
+
+    #[test]
+    fn torn_trailing_line_is_tolerated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.wire");
+        let j = Journal::load_persisted(&path, 100).unwrap();
+        j.publish(notice("a"));
+        j.publish(notice("b"));
+        drop(j);
+        // Simulate a crash mid-write: garbage appended.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        // A torn envelope: `{"v": 1,` with no close.
+        write!(f, "{}", r#"{"v": 1,"#).unwrap();
+        drop(f);
+        let j2 = Journal::load_persisted(&path, 100).unwrap();
+        assert_eq!(j2.replay(0).len(), 2);
+        // And the next publish continues the sequence.
+        assert_eq!(j2.publish(notice("c")), 3);
+    }
+
+    #[test]
+    fn loading_trims_to_the_ring_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc.wire");
+        let j = Journal::load_persisted(&path, 10).unwrap();
+        for i in 0..50 {
+            j.publish(notice(&format!("n{i}")));
+        }
+        drop(j);
+        let j2 = Journal::load_persisted(&path, 10).unwrap();
+        let replay = j2.replay(0);
+        assert_eq!(replay.len(), 10);
+        assert_eq!(replay[0].seq, 41);
+        assert_eq!(replay[9].seq, 50);
     }
 }

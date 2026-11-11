@@ -57,8 +57,9 @@ pub enum Verdict {
     Unjudged,
 }
 
-/// One orchestrated child's bookkeeping.
-#[derive(Clone)]
+/// One orchestrated child's bookkeeping. Serialised into the parent's
+/// `.orch` sidecar so an orchestration survives a daemon restart.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ChildRecord {
     id: String,
     title: String,
@@ -75,8 +76,17 @@ struct ChildRecord {
     turns_requested: usize,
     /// Settled turns (the tracker counts TurnCompleted/Cancelled/Error).
     turns_done: usize,
-    /// Last journal event summary (tracker task).
+    /// Last journal event summary (tracker task; cosmetic — not persisted
+    /// on every update).
+    #[serde(default)]
     last_event: String,
+}
+
+/// The `.orch` sidecar's on-disk shape.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedOrchestration {
+    closed: bool,
+    children: Vec<ChildRecord>,
 }
 
 /// The planner-side orchestrator: children, judge, gates, visibility.
@@ -101,6 +111,8 @@ pub struct Orchestrator {
     /// Self-reference for starting the dispatcher lazily (first spawn).
     me: std::sync::OnceLock<std::sync::Weak<Orchestrator>>,
     dispatcher_started: AtomicBool,
+    /// The `.orch` sidecar path (None = ephemeral; tests).
+    sidecar_path: Option<std::path::PathBuf>,
 }
 
 impl Orchestrator {
@@ -110,6 +122,7 @@ impl Orchestrator {
         factory: Arc<dyn SessionFactory>,
         journal: Arc<Journal>,
         controller: std::sync::Weak<Controller>,
+        sidecar_path: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         let orch = Arc::new(Self {
             parent,
@@ -124,11 +137,91 @@ impl Orchestrator {
             closed: AtomicBool::new(false),
             me: std::sync::OnceLock::new(),
             dispatcher_started: AtomicBool::new(false),
+            sidecar_path,
         });
         orch.me
             .set(Arc::downgrade(&orch))
             .expect("self-reference set once");
         orch
+    }
+
+    /// Rebuild an orchestrator from its `.orch` sidecar (daemon restart).
+    /// Returns None when the sidecar is missing or unreadable. Does not
+    /// spawn anything — [`Self::resume_after_daemon_restart`] does, once
+    /// every recovered session is back in the table.
+    pub fn recover(
+        path: &std::path::Path,
+        parent: String,
+        config: OrchestrateSection,
+        factory: Arc<dyn SessionFactory>,
+        journal: Arc<Journal>,
+        controller: std::sync::Weak<Controller>,
+    ) -> Option<Arc<Self>> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let saved: SavedOrchestration = serde_json::from_str(&raw).ok()?;
+        let orch = Self::new(
+            parent,
+            config,
+            factory,
+            journal,
+            controller,
+            Some(path.to_path_buf()),
+        );
+        orch.closed.store(saved.closed, Ordering::SeqCst);
+        *orch.children.lock().expect("children mutex poisoned") = saved.children;
+        Some(orch)
+    }
+
+    /// Post-recovery re-arm: the dispatcher (queued children resume) and
+    /// per-child trackers (live children re-subscribe).
+    pub fn resume_after_daemon_restart(&self, controller: &Arc<Controller>) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if !self.dispatcher_started.swap(true, Ordering::SeqCst)
+            && let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade)
+        {
+            tokio::spawn(me.dispatch_loop());
+        }
+        for child in self
+            .children
+            .lock()
+            .expect("children mutex poisoned")
+            .iter()
+            .filter(|c| c.state == ChildState::Running)
+            .map(|c| c.id.clone())
+            .collect::<Vec<_>>()
+        {
+            self.spawn_tracker(controller, &child);
+        }
+    }
+
+    /// Write the sidecar (state transitions only — event-level updates
+    /// don't persist; `last_event` is cosmetic). Write-then-rename, so a
+    /// torn write never leaves a half-sidecar.
+    fn persist_sidecar(&self) {
+        let Some(path) = &self.sidecar_path else {
+            return;
+        };
+        let saved = SavedOrchestration {
+            closed: self.closed.load(Ordering::SeqCst),
+            children: self
+                .children
+                .lock()
+                .expect("children mutex poisoned")
+                .clone(),
+        };
+        let body = match serde_json::to_string_pretty(&saved) {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!("orchestration sidecar serialisation failed: {e}");
+                return;
+            }
+        };
+        let tmp = path.with_extension("orch.tmp");
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, path)) {
+            tracing::warn!("orchestration sidecar write failed: {e}");
+        }
     }
 
     // ---------------------------------------------------- visibility ---
@@ -166,6 +259,7 @@ impl Orchestrator {
         {
             c.state = ChildState::Failed;
             drop(children);
+            self.persist_sidecar();
             self.publish(child_id, OrchestrationKind::Failed, "lease lost");
         }
     }
@@ -181,6 +275,7 @@ impl Orchestrator {
         {
             c.turns_requested += 1;
         }
+        self.persist_sidecar();
     }
 
     /// Tracker task bookkeeping: count a completed turn.
@@ -195,6 +290,7 @@ impl Orchestrator {
             c.turns_done += 1;
             c.last_event = "turn completed".into();
         }
+        self.persist_sidecar();
     }
 
     /// Tracker task bookkeeping: remember a child's last event summary.
@@ -285,6 +381,7 @@ impl Orchestrator {
             );
             out.push_str(&format!("\n- {} `{}`", &id[..8.min(id.len())], spec.title));
         }
+        self.persist_sidecar();
         Ok(out)
     }
 
@@ -410,6 +507,7 @@ impl Orchestrator {
                 c.state = state;
             }
         }
+        self.persist_sidecar();
         self.push_parent_status();
     }
 
@@ -420,6 +518,7 @@ impl Orchestrator {
                 c.state = ChildState::Failed;
             }
         }
+        self.persist_sidecar();
         self.push_parent_status();
     }
 
@@ -684,6 +783,7 @@ verdict; no quality claim is made):\n\n{report}\n\n{diffstat}",
                             format!("judge rework: {}", &critique[..60.min(critique.len())]);
                         c.judge_rounds_used
                     };
+                    self.persist_sidecar();
                     if used >= self.config.judge_rounds {
                         // Bounded cost: pass through, flagged.
                         return Ok(format!(
@@ -902,6 +1002,10 @@ Address it, then summarise what changed in response."
         } else {
             integrated
         };
+        // The orchestration is closed: the sidecar's job is done.
+        if let Some(path) = &self.sidecar_path {
+            let _ = std::fs::remove_file(path);
+        }
         self.publish(
             &self.parent,
             OrchestrationKind::Released,

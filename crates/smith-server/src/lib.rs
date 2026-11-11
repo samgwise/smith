@@ -50,6 +50,12 @@ pub async fn serve(config: &Config, bind_override: Option<String>) -> anyhow::Re
     let bind = bind_override.unwrap_or_else(|| config.serve.bind.clone());
     let token = ensure_token()?;
     let controller = Controller::new(config);
+    // M16: rebuild the session table from the state dir before serving —
+    // recovered sessions re-attach transparently (workers never notice).
+    let recovered = controller.recover().await;
+    if recovered > 0 {
+        println!("recovered {recovered} hosted session(s)");
+    }
     controller::spawn_clearance_poller(controller.clone());
     controller::spawn_fleet_sweeper(controller.clone());
 

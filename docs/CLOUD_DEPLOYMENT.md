@@ -112,10 +112,17 @@ self-hosting the forge.
 
 In the order ranked when this posture was discussed:
 
-1. **Daemon durability.** Sessions, journals, leases and M15
-   orchestrators are in-memory; a restart loses hosted sessions (JSONL
-   logs + git branches survive, but there is no recovery path for the
-   session table or an in-flight orchestration). The first design to do.
+1. **Daemon durability.** *Built (M16).* The daemon survives its own
+   restart: every hosted session's journal is persisted (one envelope per
+   line), and recovery rebuilds the session table, labels, agent harness
+   and leases from the state dir. Three files per session, three roles:
+   the JSONL (transcript + agent history, smith-core's), `.wire` (the
+   replay ring + label source), `.orch` (orchestration child records,
+   parents only) — plus a `.create` record (the original request) for the
+   rebuild. Worker-mode sessions recover fully; queued children re-dispatch
+   when a worker appears; a worker's first heartbeat re-learns its leases.
+   Local-mode sessions are skipped on recovery (their transcripts remain
+   `smith resume`-able).
 2. **WAN latency budget.** The harness↔execution loop is chatty; with
    both sides now WAN-separated, decide what the budget is (per-tool-call
    round trips) and whether anything needs batching.

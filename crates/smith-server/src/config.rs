@@ -152,6 +152,9 @@ pub struct ServeSection {
     pub bind: String,
     /// Seconds before an unanswered approval auto-denies.
     pub approval_timeout_secs: u64,
+    /// Daemon state directory (M16): durable journals, session create
+    /// records and orchestration sidecars. Sessions survive a restart.
+    pub state_dir: Option<String>,
 }
 
 impl Default for ServeSection {
@@ -159,6 +162,7 @@ impl Default for ServeSection {
         Self {
             bind: format!("127.0.0.1:{DEFAULT_SERVE_PORT}"),
             approval_timeout_secs: 300,
+            state_dir: None, // ~/.smith/serve
         }
     }
 }
@@ -340,6 +344,7 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              # `smith serve` daemon: thin clients attach with `smith attach`\n\
              bind = \"127.0.0.1:{DEFAULT_SERVE_PORT}\"\n\
              approval_timeout_secs = 300  # unanswered approvals auto-deny\n\
+             # state_dir = \"~/.smith/serve\"  # durable journals + sessions (M16)\n\
              \n\
              [worker]\n\
              # fleet execution (smith-worker; see docs/WORKER_MESH.md)\n\

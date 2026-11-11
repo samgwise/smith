@@ -305,7 +305,9 @@ async fn route(
                     .fleet
                     .registry
                     .record_heartbeat(&worker, &body.capability, &body.load);
-                // Reconcile: the worker's live-lease list wins.
+                // Reconcile: the worker's live-lease list wins. The M16
+                // add-direction re-learns leases the DAEMON forgot (restart).
+                controller.relearn_leases(&worker, &body.live_leases);
                 let lost = controller.fleet.reconcile(&worker, &body.live_leases);
                 if !lost.is_empty() {
                     controller.handle_lease_loss(&worker, &lost);

@@ -120,9 +120,17 @@ Semantics:
 
 ## Session and daemon lifecycle
 
-- Sessions are in-memory in the daemon; the JSONL logs they write persist.
-  A daemon restart loses hosted sessions (log-based `smith resume` still
-  works); session containers are left running on daemon shutdown and reaped
+- Sessions live in the daemon's **state dir** (`[serve].state_dir`, default
+  `~/.smith/serve`): one `.wire` journal per session (an append-only JSONL
+  of envelopes — the replay ring), one `.create` record (the original
+  request), and a `.orch` sidecar for orchestration parents. **A daemon
+  restart recovers worker-mode sessions**: the session table, labels,
+  history and leases rebuild from the state dir; queued children re-dispatch
+  when a worker appears; a worker's first heartbeat re-learns its leases.
+  Local-mode sessions are not recovered (their transcripts remain
+  `smith resume`-able). The agent transcript itself is the JSONL log; the
+  replay ring is bounded, so a late attacher sees the tail only.
+- Session containers are left running on daemon shutdown and reaped
   by `smith clean`.
 - Bind address: `[serve].bind` in `~/.smith/config.toml`
   (default `127.0.0.1:9240`). No TLS at this layer — loopback today; put a

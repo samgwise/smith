@@ -99,6 +99,13 @@ flowchart LR
   `finish_orchestration` releases the fleet and reports the integration
   branch (`auto_push = false` — humans review by default). One level deep,
   `max_children` as config. See `docs/ORCHESTRATION.md`.
+- **M16 — the persistent harness.** *Done* (post-arc; the deployment
+  thread in `docs/CLOUD_DEPLOYMENT.md`). Daemon durability: durable
+  journals (`.wire`), session create records (`.create`), orchestration
+  sidecars (`.orch`); `smith serve` restart recovers worker-mode sessions
+  — table, labels, history, leases (trust-then-verify: the worker's next
+  heartbeat re-learns) and in-flight orchestrations (queued children
+  re-dispatch).
 
 ## Decisions: settled and left open (arc record)
 

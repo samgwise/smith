@@ -138,8 +138,22 @@ impl SessionLogger {
         provider: &str,
         model: &str,
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let id = uuid::Uuid::new_v4().simple().to_string();
+        Self::new_labelled_in_with_id(dir, &id, workspace_name, workspace_id, provider, model)
+    }
+
+    /// Open a session file whose name is the GIVEN id (daemon-hosted
+    /// sessions key their log by session id so a restart can find it).
+    pub fn new_labelled_in_with_id(
+        dir: &Path,
+        session_id: &str,
+        workspace_name: &str,
+        workspace_id: String,
+        provider: &str,
+        model: &str,
+    ) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let id = session_id.to_string();
         let path = dir.join(format!("{id}.jsonl"));
         let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         let logger = Self {

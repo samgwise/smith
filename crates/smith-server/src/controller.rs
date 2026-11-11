@@ -4,10 +4,12 @@
 //! (M14) leasing workers from the fleet.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use anyhow::Context as _;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -251,6 +253,9 @@ pub struct Controller {
     worker_defaults: WorkerDefaults,
     /// `[orchestrate]` bounds and knobs (M15).
     pub(crate) orchestrate: OrchestrateSection,
+    /// Daemon state dir (M16): durable journals, `.create` session records
+    /// and orchestration sidecars. None = in-memory only (tests).
+    pub(crate) state_dir: Option<PathBuf>,
     pub(crate) metrics: Arc<smith_protocol::metrics::Metrics>,
 }
 
@@ -275,6 +280,7 @@ impl Controller {
             provider: config.provider.clone(),
             model: config.model.clone(),
         };
+        let state_dir = state_dir_for(config);
         Self::with_parts(
             Arc::new(ConfigFactory {
                 config: config.clone(),
@@ -284,10 +290,14 @@ impl Controller {
             metrics,
             defaults,
             config.orchestrate.clone(),
+            Some(state_dir),
         )
     }
 
     /// Test constructor: explicit factory, timeout, fleet and defaults.
+    /// `state_dir = None` keeps every journal in-memory (tests that don't
+    /// exercise recovery); `Some(dir)` persists journals + session records.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_parts(
         factory: Arc<dyn SessionFactory>,
         approval_timeout: Duration,
@@ -295,7 +305,13 @@ impl Controller {
         metrics: Arc<smith_protocol::metrics::Metrics>,
         worker_defaults: WorkerDefaults,
         orchestrate: OrchestrateSection,
+        state_dir: Option<PathBuf>,
     ) -> Arc<Self> {
+        if let Some(dir) = &state_dir
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            tracing::warn!("cannot create state dir {}: {e:#}", dir.display());
+        }
         Arc::new(Self {
             sessions: std::sync::Mutex::new(HashMap::new()),
             factory,
@@ -307,8 +323,40 @@ impl Controller {
             fleet,
             worker_defaults,
             orchestrate,
+            state_dir,
             metrics,
         })
+    }
+
+    /// The durable journal for a session id (loaded from the state dir when
+    /// configured — a restart resumes the ring and the seq counter).
+    fn journal_for(&self, id: &str) -> Arc<Journal> {
+        if let Some(dir) = &self.state_dir {
+            match Journal::load_persisted(
+                &dir.join(format!("{id}.wire")),
+                crate::journal::RING_CAPACITY,
+            ) {
+                Ok(j) => return Arc::new(j),
+                Err(e) => tracing::warn!("journal for {id} not loadable: {e:#}"),
+            }
+        }
+        Arc::new(Journal::new())
+    }
+
+    /// Record the create request for a session (`.create` sidecar) — the
+    /// recovery path rebuilds the harness from it.
+    fn record_create(&self, id: &str, req: &CreateSession) {
+        if let Some(dir) = &self.state_dir {
+            let path = dir.join(format!("{id}.create"));
+            match serde_json::to_string_pretty(req) {
+                Ok(body) => {
+                    if let Err(e) = std::fs::write(&path, body) {
+                        tracing::warn!("cannot write {}: {e}", path.display());
+                    }
+                }
+                Err(e) => tracing::warn!("cannot serialise the create record: {e}"),
+            }
+        }
     }
 
     /// Override the sidecar control endpoint (tests point this at a stub).
@@ -344,9 +392,12 @@ impl Controller {
     pub async fn create_session(self: &Arc<Self>, req: CreateSession) -> Result<String, ApiError> {
         let worker_mode =
             req.worker.is_some() || req.repo.is_some() || self.worker_defaults.executor == "worker";
-        // Common harness plumbing: identity, journal, approval routing.
+        // Common harness plumbing: identity, durable journal, approval
+        // routing — and the `.create` record the recovery path rebuilds
+        // from.
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let journal = Arc::new(Journal::new());
+        let journal = self.journal_for(&id);
+        self.record_create(&id, &req);
         let gate_slot = GateSlot::new();
         let gate: Arc<dyn ApprovalGate> = self.build_gate(&req, gate_slot.clone(), &journal);
         let orchestration = req.orchestrate.then(|| {
@@ -356,6 +407,9 @@ impl Controller {
                 self.factory.clone(),
                 journal.clone(),
                 Arc::downgrade(self),
+                self.state_dir
+                    .as_ref()
+                    .map(|d| d.join(format!("{id}.orch"))),
             )
         });
         if worker_mode {
@@ -552,7 +606,9 @@ impl Controller {
 
     /// Harness-side assembly for a worker session: agent over the mesh
     /// executor, keys stay here. Extra tools join the registry (orchestration
-    /// parents); a briefing suffix joins the system prompt.
+    /// parents); a briefing suffix joins the system prompt. The logger is
+    /// injected by recovery (`Some`) so the JSONL continues across a
+    /// restart; fresh creates pass `None` (a new log keyed by session id).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn assemble_worker_harness(
         &self,
@@ -563,6 +619,7 @@ impl Controller {
         resolved: &ResolvedSource,
         extra_tools: Vec<Box<dyn Tool>>,
         briefing: Option<&str>,
+        logger: Option<smith_core::SessionLogger>,
     ) -> Result<AssembledWorker, ApiError> {
         let executor: Arc<dyn ToolExecutor> =
             Arc::new(WorkerExecutor::new(self.fleet.clone(), id.to_string()));
@@ -573,17 +630,22 @@ impl Controller {
             .map_err(ApiError::from)?;
         let model_label = provider_impl.model().to_string();
 
-        let logger = smith_core::SessionLogger::new_labelled(
-            &resolved.repo_label,
-            smith_core::workspace_identity_of(
-                resolved.source.as_ref().map_or("scratch", |s| &s.git_url),
-            ),
-            req.provider
-                .as_deref()
-                .unwrap_or(&self.worker_defaults.provider),
-            &model_label,
-        )
-        .map_err(ApiError::from)?;
+        let logger = match logger {
+            Some(l) => l,
+            None => smith_core::SessionLogger::new_labelled_in_with_id(
+                &smith_core::sessions_dir().map_err(ApiError::from)?,
+                id,
+                &resolved.repo_label,
+                smith_core::workspace_identity_of(
+                    resolved.source.as_ref().map_or("scratch", |s| &s.git_url),
+                ),
+                req.provider
+                    .as_deref()
+                    .unwrap_or(&self.worker_defaults.provider),
+                &model_label,
+            )
+            .map_err(ApiError::from)?,
+        };
 
         let mut mcp_session = smith_mcp::McpSession::connect(&self.factory.mcp_config()).await;
         let mcp_status = mcp_session.status_lines();
@@ -657,7 +719,16 @@ impl Controller {
             .map(|orch| orchestration_tools(orch.clone()))
             .unwrap_or_default();
         let assembled = self
-            .assemble_worker_harness(&req, &id, gate, &worker, &resolved, extra_tools, briefing)
+            .assemble_worker_harness(
+                &req,
+                &id,
+                gate,
+                &worker,
+                &resolved,
+                extra_tools,
+                briefing,
+                None,
+            )
             .await?;
         let system = assembled.agent.system_prompt().await;
         let repo_label = resolved.repo_label.clone();
@@ -728,7 +799,8 @@ impl Controller {
     ) -> Result<String, ApiError> {
         let resolved = self.resolve_source(req);
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let journal = Arc::new(Journal::new());
+        let journal = self.journal_for(&id);
+        self.record_create(&id, req);
         let gate_slot = GateSlot::new();
         // The approval gate itself is built at grant time (the dispatcher
         // rebuilds it from the same slot and journal — no turn can run
@@ -818,7 +890,7 @@ impl Controller {
 
         let gate = self.build_gate(req, handle.gate_slot.clone(), &handle.journal);
         let assembled = self
-            .assemble_worker_harness(req, id, gate, &worker, &resolved, vec![], None)
+            .assemble_worker_harness(req, id, gate, &worker, &resolved, vec![], None, None)
             .await?;
         let system = assembled.agent.system_prompt().await;
         handle.install_agent(assembled.agent);
@@ -1202,10 +1274,274 @@ impl Controller {
             .expect("clearance mutex poisoned")
             .clone()
     }
+
+    /// Re-learn leases from a worker's heartbeat (the add direction of
+    /// reconcile, M16): after a DAEMON restart the board is empty while the
+    /// worker still holds its sandboxes; the first heartbeat re-grants.
+    /// Never overrides a `Lost` — the sweeper's decision stands.
+    pub fn relearn_leases(&self, worker: &str, live_leases: &[String]) {
+        for session_id in live_leases {
+            let Ok(handle) = self.get(session_id) else {
+                continue; // unknown session: nothing to re-learn
+            };
+            match self.fleet.board.lease_of(session_id) {
+                Some(_) => {} // already granted (or lost — sweeper wins)
+                None => {
+                    self.fleet.board.grant(session_id, worker);
+                    self.fleet
+                        .metrics
+                        .leases_active
+                        .fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut labels = handle.labels();
+                        labels.worker = Some(worker.to_string());
+                        labels.lease_state = Some(LeaseState::Granted);
+                    }
+                    handle.journal.publish_core(CoreEvent::Notice {
+                        text: format!(
+                            "[lease re-learned: worker `{worker}` still holds this session]"
+                        ),
+                    });
+                    handle.publish_status();
+                }
+            }
+        }
+    }
+
+    /// Recover hosted sessions from the state dir (M16): rebuild each
+    /// worker-mode session's harness from its `.wire` journal (labels from
+    /// the last status snapshot), its `.create` record and its JSONL
+    /// transcript; re-queue undispached children; re-arm orchestration
+    /// parents from their `.orch` sidecars. Local-mode sessions are skipped
+    /// (dev-mode; their transcripts remain `smith resume`-able). Returns
+    /// the number of sessions recovered.
+    pub async fn recover(self: &Arc<Self>) -> usize {
+        let Some(state_dir) = self.state_dir.clone() else {
+            return 0;
+        };
+        let mut orchestrators: Vec<Arc<Orchestrator>> = Vec::new();
+        let mut recovered = 0usize;
+        let Ok(entries) = std::fs::read_dir(&state_dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "wire") {
+                continue;
+            }
+            let Some(id) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            match self.recover_session(&id, &state_dir).await {
+                Ok(Some(orch)) => {
+                    orchestrators.push(orch);
+                    recovered += 1;
+                }
+                Ok(None) => {
+                    recovered += 1;
+                }
+                Err(e) => tracing::warn!("session {} not recovered: {e:#}", &id[..8.min(id.len())]),
+            }
+        }
+        // Second pass: dispatchers and trackers — only safe once every
+        // session (parents AND children) is back in the table.
+        for orch in &orchestrators {
+            orch.resume_after_daemon_restart(self);
+        }
+        if recovered > 0 {
+            tracing::info!(
+                "recovered {recovered} hosted session(s) from {}",
+                state_dir.display()
+            );
+            self.refresh_fleet_gauges();
+        }
+        recovered
+    }
+
+    /// Rebuild one session from its state-dir records.
+    /// `Ok(Some(orch))` = recovered with an orchestration sidecar (the
+    /// caller re-arms it in the second pass); `Ok(None)` = recovered plain.
+    async fn recover_session(
+        self: &Arc<Self>,
+        id: &str,
+        state_dir: &Path,
+    ) -> anyhow::Result<Option<Arc<Orchestrator>>> {
+        let journal = self.journal_for(id);
+        // Labels come from the last journalled status snapshot.
+        let status = journal
+            .replay(0)
+            .into_iter()
+            .filter_map(|env| match env.event {
+                WireEvent::Status(s) => Some(s),
+                _ => None,
+            })
+            .next_back()
+            .context("no status snapshot in the journal")?;
+        let raw = std::fs::read_to_string(state_dir.join(format!("{id}.create")))
+            .context("no .create record")?;
+        let req: CreateSession = serde_json::from_str(&raw).context("bad .create record")?;
+        anyhow::ensure!(
+            req.worker.is_some() || req.repo.is_some() || self.worker_defaults.executor == "worker",
+            "local-mode session: not recovered (the transcript remains `smith resume`-able)"
+        );
+
+        // Orchestration parent? Rebuild from the sidecar first — the agent
+        // registry needs the planner tools before the first turn.
+        let sidecar = state_dir.join(format!("{id}.orch"));
+        let orchestration = if sidecar.exists() {
+            Orchestrator::recover(
+                &sidecar,
+                id.to_string(),
+                self.orchestrate.clone(),
+                self.factory.clone(),
+                journal.clone(),
+                Arc::downgrade(self),
+            )
+        } else {
+            None
+        };
+        if sidecar.exists() && orchestration.is_none() {
+            tracing::warn!("session {id}: .orch sidecar unreadable; recovering without it");
+        }
+
+        let gate_slot = GateSlot::new();
+        let gate: Arc<dyn ApprovalGate> = self.build_gate(&req, gate_slot.clone(), &journal);
+        let resolved = self.resolve_source(&req);
+        let was_busy = status.busy;
+        let lease = status.lease_state;
+        let worker_label = status.worker.clone();
+
+        let (agent, executor, mcp_status, provider_label, model_label, history) =
+            match (lease, worker_label.as_deref()) {
+                // Undispached child: no transcript, no agent — the
+                // dispatcher re-assembles at grant time.
+                (Some(LeaseState::Queued), _) => (
+                    None,
+                    None,
+                    Vec::new(),
+                    status.provider.clone(),
+                    status.model.clone(),
+                    Vec::new(),
+                ),
+                (Some(lease), Some(worker)) if lease != LeaseState::Queued => {
+                    let jsonl = smith_core::sessions_dir()?.join(format!("{id}.jsonl"));
+                    anyhow::ensure!(jsonl.exists(), "no transcript for this session");
+                    let logger = smith_core::SessionLogger::open_for_append(&jsonl)?;
+                    let briefing = orchestration.as_ref().map(|_| PLANNER_BRIEFING);
+                    let extra_tools = orchestration
+                        .as_ref()
+                        .map(|o| orchestration_tools(o.clone()))
+                        .unwrap_or_default();
+                    // Trust-then-verify: re-grant on the recorded worker
+                    // immediately; the next heartbeat or sweep verifies.
+                    if lease == LeaseState::Granted {
+                        self.fleet.board.grant(id, worker);
+                        self.fleet
+                            .metrics
+                            .leases_active
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    let assembled = self
+                        .assemble_worker_harness(
+                            &req,
+                            id,
+                            gate,
+                            worker,
+                            &resolved,
+                            extra_tools,
+                            briefing,
+                            Some(logger),
+                        )
+                        .await?;
+                    let system = assembled.agent.system_prompt().await;
+                    let (_, mut history) = smith_core::load_history(&jsonl)?;
+                    history.insert(0, Message::system(system));
+                    (
+                        Some(assembled.agent),
+                        Some(assembled.executor),
+                        assembled.mcp_status,
+                        assembled.provider_label,
+                        assembled.model_label,
+                        history,
+                    )
+                }
+                _ => anyhow::bail!("unrecoverable lease state {lease:?}"),
+            };
+
+        let handle = Arc::new(SessionHandle {
+            id: id.to_string(),
+            agent: std::sync::Mutex::new(agent.map(Arc::new)),
+            journal: journal.clone(),
+            gate_slot,
+            metrics: self.metrics.clone(),
+            executor: executor.unwrap_or_else(|| {
+                Arc::new(WorkerExecutor::new(self.fleet.clone(), id.to_string()))
+            }),
+            history: tokio::sync::Mutex::new(history),
+            busy: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+            labels: std::sync::Mutex::new(Labels {
+                provider: provider_label,
+                model: model_label,
+                container: None,
+                mcp_status,
+                workspace: status.workspace.clone(),
+                workspace_id: status.workspace_id.clone(),
+                executor: status.executor,
+                worker: worker_label.clone(),
+                repo: status.repo.clone(),
+                lease_state: lease,
+            }),
+            created_ms: status.created_ms,
+            fleet: Some(self.fleet.clone()),
+            orchestration: orchestration.clone(),
+            _sandbox: None,
+        });
+
+        self.sessions
+            .lock()
+            .expect("session table mutex poisoned")
+            .insert(id.to_string(), handle.clone());
+        handle.journal.publish_core(CoreEvent::Notice {
+            text: format!(
+                "[daemon restarted; session recovered — transcript continued{}]",
+                if was_busy {
+                    " (an in-flight turn was abandoned; work since the last checkpoint is on the branch)"
+                } else {
+ ""
+                }
+            ),
+        });
+        self.metrics
+            .sessions
+            .set("executor=\"worker\"", self.count_worker());
+        handle.publish_status();
+        Ok(orchestration)
+    }
 }
 
 fn non_empty(s: String) -> Option<String> {
     (!s.trim().is_empty()).then_some(s.trim().to_string())
+}
+
+/// Resolve the daemon state dir (default `~/.smith/serve`); `~` expands.
+fn state_dir_for(config: &crate::config::Config) -> PathBuf {
+    match config.serve.state_dir.as_deref() {
+        Some(dir) if !dir.trim().is_empty() => {
+            let trimmed = dir.trim();
+            match trimmed.strip_prefix("~/") {
+                Some(rest) => match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
+                {
+                    Ok(home) => PathBuf::from(home).join(rest),
+                    Err(_) => PathBuf::from(trimmed),
+                },
+                None => PathBuf::from(trimmed),
+            }
+        }
+        _ => smith_core::session::smith_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("serve"),
+    }
 }
 
 /// One agent turn inside the daemon: user echo, event forwarding, busy
