@@ -121,10 +121,11 @@ flowchart LR
   format, hand-rolled (exec duration, queue wait, lease churn, judge
   verdicts, clearance denials).
 - **Repo topology for materialisation.** *Still open — the arc's one
-  genuine leftover.* Self-hosted Forgejo/Gitea vs GitHub; how workers
-  authenticate (deploy keys scoped per workspace vs a forge token broker on
-  the controller). Workers hold repo creds as-is today; nothing in the
-  mesh forced the decision.
+  genuine leftover; leaning self-hosted Forgejo co-located with the cloud
+  daemon behind WireGuard.* How workers authenticate (deploy keys scoped
+  per workspace vs a forge token broker on the controller) is sketched in
+  `docs/CLOUD_DEPLOYMENT.md`. Workers hold repo creds as-is today; nothing
+  in the mesh forced the decision.
 - **Multi-tenancy.** *Left open by design.* Single-org (us) first;
   quotas/auth-zones/per-orchestration cost accounting later.
 
