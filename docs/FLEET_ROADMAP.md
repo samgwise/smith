@@ -1,12 +1,16 @@
 # The fleet arc: decoupled prompting, harness, execution and models
 
-Planning document for smith's next arc. The goal: **separate the machine
-issuing prompts from the compute the agent runs on**, and scale that to
-multi-agent orchestration — so that prompting, harness, execution and the
-model service are decoupled from any single platform architecture.
+*Complete.* The goal — **separate the machine issuing prompts from the
+compute the agent runs on**, and scale that to multi-agent orchestration —
+was delivered in four milestones: M12 remote executor, M13 `smith serve`
+harness daemon, M14 worker mesh, M15 orchestration (see the ladder below
+and `git log`). This document remains as the arc's record: the four
+planes, the principles taken from linguine, and what was settled or left
+open along the way.
 
-Companion documents: `README.md` (usage), `ARCHITECTURE.md` (current
-single-machine design).
+Companion documents: `README.md` (usage, including the orchestration
+quickstart), `docs/ARCHITECTURE.md` (how the system is shaped),
+`docs/ORCHESTRATION.md` (the M15 model, limits and worked example).
 
 ## The four planes
 
@@ -96,30 +100,33 @@ flowchart LR
   branch (`auto_push = false` — humans review by default). One level deep,
   `max_children` as config. See `docs/ORCHESTRATION.md`.
 
-## Open decisions (to settle as the arc proceeds)
+## Decisions: settled and left open (arc record)
 
-- **Controller colocation.** *Partially settled at M13.* The harness runs
+- **Controller colocation.** *Settled in posture at M13.* The harness runs
   wherever `smith serve` runs — by default on the prompting device (loopback,
   fine while models are remote via linguine), with `--bind` + a reverse
   proxy when it moves to its own box. The latency rule of thumb stands: the
   harness wants to be near the execution plane (the loop is chatty), the
-  prompting plane can be anywhere.
-- **Repo topology for materialisation.** Self-hosted Forgejo/Gitea vs GitHub;
-  how workers authenticate (deploy keys scoped per workspace vs a forge token
-  broker on the controller).
-- **Wire protocol.** *Settled at M13, loopback scope.* Hand-rolled HTTP/1.1
-  + REST + SSE, no framework (the egress sidecar's pattern; zero new
-  dependencies). The message shapes are the freeze
-  (`docs/SERVE_PROTOCOL.md`); a WebSocket carrier can transport the same
-  envelopes in M14+ if the mesh needs bidirectional multiplexing. TLS via
-  reverse proxy when the daemon leaves the box — linguine's homelab pattern.
-- **Streaming exec event format.** *M13's harness stream is frozen*
-  (envelope + replay semantics). The worker-mesh exec event format is still
-  open until M14.
-- **Observability.** Prometheus/OpenTelemetry from the first worker
-  (requests, exec duration, queue wait, lease churn, clearance denials) —
-  the same advice linguine's review gave, taken.
-- **Multi-tenancy.** Single-org (us) first; quotas/auth-zones later.
+  prompting plane can be anywhere. Moving the daemon off the box is
+  operational work, not a design change.
+- **Wire protocol.** *Settled at M13; held through M14/M15 additively.*
+  Hand-rolled HTTP/1.1 + REST + SSE, no framework (the egress sidecar's
+  pattern; zero new dependencies). The message shapes are the freeze
+  (`docs/SERVE_PROTOCOL.md`); every later milestone extended it without a
+  version bump. TLS via reverse proxy when the daemon leaves the box —
+  linguine's homelab pattern.
+- **Streaming exec event format.** *Settled at M14* (`ExecEvent`, telemetry
+  only; results travel via correlated op-results).
+- **Observability.** *Settled from the first worker.* Prometheus text
+  format, hand-rolled (exec duration, queue wait, lease churn, judge
+  verdicts, clearance denials).
+- **Repo topology for materialisation.** *Still open — the arc's one
+  genuine leftover.* Self-hosted Forgejo/Gitea vs GitHub; how workers
+  authenticate (deploy keys scoped per workspace vs a forge token broker on
+  the controller). Workers hold repo creds as-is today; nothing in the
+  mesh forced the decision.
+- **Multi-tenancy.** *Left open by design.* Single-org (us) first;
+  quotas/auth-zones/per-orchestration cost accounting later.
 
 ## Risks
 
