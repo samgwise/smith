@@ -47,6 +47,11 @@ smith worker list / smith worker revoke gpu-box
 - **Worker → controller**: POSTs — `heartbeat` (capability + load + live
   leases, every 10s), `op-result` (correlated by exec id), `exec-events`
   (batched streamed output), `checkpoint` (commit + pushed flag).
+- **Worker git auth (M17)**: for controller-hosted repos
+  (`WorkspaceSource.token`), the DISPATCH delivers a per-session,
+  per-repo scoped token — used in memory per git invocation; no
+  long-lived secret on the worker. External forges keep the `token_env`
+  pattern.
 - **Reconnect**: the worker retries with backoff; its next heartbeat's
   `live_leases` **reconciles** the controller's board (worker state wins).
   A worker that misses three heartbeats goes stale; its leases are lost.

@@ -182,6 +182,7 @@ fn harness_controller(
         smith_server::WorkerDefaults::default(),
         smith_server::OrchestrateSection::default(),
         None,
+        None,
     )
 }
 
@@ -604,7 +605,9 @@ async fn clearance_requests_fan_out_and_decisions_are_forwarded() {
     let stub_task = tokio::spawn({
         let decided = Arc::clone(&decided);
         async move {
-            for _ in 0..2 {
+            // The poller's /pending requests recur; accept until the
+            // controller forwards the decision.
+            loop {
                 let (mut stream, _) = stub_listener.accept().await.unwrap();
                 let req = read_request(&mut stream).await.unwrap();
                 if req.path == "/pending" {
@@ -622,7 +625,6 @@ async fn clearance_requests_fan_out_and_decisions_are_forwarded() {
                     return;
                 }
             }
-            panic!("stub sidecar never received a decision");
         }
     });
 
@@ -694,6 +696,9 @@ async fn spawn_fake_worker(
     // worker keeps its sandboxes across a daemon restart and reports them
     // in heartbeats).
     pre_hold: Vec<String>,
+    // Captured `WorkspaceSource`s (the broker e2e asserts the delivered
+    // URL + token).
+    captured: Arc<Mutex<Vec<smith_protocol::WorkspaceSource>>>,
 ) {
     let issue = client.worker_issue(name).await.unwrap();
     let enrol = ServeClient::new("127.0.0.1", port, issue.clone());
@@ -757,9 +762,12 @@ async fn spawn_fake_worker(
                             WorkerCommand::StartSession {
                                 session_id,
                                 exec_id,
-                                ..
+                                source,
                             } => {
                                 holds.lock().unwrap().push(session_id.clone());
+                                if let Some(source) = source {
+                                    captured.lock().unwrap().push(source.clone());
+                                }
                                 (session_id.clone(), exec_id.clone(), OpResult::WriteFile)
                             }
                             WorkerCommand::Exec {
@@ -912,6 +920,7 @@ async fn orchestration_end_to_end_over_the_mesh() {
                 collect_timeout_secs: 30,
             },
             None,
+            None,
         )
     };
     let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
@@ -929,9 +938,9 @@ async fn orchestration_end_to_end_over_the_mesh() {
         merge_results,
         gate_commands.clone(),
         vec![],
+        Arc::new(Mutex::new(vec![])),
     )
     .await;
-
     // The planner: a local session with orchestration opt-in.
     let parent = client
         .create_session_req(&smith_protocol::CreateSession {
@@ -1104,6 +1113,7 @@ async fn spawn_caps_are_enforced_and_finish_releases_queued_children() {
             ..Default::default()
         },
         None,
+        None,
     );
     let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1227,6 +1237,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
                 ..Default::default()
             },
             Some(state.path().to_path_buf()),
+            None,
         )
     };
     let listener1 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
@@ -1244,6 +1255,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
         merge_results_1,
         gate_commands.clone(),
         vec![],
+        Arc::new(Mutex::new(vec![])),
     )
     .await;
 
@@ -1318,6 +1330,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
                 ..Default::default()
             },
             Some(state.path().to_path_buf()),
+            None,
         )
     };
     let listener2 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
@@ -1340,6 +1353,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
         }]))),
         gate_commands.clone(),
         vec![parent.clone(), children[0].clone(), children[1].clone()],
+        Arc::new(Mutex::new(vec![])),
     )
     .await;
 
@@ -1465,6 +1479,7 @@ async fn requeued_children_dispatch_after_restart() {
                 ..Default::default()
             },
             Some(state.path().to_path_buf()),
+            None,
         )
     };
     let listener1 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
@@ -1482,6 +1497,7 @@ async fn requeued_children_dispatch_after_restart() {
         Arc::new(Mutex::new(VecDeque::from(vec![]))),
         Arc::new(Mutex::new(vec![])),
         vec![],
+        Arc::new(Mutex::new(vec![])),
     )
     .await;
 
@@ -1536,6 +1552,7 @@ async fn requeued_children_dispatch_after_restart() {
                 ..Default::default()
             },
             Some(state.path().to_path_buf()),
+            None,
         )
     };
     let listener2 = smith_server::http::bind("127.0.0.1:0").await.unwrap();
@@ -1560,6 +1577,7 @@ async fn requeued_children_dispatch_after_restart() {
         Arc::new(Mutex::new(VecDeque::from(vec![]))),
         Arc::new(Mutex::new(vec![])),
         vec![],
+        Arc::new(Mutex::new(vec![])),
     )
     .await;
     wait_for(
@@ -1591,4 +1609,336 @@ async fn requeued_children_dispatch_after_restart() {
         .unwrap();
     let finding = orch2.collect(&child).await.unwrap();
     assert!(finding.contains("verdict: accept"), "{finding}");
+}
+
+// ---- M17: the forge in the controller -------------------------------
+
+/// Run git against the loopback forge. Git is the protocol oracle: if its
+/// client is happy, the endpoints speak smart HTTP correctly. Async on
+/// purpose: the daemon shares the test's runtime thread — a blocking
+/// spawn here would deadlock the accept loop.
+async fn git(dir: &std::path::Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    let out = tokio::process::Command::new("git")
+        .args(["-c", "credential.helper="]) // no GCM/askpass on a 401
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0") // never hang on a 401
+        .current_dir(dir)
+        .output()
+        .await?;
+    Ok(out)
+}
+
+fn expect_ok(out: std::process::Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+async fn forge_push_to_create_clone_and_scopes() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let controller = harness_controller_with_state(ws.path(), state.path());
+    let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener,
+        controller.clone(),
+        TOKEN.to_string(),
+    ));
+    let forge_url =
+        |repo: &str, token: &str| format!("http://smith:{token}@127.0.0.1:{port}/git/{repo}.git");
+
+    // Seed a local repo with one commit.
+    let origin = ws.path().join("seed");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-b", "main"]).await.unwrap();
+    std::fs::write(origin.join("README.md"), "seed\n").unwrap();
+    git(&origin, &["add", "-A"]).await.unwrap();
+    git(
+        &origin,
+        &[
+            "-c",
+            "user.email=s@x",
+            "-c",
+            "user.name=s",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Push-to-create with the daemon token; the push body is chunked (a
+    // tiny postBuffer forces git's chunked upload path).
+    let url = forge_url("demo", TOKEN);
+    expect_ok(
+        git(
+            &origin,
+            &["-c", "http.postBuffer=1024", "push", &url, "main"],
+        )
+        .await
+        .unwrap(),
+        "push-to-create",
+    );
+    assert!(state.path().join("repos/demo.git").is_dir());
+
+    // Clone elsewhere: the content round-trips.
+    let clone_dir = ws.path().join("clone");
+    expect_ok(
+        git(ws.path(), &["clone", &url, clone_dir.to_str().unwrap()])
+            .await
+            .unwrap(),
+        "clone",
+    );
+    // (Windows autocrlf may check the file out with CRLF — trim.)
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.join("README.md"))
+            .unwrap()
+            .trim_end(),
+        "seed"
+    );
+
+    // A read-only session token: clone ok, push refused.
+    let ro = controller
+        .forge
+        .as_ref()
+        .unwrap()
+        .mint("s1", "demo", true, false)
+        .unwrap();
+    let ro_clone = ws.path().join("ro-clone");
+    expect_ok(
+        git(
+            ws.path(),
+            &["clone", &forge_url("demo", &ro), ro_clone.to_str().unwrap()],
+        )
+        .await
+        .unwrap(),
+        "read-only clone",
+    );
+    std::fs::write(ro_clone.join("hack.txt"), "nope").unwrap();
+    git(&ro_clone, &["add", "-A"]).await.unwrap();
+    git(
+        &ro_clone,
+        &[
+            "-c",
+            "user.email=s@x",
+            "-c",
+            "user.name=s",
+            "commit",
+            "-m",
+            "hack",
+        ],
+    )
+    .await
+    .unwrap();
+    let refused = git(&ro_clone, &["push", &forge_url("demo", &ro), "main"])
+        .await
+        .unwrap();
+    assert!(!refused.status.success(), "read-only token must not push");
+
+    // A token scoped to ANOTHER repo: refused on this one.
+    let other = controller
+        .forge
+        .as_ref()
+        .unwrap()
+        .mint("s2", "other", true, true)
+        .unwrap();
+    let refused = git(&origin, &["push", &forge_url("demo", &other), "main"])
+        .await
+        .unwrap();
+    assert!(!refused.status.success(), "wrong-repo token must not push");
+
+    // And the repo list.
+    let repos: Vec<String> = client_repos(&port).await;
+    assert!(repos.contains(&"demo".to_string()), "{repos:?}");
+}
+
+async fn client_repos(port: &u16) -> Vec<String> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", *port))
+        .await
+        .unwrap();
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    stream
+        .write_all(
+            format!(
+                "GET /v1/repos HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("[]");
+    serde_json::from_str(body).unwrap()
+}
+
+/// A controller with a state dir (the forge is live), no public_url.
+fn harness_controller_with_state(ws: &std::path::Path, state: &std::path::Path) -> Arc<Controller> {
+    let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+    let fleet = Arc::new(smith_server::Fleet::new(
+        ws.join("workers.json"),
+        metrics.clone(),
+    ));
+    Controller::with_parts(
+        Arc::new(FakeFactory {
+            script: vec![],
+            hang: false,
+            judge_script: vec![],
+        }),
+        Duration::from_secs(60),
+        fleet,
+        metrics,
+        smith_server::WorkerDefaults::default(),
+        smith_server::OrchestrateSection::default(),
+        Some(state.to_path_buf()),
+        None,
+    )
+}
+
+/// The broker end to end: a `smith:` repo reference in a spawn resolves to
+/// the controller's forge URL with a minted per-session token — and that
+/// token really pushes (push-to-create) to the hosted repo.
+#[tokio::test]
+async fn smith_repo_scheme_mints_session_tokens() {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let controller = {
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(smith_server::Fleet::new(
+            ws.path().join("workers.json"),
+            metrics.clone(),
+        ));
+        smith_server::Controller::with_parts(
+            Arc::new(FakeFactory {
+                script: vec![],
+                hang: false,
+                judge_script: vec![],
+            }),
+            Duration::from_secs(60),
+            fleet,
+            metrics,
+            smith_server::WorkerDefaults::default(),
+            smith_server::OrchestrateSection::default(),
+            Some(state.path().to_path_buf()),
+            Some(format!("http://127.0.0.1:{port}")),
+        )
+    };
+    tokio::spawn(smith_server::http::accept_loop(
+        listener,
+        controller.clone(),
+        TOKEN.to_string(),
+    ));
+    let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
+    let captured = Arc::new(Mutex::new(vec![]));
+    spawn_fake_worker(
+        &client,
+        port,
+        "fake-1",
+        Arc::new(Mutex::new(VecDeque::from(vec![]))),
+        Arc::new(Mutex::new(vec![])),
+        vec![],
+        captured.clone(),
+    )
+    .await;
+
+    // The planner spawns with a controller-hosted repo reference.
+    let parent = client
+        .create_session_req(&smith_protocol::CreateSession {
+            workspace: ws.path().to_str().unwrap().to_string(),
+            provider: None,
+            model: Some("planner".into()),
+            approval_mode: smith_protocol::ApprovalMode::Auto,
+            worker: None,
+            repo: Some("https://git.example.com/org/repo.git".into()),
+            git_ref: None,
+            orchestrate: true,
+        })
+        .await
+        .unwrap();
+    // Drive the planner's spawn directly (the orchestrator API is what
+    // the tool calls); the dispatcher grants and the worker captures the
+    // delivered source.
+    let orch = controller
+        .get(&parent)
+        .unwrap()
+        .orchestration
+        .clone()
+        .unwrap();
+    orch.spawn(vec![smith_server::orchestrator::SubtaskSpec {
+        title: "demo child".into(),
+        instructions: "do it".into(),
+        repo: Some("smith:demo".into()),
+        git_ref: None,
+    }])
+    .await
+    .unwrap();
+    let captured_watcher = captured.clone();
+    wait_for(
+        async || {
+            captured_watcher
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.token.is_some())
+        },
+        "broker delivered a tokened source",
+    )
+    .await;
+    // The BROKERED source (the parent's own StartSession carries the
+    // external repo and no token).
+    let captured_list = captured_watcher.lock().unwrap().clone();
+    let source = captured_list
+        .iter()
+        .find(|s| s.token.is_some())
+        .expect("a brokered source with a minted token");
+
+    assert_eq!(
+        source.git_url,
+        format!("http://127.0.0.1:{port}/git/demo.git")
+    );
+    let token = source.token.clone().expect("minted token delivered");
+
+    // The token really pushes (push-to-create) to the hosted repo.
+    let seed = ws.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "-b", "main"]).await.unwrap();
+    std::fs::write(seed.join("README.md"), "seed\n").unwrap();
+    git(&seed, &["add", "-A"]).await.unwrap();
+    git(
+        &seed,
+        &[
+            "-c",
+            "user.email=s@x",
+            "-c",
+            "user.name=s",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    )
+    .await
+    .unwrap();
+    expect_ok(
+        git(
+            &seed,
+            &[
+                "push",
+                &format!("http://smith:{token}@127.0.0.1:{port}/git/demo.git"),
+                "main",
+            ],
+        )
+        .await
+        .unwrap(),
+        "session-token push",
+    );
 }

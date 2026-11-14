@@ -177,6 +177,11 @@ pub struct WorkspaceSource {
     /// token itself. Passed to git via env plumbing per invocation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+    /// The token itself, delivered by the controller when the repo is
+    /// hosted by the controller's forge (M17): a short-lived per-session
+    /// token scoped to this repo. Preferred over the `token_env` lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// Whether a hosted session asks its viewers for approvals or auto-allows
@@ -467,8 +472,25 @@ mod tests {
                 git_url: "https://git.example.com/x.git".into(),
                 git_ref: "main".into(),
                 token_env: Some("SMITH_GIT_TOKEN".into()),
+                token: None,
             }),
         };
+        // A delivered forge token rides the source (M17) and survives the
+        // wire.
+        let brokered = WorkerCommand::StartSession {
+            session_id: "abc".into(),
+            exec_id: "ack-2".into(),
+            source: Some(WorkspaceSource {
+                git_url: "https://controller/git/repo.git".into(),
+                git_ref: "main".into(),
+                token_env: None,
+                token: Some("s3cret".into()),
+            }),
+        };
+        let json = serde_json::to_string(&brokered).unwrap();
+        assert!(json.contains(r#""token":"s3cret""#));
+        let back: WorkerCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, brokered);
         let json = serde_json::to_string(&start).unwrap();
         let back: WorkerCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(back, start);

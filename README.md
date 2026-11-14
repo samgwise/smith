@@ -211,6 +211,12 @@ gate_command = "cargo test -q"   # empty = merge-only
 auto_push = false       # humans review the integration branch by default
 ```
 
+The controller also **hosts git itself** (`smith:` repo references in
+spawns; per-session scoped tokens delivered automatically — no forge to
+stand up, no long-lived credentials on workers). See
+[`docs/CLOUD_DEPLOYMENT.md`](docs/CLOUD_DEPLOYMENT.md) and
+[`docs/SERVE_PROTOCOL.md`](docs/SERVE_PROTOCOL.md) (`/git/...`).
+
 See [`docs/ORCHESTRATION.md`](docs/ORCHESTRATION.md) for the model, the
 limits, and a worked example.
 

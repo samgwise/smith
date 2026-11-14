@@ -9,6 +9,7 @@
 pub mod config;
 pub mod controller;
 pub mod factory;
+pub mod forge;
 pub mod gate;
 pub mod http;
 pub mod journal;

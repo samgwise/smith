@@ -155,6 +155,10 @@ pub struct ServeSection {
     /// Daemon state directory (M16): durable journals, session create
     /// records and orchestration sidecars. Sessions survive a restart.
     pub state_dir: Option<String>,
+    /// Advertised base URL (M17): what workers/clients should dial for the
+    /// controller's forge (`smith:<name>` repo references resolve against
+    /// it). Empty = the forge's `smith:` scheme is unavailable.
+    pub public_url: Option<String>,
 }
 
 impl Default for ServeSection {
@@ -162,7 +166,8 @@ impl Default for ServeSection {
         Self {
             bind: format!("127.0.0.1:{DEFAULT_SERVE_PORT}"),
             approval_timeout_secs: 300,
-            state_dir: None, // ~/.smith/serve
+            state_dir: None,  // ~/.smith/serve
+            public_url: None, // e.g. https://smith.example.com
         }
     }
 }
@@ -345,6 +350,7 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              bind = \"127.0.0.1:{DEFAULT_SERVE_PORT}\"\n\
              approval_timeout_secs = 300  # unanswered approvals auto-deny\n\
              # state_dir = \"~/.smith/serve\"  # durable journals + sessions (M16)\n\
+             # public_url = \"https://smith.example.com\"  # the forge's advertised URL (M17)\n\
              \n\
              [worker]\n\
              # fleet execution (smith-worker; see docs/WORKER_MESH.md)\n\

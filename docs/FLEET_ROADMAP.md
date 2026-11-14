@@ -106,6 +106,12 @@ flowchart LR
   — table, labels, history, leases (trust-then-verify: the worker's next
   heartbeat re-learns) and in-flight orchestrations (queued children
   re-dispatch).
+- **M17 — the forge in the controller.** *Done* (deployment thread).
+  Controller-hosted git over the house HTTP (smart-HTTP piping to
+  `--stateless-rpc` subprocesses; chunked request bodies), push-to-create,
+  per-session scoped git tokens minted in-process and delivered via
+  `WorkspaceSource.token` — the token broker as a function; `smith:`
+  repo references in spawns.
 
 ## Decisions: settled and left open (arc record)
 

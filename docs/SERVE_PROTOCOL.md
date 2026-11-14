@@ -173,12 +173,29 @@ Full semantics in `docs/WORKER_MESH.md`; the wire shapes:
 - Fleet admin (daemon token): `POST /v1/workers {name}` → one-time
   `enrolment_token`; `GET /v1/workers` → `[WorkerSummary]`;
   `DELETE /v1/workers/:name` → revoke (leases lost).
+- `GET /v1/repos` (M17, daemon token) — the forge's hosted repo names.
 - `GET /v1/metrics` — Prometheus text format (daemon token; M15 adds
   `smith_judge_total{verdict="accept|rework|unjudged"}`).
 - `POST /v1/sessions` gains optional M14 fields: `approval_mode`
   (`ask`|`auto` — auto for CI issuers), `worker`, `repo`, `git_ref`
   (worker-mode execution; see WORKER_MESH.md) — and the M15 flag
   `orchestrate` (the session becomes a planner; see ORCHESTRATION.md).
+
+## The forge (M17)
+
+The controller hosts git repos itself (`<state_dir>/repos/<name>.git`,
+bare, push-to-create on the first push):
+
+- `GET /git/<repo>/info/refs?service=git-upload-pack|git-receive-pack` —
+  the smart-protocol advertisement (`application/x-git-*-advertisement`).
+- `POST /git/<repo>/git-upload-pack` / `git-receive-pack` — the RPC half;
+  request bodies may be **chunked** (git's push path) up to 256 MiB.
+- Auth: Basic (git's shape — the token is the password) or Bearer; tokens
+  are **per-session, per-repo, read/write-scoped**, minted at dispatch for
+  `smith:<name>` repo references and delivered to the worker in
+  `WorkspaceSource.token`; the daemon token is a full grant. Worker mesh
+  credentials do not authorise git routes. Git itself does the protocol
+  work (`--stateless-rpc` subprocesses); the daemon pipes bytes only.
 
 ## Test anchors
 

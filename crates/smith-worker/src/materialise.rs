@@ -235,7 +235,14 @@ pub fn cache_dir(source: &WorkspaceSource) -> anyhow::Result<PathBuf> {
     Ok(work_dir()?.join(format!("cache-{}", fnv64(&source.git_url))))
 }
 
+/// The token for THIS invocation: a delivered forge token (M17) wins;
+/// otherwise the env var named in the source.
 fn token_of(source: &WorkspaceSource) -> Option<String> {
+    if let Some(t) = &source.token
+        && !t.trim().is_empty()
+    {
+        return Some(t.clone());
+    }
     source
         .token_env
         .as_ref()
@@ -514,6 +521,7 @@ mod tests {
             ),
             git_ref: "main".into(),
             token_env: None,
+            token: None,
         };
 
         // Bare-clone cache + worktree under the work dir.

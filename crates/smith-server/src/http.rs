@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::error::RecvError;
 
 use smith_core::CoreEvent;
 use smith_protocol::http::{
-    read_request, write_json_response, write_sse_end, write_sse_event, write_sse_head,
+    complete_request, head_path, read_head, write_json_response, write_sse_end, write_sse_event,
+    write_sse_head,
 };
 use smith_protocol::{
     ApprovalPost, ClearancePost, CreateSession, PROTOCOL_VERSION, ProviderPost, ResumePost,
@@ -21,6 +23,7 @@ use smith_protocol::{
 };
 
 use crate::controller::{ApiError, Controller};
+use crate::forge::{Forge, run_git_svc};
 
 /// Bind the daemon's listener (split from [`accept_loop`] so tests can bind
 /// port 0 and learn the port).
@@ -54,16 +57,28 @@ async fn handle_conn(
     controller: Arc<Controller>,
     token: String,
 ) -> anyhow::Result<()> {
-    let req = read_request(&mut stream).await?;
+    // Read the head first so the body cap can be picked per path: git
+    // routes carry pack bodies (up to MAX_GIT_BODY_BYTES); everything else
+    // stays at the 1 MiB RPC cap.
+    let (head, leftover) = read_head(&mut stream).await?;
+    let is_git = head_path(&head).is_some_and(|p| p.starts_with("/git/"));
+    let cap = if is_git {
+        smith_protocol::http::MAX_GIT_BODY_BYTES
+    } else {
+        smith_protocol::http::MAX_BODY_BYTES
+    };
+    let req = complete_request(&mut stream, &head, leftover, cap).await?;
     // There are no public endpoints. Worker routes authenticate with the
     // worker credential (enrol carries its body-carried one-time token);
-    // everything else — including the fleet admin routes and metrics —
-    // needs the daemon token.
+    // git routes do their own token auth (Basic for git clients, scoped
+    // per session); everything else — including the fleet admin routes
+    // and metrics — needs the daemon token.
+    let git_route = req.path.starts_with("/git/");
     let worker_route = req.path.starts_with("/v1/worker/");
-    if !worker_route && req.bearer_token() != Some(token.as_str()) {
+    if !worker_route && !git_route && req.bearer_token() != Some(token.as_str()) {
         return write_json_response(&mut stream, 401, "{\"error\":\"unauthorised\"}").await;
     }
-    route(&controller, &req, &mut stream).await
+    route(&controller, &req, &mut stream, &token).await
 }
 
 /// Authenticate a worker credential → worker name, or None (401).
@@ -75,9 +90,24 @@ async fn route(
     controller: &Arc<Controller>,
     req: &smith_protocol::http::Request,
     stream: &mut TcpStream,
+    daemon_token: &str,
 ) -> anyhow::Result<()> {
     let segments: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
     let method = req.method.as_str();
+
+    // ---- the forge (M17): git over the house HTTP ----
+    match (method, segments.as_slice()) {
+        ("GET", ["git", repo, "info", "refs"]) => {
+            return git_service_info(controller, req, stream, repo, daemon_token).await;
+        }
+        ("POST", ["git", repo, "git-upload-pack"]) => {
+            return git_rpc(controller, req, stream, repo, daemon_token, "upload-pack").await;
+        }
+        ("POST", ["git", repo, "git-receive-pack"]) => {
+            return git_rpc(controller, req, stream, repo, daemon_token, "receive-pack").await;
+        }
+        _ => {}
+    }
 
     match (method, segments.as_slice()) {
         ("GET", ["v1", "health"]) => {
@@ -180,6 +210,14 @@ async fn route(
                 .await
             }
         },
+        ("GET", ["v1", "repos"]) => {
+            let repos = controller
+                .forge
+                .as_ref()
+                .map(|f| f.list_repos())
+                .unwrap_or_default();
+            reply(stream, 200, serde_json::to_string(&repos)?).await
+        }
         ("GET", ["v1", "metrics"]) => {
             let text = controller.metrics.render();
             write_plain_text(stream, &text).await
@@ -398,6 +436,214 @@ async fn route(
             None => reply(stream, 401, "{\"error\":\"unauthorised\"}".into()).await,
         },
         _ => not_found(stream).await,
+    }
+}
+
+// ------------------------------------------------- the forge (M17) ----
+
+/// One git request's authorisation: a session token scoped to `repo`, or
+/// the daemon token (full access). `None` → 401.
+fn forge_grant(
+    controller: &Arc<Controller>,
+    req: &smith_protocol::http::Request,
+    repo: &str,
+    daemon_token: &str,
+) -> Option<crate::forge::GitCred> {
+    let token = Forge::token_from_request(req)?;
+    if token == daemon_token {
+        return Some(crate::forge::GitCred {
+            session_id: "daemon".into(),
+            token_hash: String::new(),
+            repo: repo.to_string(),
+            read: true,
+            write: true,
+        });
+    }
+    let grant = controller.forge.as_ref()?.authenticate(&token)?;
+    (grant.repo == repo).then_some(grant)
+}
+
+async fn git_unauthorised(stream: &mut TcpStream) -> anyhow::Result<()> {
+    // The WWW-Authenticate header is what makes git's client send creds.
+    stream
+        .write_all(
+            b"HTTP/1.1 401 Unauthorized\r\n\
+              WWW-Authenticate: Basic realm=\"smith forge\"\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn git_forbidden(stream: &mut TcpStream) -> anyhow::Result<()> {
+    write_json_response(stream, 403, "{\"error\":\"token lacks this scope\"}").await
+}
+
+async fn write_git_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+         Cache-Control: no-cache\r\nContent-Length: {len}\r\n\
+         Connection: close\r\n\r\n",
+        reason = smith_protocol::http::reason(status),
+        len = body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// `GET /git/<repo>/info/refs?service=git-upload-pack|git-receive-pack` —
+/// the smart-protocol advertisement.
+async fn git_service_info(
+    controller: &Arc<Controller>,
+    req: &smith_protocol::http::Request,
+    stream: &mut TcpStream,
+    repo: &str,
+    daemon_token: &str,
+) -> anyhow::Result<()> {
+    // git appends `.git` to clone/push URLs; grants are keyed on the bare
+    // name.
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let grant = forge_grant(controller, req, repo, daemon_token);
+    let Some(grant) = grant else {
+        return git_unauthorised(stream).await;
+    };
+    let service = req.query_param("service").unwrap_or_default();
+    let (svc, needs_write) = match service.as_str() {
+        "git-upload-pack" => ("upload-pack", false),
+        "git-receive-pack" => ("receive-pack", true),
+        other => {
+            return write_json_response(
+                stream,
+                400,
+                &format!("{{\"error\":\"bad service {other:?}\"}}"),
+            )
+            .await;
+        }
+    };
+    if needs_write && !grant.write {
+        return git_forbidden(stream).await;
+    }
+    let Some(forge) = &controller.forge else {
+        return write_json_response(stream, 404, "{\"error\":\"no forge\"}").await;
+    };
+    // Push-to-create fires at the advertisement: git's push sequence starts
+    // here, and the auth already checked out.
+    let repo_path = if needs_write {
+        match forge.ensure_repo(repo).await {
+            Ok(p) => p,
+            Err(e) => {
+                return write_json_response(
+                    stream,
+                    400,
+                    &format!("{{\"error\":\"{}\"}}", e).replace('"', "'"),
+                )
+                .await;
+            }
+        }
+    } else {
+        match forge.repo_path(repo) {
+            Some(p) if p.exists() => p,
+            _ => {
+                return write_json_response(stream, 404, "{\"error\":\"no such repo\"}").await;
+            }
+        }
+    };
+    let advertisement = match run_git_svc(&repo_path, svc, true, vec![]).await {
+        Ok(b) => b,
+        Err(e) => {
+            return write_json_response(
+                stream,
+                500,
+                &format!("{{\"error\":\"{}\"}}", e).replace('"', "'"),
+            )
+            .await;
+        }
+    };
+    // The smart-HTTP advertisement leads with the service announcement
+    // pkt-line + flush; `git --advertise-refs` alone prints only the refs.
+    let mut body = pkt_line(&format!("# service=git-{svc}\n"));
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&advertisement);
+    write_git_response(
+        stream,
+        200,
+        &format!("application/x-git-{svc}-advertisement"),
+        &body,
+    )
+    .await
+}
+
+/// One pkt-line: 4-hex length (including itself) + payload.
+fn pkt_line(data: &str) -> Vec<u8> {
+    let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+    out.extend_from_slice(data.as_bytes());
+    out
+}
+
+/// `POST /git/<repo>/git-upload-pack` / `git-receive-pack` — the RPC half
+/// of the smart protocol: request body → the subprocess's stdin, its
+/// stdout → the response.
+async fn git_rpc(
+    controller: &Arc<Controller>,
+    req: &smith_protocol::http::Request,
+    stream: &mut TcpStream,
+    repo: &str,
+    daemon_token: &str,
+    svc: &str,
+) -> anyhow::Result<()> {
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let grant = forge_grant(controller, req, repo, daemon_token);
+    let Some(grant) = grant else {
+        return git_unauthorised(stream).await;
+    };
+    let needs_write = svc == "receive-pack";
+    if needs_write && !grant.write {
+        return git_forbidden(stream).await;
+    }
+    if !needs_write && !grant.read {
+        return git_forbidden(stream).await;
+    }
+    let Some(forge) = &controller.forge else {
+        return write_json_response(stream, 404, "{\"error\":\"no forge\"}").await;
+    };
+    let repo_path = if needs_write {
+        forge.ensure_repo(repo).await?
+    } else {
+        match forge.repo_path(repo) {
+            Some(p) if p.exists() => p,
+            _ => {
+                return write_json_response(stream, 404, "{\"error\":\"no such repo\"}").await;
+            }
+        }
+    };
+    match run_git_svc(&repo_path, svc, false, req.body.clone()).await {
+        Ok(body) => {
+            write_git_response(
+                stream,
+                200,
+                &format!("application/x-git-{svc}-result"),
+                &body,
+            )
+            .await
+        }
+        Err(e) => {
+            // A failed receive-pack (non-fast-forward etc.) — surface the
+            // protocol-level failure to the client.
+            write_json_response(
+                stream,
+                500,
+                &format!("{{\"error\":\"{}\"}}", e).replace('"', "'"),
+            )
+            .await
+        }
     }
 }
 

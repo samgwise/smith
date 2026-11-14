@@ -113,6 +113,14 @@ stream tells the whole story as `orchestration` events (`spawned`,
 `started`, `judged`, `merged`, `failed`, `released`), and its status lists
 the children with their states.
 
+## Repo references
+
+`spawn_subtasks`' `repo` accepts any git URL — and, from M17, the
+controller's own forge: `repo: "smith:<name>"` resolves against
+`[serve].public_url` and the child receives a per-session scoped token
+automatically (the token broker). The planner never handles forge
+credentials.
+
 ## Wire additions (additive; see SERVE_PROTOCOL.md)
 
 - `WireEvent::Orchestration {parent, child, kind, detail}` — journalled on

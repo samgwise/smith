@@ -15,6 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Requests larger than this are refused (prompts and config are small).
 pub const MAX_BODY_BYTES: usize = 1 << 20;
+/// Cap for git-route bodies (pack files can be large; still bounded).
+pub const MAX_GIT_BODY_BYTES: usize = 1 << 28; // 256 MiB
 
 /// Budget for reading a request head (and body) before giving up.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -89,9 +91,43 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 /// Read one request: head plus a `Content-Length` body. One request per
 /// connection — callers reply and close.
 pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<Request> {
-    let (head, mut leftover) = tokio::time::timeout(READ_TIMEOUT, read_head(stream))
+    read_request_capped(stream, MAX_BODY_BYTES).await
+}
+
+/// [`read_request`] with an explicit body cap (git routes accept packs —
+/// the 1 MiB RPC cap would refuse them).
+pub async fn read_request_capped<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_body: usize,
+) -> anyhow::Result<Request> {
+    let (head, leftover) = tokio::time::timeout(READ_TIMEOUT, read_head(stream))
         .await
         .context("timed out waiting for a request")??;
+    complete_request(stream, &head, leftover, max_body).await
+}
+
+/// The request target (second token of the request line, query stripped)
+/// — lets a server pick the body cap before reading the body.
+pub fn head_path(head: &str) -> Option<String> {
+    let line = head.lines().next()?;
+    let target = line.split_whitespace().nth(1)?;
+    Some(
+        target
+            .split_once('?')
+            .map_or(target, |(p, _)| p)
+            .to_string(),
+    )
+}
+
+/// Finish a request whose head is already read: parse it and read the
+/// body (per its framing) under the cap.
+pub async fn complete_request<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    head: &str,
+    leftover: Vec<u8>,
+    max_body: usize,
+) -> anyhow::Result<Request> {
+    let mut leftover = leftover;
 
     let mut lines = head.lines();
     let request_line = lines.next().context("empty request")?.to_string();
@@ -116,28 +152,38 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Resul
             .map(|(_, v)| v.clone())
     };
 
-    let content_length: usize = header("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    anyhow::ensure!(
-        content_length <= MAX_BODY_BYTES,
-        "request body exceeds the size cap"
-    );
+    // Git's HTTP client pushes pack data as chunked bodies (the size
+    // isn't known up front); the RPC paths use Content-Length.
+    let chunked = header("transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
+    let body = if chunked {
+        read_chunked_body(stream, &mut leftover, max_body).await?
+    } else {
+        let content_length: usize = header("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        anyhow::ensure!(
+            content_length <= max_body,
+            "request body exceeds the size cap"
+        );
 
-    let mut body = std::mem::take(&mut leftover);
-    body.truncate(content_length);
-    while body.len() < content_length {
-        let mut chunk = [0u8; 8192];
-        let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
-            .await
-            .context("timed out reading the request body")??;
-        if n == 0 {
-            bail!("connection closed mid-body");
+        let mut body = std::mem::take(&mut leftover);
+        body.truncate(content_length);
+        while body.len() < content_length {
+            let mut chunk = [0u8; 8192];
+            let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .context("timed out reading the request body")??;
+            if n == 0 {
+                bail!("connection closed mid-body");
+            }
+            let take = n.min(content_length - body.len());
+            body.extend_from_slice(&chunk[..take]);
         }
-        let take = n.min(content_length - body.len());
-        body.extend_from_slice(&chunk[..take]);
-    }
-    body.truncate(content_length);
+        body.truncate(content_length);
+        body
+    };
 
     Ok(Request {
         method,
@@ -146,6 +192,105 @@ pub async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Resul
         headers,
         body,
     })
+}
+
+/// Decode a chunked request body (`Transfer-Encoding: chunked`) into its
+/// bytes, bounded by `max`. Bytes already read past the head (`leftover`)
+/// are consumed first. Consumes the trailing empty line (plus any
+/// trailers, which smith ignores).
+async fn read_chunked_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    leftover: &mut Vec<u8>,
+    max: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line = read_limited_line(stream, leftover, 8192).await?;
+        let size_str = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| anyhow::anyhow!("bad chunk size `{size_str}`"))?;
+        if size == 0 {
+            // Terminal chunk: consume trailers up to the blank line.
+            loop {
+                let trailer = read_limited_line(stream, leftover, 8192).await?;
+                if trailer.is_empty() {
+                    return Ok(body);
+                }
+            }
+        }
+        anyhow::ensure!(
+            body.len() + size <= max,
+            "chunked body exceeds the size cap"
+        );
+        let mut chunk = vec![0u8; size + 2]; // data + CRLF
+        read_full(stream, leftover, &mut chunk).await?;
+        if &chunk[size..] != b"\r\n" {
+            bail!("bad chunk framing");
+        }
+        body.extend_from_slice(&chunk[..size]);
+    }
+}
+
+/// Read one CRLF-terminated line (bounded; leftover bytes consumed first);
+/// the terminators are stripped.
+async fn read_limited_line<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    leftover: &mut Vec<u8>,
+    cap: usize,
+) -> anyhow::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        // Serve from the leftover buffer before touching the stream.
+        if let Some(pos) = leftover.iter().position(|b| *b == b'\n') {
+            line.extend(leftover.drain(..=pos));
+        } else {
+            let mut chunk = [0u8; 8192];
+            let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .context("timed out reading a chunked line")??;
+            if n == 0 {
+                bail!("connection closed mid-chunk");
+            }
+            leftover.extend_from_slice(&chunk[..n]);
+            continue;
+        }
+        let line_end = line
+            .iter()
+            .position(|b| *b == b'\n')
+            .expect("drain stopped at the newline");
+        anyhow::ensure!(
+            line[..line_end].last() == Some(&b'\r'),
+            "bad chunked line ending"
+        );
+        let text: String = String::from_utf8_lossy(&line[..line_end - 1]).into_owned();
+        anyhow::ensure!(text.len() <= cap, "chunked line exceeds the cap");
+        return Ok(text);
+    }
+}
+
+/// Read exactly `buf.len()` bytes (leftover bytes consumed first).
+async fn read_full<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    leftover: &mut Vec<u8>,
+    buf: &mut [u8],
+) -> anyhow::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        if !leftover.is_empty() {
+            let take = leftover.len().min(buf.len() - filled);
+            buf[filled..filled + take].copy_from_slice(&leftover.drain(..take).collect::<Vec<_>>());
+            filled += take;
+            continue;
+        }
+        let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut buf[filled..]))
+            .await
+            .context("timed out reading a chunk")??;
+        if n == 0 {
+            bail!("connection closed mid-chunk");
+        }
+        filled += n;
+    }
+    Ok(())
 }
 
 /// A `text/plain` body (metrics), same one-request-per-connection framing.
@@ -164,7 +309,7 @@ pub async fn write_plain_text<S: AsyncWrite + Unpin>(
 }
 
 /// Reason phrase for the statuses smith replies with.
-fn reason(status: u16) -> &'static str {
+pub fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         202 => "Accepted",
@@ -533,5 +678,55 @@ mod tests {
         drop(server);
         let result = read_head(&mut client).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn chunked_request_bodies_decode() {
+        // Git pushes pack data as chunked request bodies; decode them
+        // byte-exact (multi-chunk, chunk extensions, trailers).
+        let mut framed = b"POST /git/repo.git/git-receive-pack HTTP/1.1\r\n\
+               Host: localhost\r\n\
+               Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        framed.extend_from_slice(b"a\r\n0123456789\r\n");
+        framed.extend_from_slice(b"3;ext=1\r\nabc\r\n");
+        framed.extend_from_slice(b"0\r\n\r\n");
+        let mut stream = Cursor::new(framed);
+
+        let req = read_request_capped(&mut stream, MAX_GIT_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(req.path, "/git/repo.git/git-receive-pack");
+        assert_eq!(req.body, b"0123456789abc");
+    }
+
+    #[tokio::test]
+    async fn chunked_request_bodies_respect_the_cap() {
+        let mut framed = b"POST /git/r/git-receive-pack HTTP/1.1\r\n\
+                            Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        framed.extend_from_slice(b"10\r\n0123456789abcdef\r\n0\r\n\r\n");
+        let mut stream = Cursor::new(framed);
+        // A 16-byte body against a 10-byte cap → refused.
+        assert!(
+            read_request_capped(&mut stream, 10)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("size cap")
+        );
+    }
+
+    #[test]
+    fn head_path_extracts_the_target_for_cap_selection() {
+        assert_eq!(
+            head_path("POST /git/r.git/git-receive-pack HTTP/1.1\r\nHost: x").as_deref(),
+            Some("/git/r.git/git-receive-pack")
+        );
+        assert_eq!(
+            head_path("GET /git/r.git/info/refs?service=git-upload-pack HTTP/1.1").as_deref(),
+            Some("/git/r.git/info/refs")
+        );
+        assert_eq!(head_path("garbage"), None);
     }
 }

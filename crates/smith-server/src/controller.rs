@@ -22,6 +22,7 @@ use smith_protocol::{
 
 use crate::config::OrchestrateSection;
 use crate::factory::{ConfigFactory, SessionFactory};
+use crate::forge::Forge;
 use crate::gate::{GateSlot, WireGate};
 use crate::journal::Journal;
 use crate::orchestrator::{Orchestrator, PLANNER_BRIEFING, orchestration_tools};
@@ -256,6 +257,10 @@ pub struct Controller {
     /// Daemon state dir (M16): durable journals, `.create` session records
     /// and orchestration sidecars. None = in-memory only (tests).
     pub(crate) state_dir: Option<PathBuf>,
+    /// The controller's forge (M17) — hosted repos + session git tokens.
+    pub forge: Option<Arc<Forge>>,
+    /// Advertised base URL for `smith:` repo references.
+    pub(crate) public_url: Option<String>,
     pub(crate) metrics: Arc<smith_protocol::metrics::Metrics>,
 }
 
@@ -281,6 +286,13 @@ impl Controller {
             model: config.model.clone(),
         };
         let state_dir = state_dir_for(config);
+        let public_url = config
+            .serve
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         Self::with_parts(
             Arc::new(ConfigFactory {
                 config: config.clone(),
@@ -291,6 +303,7 @@ impl Controller {
             defaults,
             config.orchestrate.clone(),
             Some(state_dir),
+            public_url,
         )
     }
 
@@ -306,12 +319,14 @@ impl Controller {
         worker_defaults: WorkerDefaults,
         orchestrate: OrchestrateSection,
         state_dir: Option<PathBuf>,
+        public_url: Option<String>,
     ) -> Arc<Self> {
         if let Some(dir) = &state_dir
             && let Err(e) = std::fs::create_dir_all(dir)
         {
             tracing::warn!("cannot create state dir {}: {e:#}", dir.display());
         }
+        let forge = state_dir.as_ref().map(|dir| Arc::new(Forge::new(dir)));
         Arc::new(Self {
             sessions: std::sync::Mutex::new(HashMap::new()),
             factory,
@@ -324,8 +339,50 @@ impl Controller {
             worker_defaults,
             orchestrate,
             state_dir,
+            forge,
+            public_url,
             metrics,
         })
+    }
+
+    /// Resolve the workspace source for a session, minting a scoped forge
+    /// token when the repo is controller-hosted (`smith:<name>`). `mint =
+    /// false` (queued-child creation) resolves labels only — the token is
+    /// minted once, at grant time.
+    fn prepare_source(
+        &self,
+        req: &CreateSession,
+        session_id: &str,
+        mint: bool,
+    ) -> Result<ResolvedSource, ApiError> {
+        let mut resolved = self.resolve_source(req);
+        if let Some(source) = &mut resolved.source
+            && let Some(name) = source.git_url.strip_prefix("smith:").map(str::to_string)
+        {
+            let base = self
+                .public_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "repo `{name}` is controller-hosted but [serve].public_url is not configured"
+                    ))
+                })?;
+            source.git_url = format!("{}/git/{name}.git", base.trim_end_matches('/'));
+            if mint {
+                let forge = self
+                    .forge
+                    .as_ref()
+                    .ok_or_else(|| ApiError::unavailable("no forge (no state dir)"))?;
+                source.token = Some(
+                    forge
+                        .mint(session_id, &name, true, true)
+                        .map_err(ApiError::from)?,
+                );
+            }
+            resolved.repo_label = name;
+        }
+        Ok(resolved)
     }
 
     /// The durable journal for a session id (loaded from the state dir when
@@ -526,6 +583,7 @@ impl Controller {
             git_url,
             git_ref,
             token_env: Some(self.worker_defaults.git_token_env.clone()),
+            token: None,
         });
         let repo_label = source
             .as_ref()
@@ -701,7 +759,7 @@ impl Controller {
         gate: Arc<dyn ApprovalGate>,
         orchestration: Option<Arc<Orchestrator>>,
     ) -> Result<String, ApiError> {
-        let resolved = self.resolve_source(&req);
+        let resolved = self.prepare_source(&req, &id, true)?;
         let worker = self.wait_for_worker(&req).await?;
         self.dispatch_start(&worker, &id, resolved.source.clone())
             .await?;
@@ -797,7 +855,7 @@ impl Controller {
         req: &CreateSession,
         title: &str,
     ) -> Result<String, ApiError> {
-        let resolved = self.resolve_source(req);
+        let resolved = self.prepare_source(req, "", false)?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let journal = self.journal_for(&id);
         self.record_create(&id, req);
@@ -877,7 +935,7 @@ impl Controller {
             return Ok(false);
         };
         let handle = self.get(id)?;
-        let resolved = self.resolve_source(req);
+        let resolved = self.prepare_source(req, id, true)?;
         self.dispatch_start(&worker, id, resolved.source.clone())
             .await?;
 
@@ -1319,6 +1377,14 @@ impl Controller {
         let Some(state_dir) = self.state_dir.clone() else {
             return 0;
         };
+        // Forge tokens first: recovered sessions' delivered tokens stay
+        // valid across the restart.
+        if let Some(forge) = &self.forge {
+            let n = forge.recover();
+            if n > 0 {
+                tracing::info!("forge: {n} session token grant(s) recovered");
+            }
+        }
         let mut orchestrators: Vec<Arc<Orchestrator>> = Vec::new();
         let mut recovered = 0usize;
         let Ok(entries) = std::fs::read_dir(&state_dir) else {
