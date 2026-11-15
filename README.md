@@ -24,17 +24,23 @@ code only ever runs in the container, never on your host.
 1. Provider keys stay host-side and are never injected into the container.
 2. Shell commands run only via `podman exec` inside the session container
    (non-root user, memory/CPU/pids limits, wall-clock timeout).
-3. File tools are locked to the canonicalised workspace directory.
-4. Smith refuses to mount your home directory or sensitive paths
-   (`~/.ssh`, `~/.aws`, …).
+3. File tools are locked to the canonicalised workspace directory — any
+   symlinked path component is refused, so a link can't fling a write
+   outside the workspace.
+4. Smith refuses to mount your home directory, any ancestor of it (so
+   `C:\Users` and `/home` are out), and sensitive paths (`~/.ssh`, `~/.aws`, …).
 5. Every tool call is logged to the session JSONL file.
 
 In the TUI, shell commands ask first: `y` once, `a` for the session,
-`n` to refuse. Risky commands (`git push`, `git reset`, `rm`, `curl`, `wget`,
-`sudo`, `dd`, `chmod 777`) always re-prompt — "a" binds to the exact command,
-never the prefix. Headless `smith run` auto-approves (the sandbox is the
-boundary), and repeated denials escalate: after three, the agent is told to
-stop retrying and wait.
+`n` to refuse. Risky commands (`git push`, `git reset`, `git clean`, `rm`,
+`curl`, `wget`, `sudo`, `dd`, `chmod 777`) always re-prompt — "a" binds to
+the exact command, never the prefix, and compound commands (`&&`, `||`, `;`,
+`|`, `$()`, backticks) are checked segment by segment: approving one half of
+a compound never covers the other. Writes into the workspace are approval-free
+except to files whose contents execute on the host (`.git/hooks/*`,
+`.git/config`, `.gitattributes`, `.envrc`) — those always prompt. Headless
+`smith run` auto-approves (the sandbox is the boundary), and repeated denials
+escalate: after three, the agent is told to stop retrying and wait.
 
 ## Egress control
 
@@ -52,12 +58,17 @@ stop retrying and wait.
 In `proxy` mode the allowlist is **enforced**, not just cooperative: an
 nftables default-deny ruleset is installed inside the podman machine
 (forward hook scoped to the egress bridge only — the machine's own networking
-is untouched). Only the proxy's pinned IP and the network gateway (DNS) may
-leave the bridge, so a program that ignores the proxy env and dials IP
-literals is dropped at the packet level. Installation is fail-closed: if the
-ruleset cannot be installed, the session refuses to start (escape hatch:
-`egress_enforce = false`). Machine reboots clear the rules; the next session
-reinstalls them. `smith clean` removes the sidecar and the table.
+is untouched). Forwarded traffic — a program dialling an external IP — only
+leaves via the proxy's pinned IP or the gateway's DNS, so a program that
+ignores the proxy env and dials IP literals is dropped at the packet level.
+Two residual channels remain (known limits, see `docs/SECURITY_REVIEW.md`
+S-08): traffic addressed to the bridge gateway itself is locally destined and
+not filtered, and DNS through the gateway can carry a little data. The rules
+cover the common case; they are not a hermetic seal. Installation is
+fail-closed: if the ruleset cannot be installed, the session refuses to
+start (escape hatch: `egress_enforce = false`). Machine reboots clear the
+rules; the next session reinstalls them. `smith clean` removes the sidecar
+and the table.
 
 ### Per-destination clearance
 
@@ -208,7 +219,10 @@ git worktree. A tool-less **judge** reviews every sub-agent's report before
 the planner sees it (bounded rework rounds), and worker-side **merge gates**
 converge the checkpoint branches onto a reviewable integration branch
 (`smith/integration/<session>`) — conflicts come back to the planner for
-rework; nothing is pushed without opting in.
+rework. What gets pushed without asking: each passing gate pushes the
+integration branch itself to the origin (that's how the convergence is
+reviewable); `auto_push = true` additionally lets it update your base refs
+(e.g. `main`), which is the only thing that's opt-in.
 
 ```sh
 smith serve                                   # the controller
@@ -240,23 +254,36 @@ smith connects to stdio MCP servers and exposes their tools to the agent as
 
 ```toml
 [mcp.servers.github]
-command = "npx"
+command = "npx"                              # resolved via PATH (PATHEXT-aware
+                                             # on Windows, so npx.cmd works)
 args = ["-y", "@modelcontextprotocol/server-github"]
 env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }   # expanded from your environment
 approval = "ask"                             # or "allow" to pre-approve all
                                              # tools from this server
-timeout_secs = 60
+timeout_secs = 60                            # per tool call
+connect_timeout_secs = 30                    # per connect step (spawn/handshake/list)
 ```
 
 Project-scoped servers go in `.smith/mcp.toml` at the workspace root (same
 shape, `[servers.<name>]`, wins over user config on name collisions).
+
+**Workspace trust**: a project's `.smith/mcp.toml` runs HOST commands, so it
+only loads when the workspace is trusted. The TUI asks once at session start
+(showing the server names and commands) and remembers the answer;
+`smith run --trust-workspace` grants headlessly; `smith trust <workspace>`
+records it for daemon-hosted sessions (`smith serve` never prompts — it
+consults `~/.smith/trust.json` only; `smith trust --revoke` withdraws).
+Even for a trusted workspace, the project layer's `approval` and `env` are
+ignored — a repo cannot pre-approve its own tools or read your environment
+variables; only its server commands and args are honoured.
 
 Security notes: servers run **host-side** with only the explicitly configured
 environment (plus PATH) — never your full environment — so the sandbox is not
 a boundary for them; that is why `approval = "ask"` is the default and routes
 every call through the same modal as shell commands. Servers are connected at
 session start and their tool list is fixed for the session (prompt-cache
-friendly); a server that fails to start is reported by `/mcp` and skipped.
+friendly); a server that fails to start (including a hung handshake, which
+fails after `connect_timeout_secs`) is reported by `/mcp` and skipped.
 
 ## Verify gate (headless)
 
@@ -284,7 +311,9 @@ smith conformance --network proxy   # exercise the egress stack explicitly
 ```
 
 Exit code is 0 unless a check fails (warnings do not fail). Deep checks use a
-throwaway temp workspace — your project directory is never touched.
+throwaway temp workspace — your project directory is never touched — and the
+MCP handshake check only starts servers from your own `~/.smith/config.toml`:
+it never runs a project's `.smith/mcp.toml`.
 
 ## Requirements
 

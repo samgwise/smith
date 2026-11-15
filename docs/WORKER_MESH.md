@@ -54,7 +54,11 @@ smith worker list / smith worker revoke gpu-box
   (`WorkspaceSource.token`), the DISPATCH delivers a per-session,
   per-repo scoped token — used in memory per git invocation; no
   long-lived secret on the worker. External forges keep the `token_env`
-  pattern.
+  pattern. The token is bound to an origin (`credential_origin`) and the
+  worker's credential helper is `credential.<origin>.helper` — git offers
+  the token only to that origin, never to another host that answers 401
+  (S-02); the helper reads the token from `SMITH_CRED_PASSWORD`, so it is
+  never spliced into a shell snippet (S-32).
 - **Reconnect**: the worker retries with backoff; its next heartbeat's
   `live_leases` **reconciles** the controller's board (worker state wins).
   A worker that misses three heartbeats goes stale; its leases are lost.
@@ -91,12 +95,14 @@ semantics. Shapes are pinned by tests in `smith-protocol`; append to
 A worker is cattle. Per session: bare-clone cache per repo URL
 (`~/.smith-worker/work/cache-<hash>`) → `git worktree add` (detached) at
 `ws-<session>` → bind-mounted as `/workspace`. Git tokens come from the env
-var named in the source (`git_token_env`, default `SMITH_GIT_TOKEN`) and
-reach git **only via a per-invocation credential-helper env** — never in
-process arguments, never on disk. At each turn end the controller sends
-`checkpoint`: the worker commits everything on
-`smith/<session-id>` and pushes best-effort. Losing a worker loses nothing
-but the lease.
+var named in the source (`git_token_env`, default `SMITH_GIT_TOKEN`) or the
+delivered forge token, and reach git **only via the per-invocation,
+origin-scoped credential-helper env** (see the auth note above) — never in
+process arguments, never on disk. Git refs are validated at the entry points
+(no leading dash, no whitespace) and user-supplied URLs/refs ride behind
+`--` (S-29). At each turn end the controller sends `checkpoint`: the worker
+commits everything on `smith/<session-id>` and pushes best-effort. Losing a
+worker loses nothing but the lease.
 
 ## Observability
 

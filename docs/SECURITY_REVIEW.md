@@ -1,6 +1,6 @@
 # Security review tracker
 
-Reviewed on 14 November 2026 against `main`. This was a static review, so nothing has been executed. Items marked **to verify** need a reproduction or test before they count as confirmed.
+Reviewed on 14 November 2026 against `main`. This was a static review, so nothing has been executed. Items marked **to verify** need a reproduction or test before they count as confirmed. Security round 2 (batches 1–6) closed the remaining fixable items test-first; S-08, S-12, S-22, S-23, S-28, S-30 and S-14 part 2 stay open by design (see the round-2 plan).
 
 How to use this file:
 - Tick `[x]` when the fix is merged and a test covers it. Add the PR or commit after the item.
@@ -226,11 +226,11 @@ Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
 
 ## Documentation to correct
 
-- [ ] **D-01 · Home and sensitive path refusal is overstated** (see S-17). `README.md:28-29`
+- [x] **D-01 · Home and sensitive path refusal is overstated** (see S-17; the README now states what is actually refused — home, its ancestors, sensitive components — security round 2 batch 6). `README.md:28-33`
 - [x] **D-02 · TLS verification is described but not built** (see S-05; built and documented in WORKER_MESH.md at the Phase 6 cutover).
-- [ ] **D-03 · "Only the proxy and gateway DNS may leave the bridge"** (see S-08). `README.md:52-59`
-- [ ] **D-04 · Risky commands always re-prompt; "always" binds to the exact command** (see S-11). `README.md:32-37`
-- [ ] **D-05 · "Nothing is pushed without opting in"**. The merge gate pushes `smith/integration/<parent>` on every pass (`crates/smith-worker/src/main.rs:527-569`), which `docs/WORKER_MESH.md:72-74` describes. `README.md:196-198`
-- [x] **D-06 · Deep checks "never touch your project directory"** (see S-01; fixed in security round 2 batch 5 — doctor no longer spawns or calls workspace MCP servers). `README.md:273-274`
-- [x] **D-07 · `command = "npx"` example** (see S-26; fixed in security round 2 batch 5 — the example resolves on Windows too). `README.md:228-236`
-- [ ] **D-08 · File tools are locked to the canonicalised workspace** (see S-07). `README.md:27`
+- [x] **D-03 · "Only the proxy and gateway DNS may leave the bridge"** (see S-08, still open; the README now documents the residual gateway-side channels instead of overclaiming — security round 2 batch 6). `README.md:58-71`
+- [x] **D-04 · Risky commands always re-prompt; "always" binds to the exact command** (see S-11, fixed in batch 1; the README documents the segment-by-segment compound checks — security round 2 batch 6). `README.md:34-43`
+- [x] **D-05 · "Nothing is pushed without opting in"** (the README now states that each passing gate pushes the integration branch, and `auto_push` only opts in base-ref updates — security round 2 batch 6). `README.md:216-222`
+- [x] **D-06 · Deep checks "never touch your project directory"** (see S-01; fixed in security round 2 batch 5 — doctor no longer spawns or calls workspace MCP servers; batch 6 documents it). `README.md:314-316`
+- [x] **D-07 · `command = "npx"` example** (see S-26; fixed in security round 2 batch 5 — the example resolves on Windows too, documented batch 6). `README.md:256-265`
+- [x] **D-08 · File tools are locked to the canonicalised workspace** (see S-07, fixed in batch 2; the README documents the symlink refusal — security round 2 batch 6). `README.md:27-29`
