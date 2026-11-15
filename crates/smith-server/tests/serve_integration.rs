@@ -1942,3 +1942,230 @@ async fn smith_repo_scheme_mints_session_tokens() {
         "session-token push",
     );
 }
+
+// ---- Phase 0 red tests (HTTP migration) --------------------------------
+//
+// These pin the gaps tracked in docs/SECURITY_REVIEW.md (C-01, S-03, S-04,
+// C-02) and FAIL against the hand-rolled HTTP layer. They are #[ignore]d so
+// the default suite stays green until the migration phases land; run them
+// with:
+//   cargo test -p smith-server --test serve_integration -- --ignored
+// Each goes green in the phase noted in its ignore reason; remove the
+// attribute then.
+
+use smith_protocol::http::raw_request;
+
+/// A controller with a live forge, plus the port it is serving on.
+async fn forge_harness() -> (Arc<Controller>, u16, tempfile::TempDir, tempfile::TempDir) {
+    let ws = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let controller = harness_controller_with_state(ws.path(), state.path());
+    let listener = smith_server::http::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        listener,
+        controller.clone(),
+        TOKEN.to_string(),
+    ));
+    (controller, port, ws, state)
+}
+
+/// Seed a one-commit repo and push-to-create it on the forge (a tiny
+/// postBuffer forces git's chunked upload path, as in the forge test).
+async fn seed_and_push(origin: &std::path::Path, url: &str) -> String {
+    std::fs::create_dir_all(origin).unwrap();
+    git(origin, &["init", "-b", "main"]).await.unwrap();
+    std::fs::write(origin.join("README.md"), "seed\n").unwrap();
+    git(origin, &["add", "-A"]).await.unwrap();
+    git(
+        origin,
+        &["-c", "user.email=s@x", "-c", "user.name=s", "commit", "-m", "seed"],
+    )
+    .await
+    .unwrap();
+    expect_ok(
+        git(origin, &["-c", "http.postBuffer=1024", "push", url, "main"])
+            .await
+            .unwrap(),
+        "push-to-create",
+    );
+    String::from_utf8_lossy(&git(origin, &["rev-parse", "HEAD"]).await.unwrap().stdout)
+        .trim()
+        .to_string()
+}
+
+/// RED (C-01, green in Phase 2): a 2 MiB worker op-result must be accepted.
+/// Today the 1 MiB body cap drops the connection before the route runs, so
+/// the controller would sit out the full 300 s op timeout instead.
+#[tokio::test]
+#[ignore = "red test (C-01): goes green in Phase 2 of the HTTP migration"]
+async fn red_c01_two_mib_op_result_is_accepted() {
+    let (controller, port, _ws, _state) = forge_harness().await;
+
+    // Enrol a worker directly through the registry and use its credential.
+    let enrolment = controller
+        .fleet
+        .registry
+        .issue_enrolment("red-worker")
+        .unwrap();
+    let (_worker_id, worker_token) = controller
+        .fleet
+        .registry
+        .enrol("red-worker", &enrolment, &smith_protocol::Capability::default())
+        .unwrap();
+
+    let big = "x".repeat(2 * 1024 * 1024);
+    let body = serde_json::to_string(&OpResultRequest {
+        session_id: "sess".into(),
+        exec_id: "exec".into(),
+        result: OpResult::Done { output: big },
+    })
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let (status, resp) = raw_request(&mut stream, "POST", "/v1/worker/op-result", &worker_token, Some(&body))
+        .await
+        .expect("server must answer an oversized (but within-limit) op-result");
+    assert_eq!(status, 200, "2 MiB op-result must be accepted: {resp}");
+    assert!(resp.contains("\"delivered\""), "{resp}");
+}
+
+/// RED (S-03, green in Phase 2): an unauthenticated request must be refused
+/// BEFORE its body is read. The head declares a 256 MiB body that the client
+/// never sends; a 401 must still arrive promptly. Today the daemon buffers
+/// the declared body first, so nothing arrives inside the window.
+#[tokio::test]
+#[ignore = "red test (S-03): goes green in Phase 2 (auth-before-body middleware)"]
+async fn red_s03_unauthenticated_body_is_not_read() {
+    let (_controller, port, _ws, _state) = forge_harness().await;
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let head = "POST /v1/sessions HTTP/1.1\r\n\
+                Host: localhost\r\n\
+                Authorization: Bearer wrong\r\n\
+                Content-Length: 268435456\r\n\
+                Connection: close\r\n\r\n";
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    // Deliberately send NO body. Auth must not wait for it.
+
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
+    let text = match read {
+        Ok(Ok(_)) => String::from_utf8_lossy(&buf).into_owned(),
+        Ok(Err(e)) => panic!("connection error before a response: {e}"),
+        Err(_) => panic!(
+            "no response within 3s to an unauthenticated request whose body never arrived — \
+             the server is buffering the declared body before checking auth (S-03)"
+        ),
+    };
+    assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+}
+
+/// RED (S-04, green in Phase 1): the server must bound connection resources.
+/// Part 1: an idle connection that never sends a head is closed well within
+/// the 10 s header-read budget (today it lingers for the 30 s read timeout).
+/// Part 2: connections beyond the cap are closed promptly (today nothing
+/// ever closes idle connections early).
+#[tokio::test]
+#[ignore = "red test (S-04): goes green in Phase 1 (connection limits + timeouts)"]
+async fn red_s04_idle_connection_is_bounded_and_cap_refuses_extras() {
+    let (_controller, port, _ws, _state) = forge_harness().await;
+
+    // Part 1: header-read timeout. A silent client is disconnected.
+    let idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut idle = idle;
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(15), idle.read_to_end(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(_))),
+        "an idle connection was still open after 15s — no header-read deadline (S-04)"
+    );
+
+    // Part 2: the connection cap. Over-cap connections are closed promptly.
+    let mut extra: Vec<tokio::net::TcpStream> = Vec::new();
+    for _ in 0..1026 {
+        extra.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+    }
+    let mut saw_close = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !saw_close {
+        for s in extra.iter_mut() {
+            let mut probe = Vec::new();
+            if let Ok(Ok(0)) = tokio::time::timeout(Duration::from_millis(200), s.read_to_end(&mut probe)).await {
+                saw_close = true;
+                break;
+            }
+        }
+        if !saw_close {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    assert!(
+        saw_close,
+        "no connection beyond the cap was closed — there is no connection limit (S-04)"
+    );
+}
+
+/// RED (C-02, green in Phase 4): git compresses upload-pack requests larger
+/// than 1024 bytes with Content-Encoding: gzip (remote-curl.c). The server
+/// must decode before handing the body to upload-pack, which answers a
+/// complete request with a NAK pkt-line. Today the gzipped bytes go to
+/// upload-pack raw and the call fails.
+#[tokio::test]
+#[ignore = "red test (C-02): goes green in Phase 4 (git http-backend) or with gzip decoding"]
+async fn red_c02_gzipped_upload_pack_request_is_decoded() {
+    let (_controller, port, ws, _state) = forge_harness().await;
+    let origin = ws.path().join("seed");
+    let sha = seed_and_push(&origin, &format!("http://smith:{TOKEN}@127.0.0.1:{port}/git/demo.git")).await;
+
+    // A minimal, complete upload-pack request: want + flush + done.
+    let want = format!("want {sha} multi_ack_detailed side-band-64k thin-pack ofs-delta\n");
+    let pkt = |data: &str| format!("{:04x}", data.len() + 4) + data;
+    let plain = format!("{}00000009done\n", pkt(&want));
+
+    // Gzip it, the way git's HTTP client does.
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(plain.as_bytes()).unwrap();
+    let gzipped = enc.finish().unwrap();
+
+    // Send it with Content-Encoding: gzip (raw_request has no header knobs).
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = format!(
+        "POST /git/demo.git/git-upload-pack HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {TOKEN}\r\n\
+         Content-Type: application/x-git-upload-pack-request\r\n\
+         Content-Encoding: gzip\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        gzipped.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.write_all(&gzipped).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1).map(str::to_string))
+        .unwrap_or_default();
+    assert_eq!(status, "200", "gzip request must decode: {text}");
+    assert!(
+        text.contains("NAK"),
+        "upload-pack must answer a complete (decompressed) request with NAK: {text}"
+    );
+}
