@@ -8,25 +8,32 @@
 //! phase by phase; the legacy loop keeps serving until the cutover.
 
 use std::net::ToSocketAddrs as _;
-use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use axum::extract::{Request, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Extension, Path, Request, State};
+use axum::handler::Handler;
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::Router;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-use smith_protocol::PROTOCOL_VERSION;
+use smith_core::CoreEvent;
+use smith_protocol::{
+    ApprovalPost, CheckpointRequest, ClearancePost, CreateSession, EnrolReply, EnrolRequest,
+    ExecEventKind, ExecEventsRequest, HeartbeatRequest, OpResultRequest, ProviderPost, ResumePost,
+    StartTurn, WireEvent, WorkerSummary, PROTOCOL_VERSION,
+};
 
-use crate::controller::Controller;
+use crate::controller::{ApiError, Controller};
 
 /// Request head budget (D-5). hyper errors out oversized heads with 431.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -194,17 +201,103 @@ pub async fn accept_loop(
     Ok(())
 }
 
+/// Body budgets per route group (D-5). The legacy server capped everything
+/// at 1 MiB; the metadata posts are tightened and op-result widened so the
+/// worker's capped results (D-6) fit after JSON escaping.
+const JSON_BODY_LIMIT: usize = 1024 * 1024;
+const META_BODY_LIMIT: usize = 64 * 1024;
+const EXEC_EVENTS_LIMIT: usize = 1024 * 1024;
+const OP_RESULT_LIMIT: usize = 32 * 1024 * 1024;
+
+/// The authenticated worker's registry name (inserted by [`worker_auth`]).
+#[derive(Clone)]
+pub(crate) struct WorkerIdentity(pub String);
+
 /// The serve API router. Auth middleware wraps everything: it runs before
 /// any body extractor, so an unauthenticated request never gets its body
-/// buffered (S-03).
+/// buffered (S-03). Three groups: daemon-token routes, worker-credential
+/// routes, and the open enrol route (which authenticates with the one-time
+/// token carried in its body).
 pub(crate) fn build_router(state: ApiState) -> Router {
-    Router::new()
+    let daemon = Router::new()
         .route("/v1/health", get(health))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth,
-        ))
+        .route(
+            "/v1/sessions",
+            get(sessions_list)
+                .post(session_create.layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))),
+        )
+        .route(
+            "/v1/sessions/{id}/turns",
+            post(session_turns.layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))),
+        )
+        .route("/v1/sessions/{id}/cancel", post(session_cancel))
+        .route(
+            "/v1/sessions/{id}/approvals",
+            post(session_approvals.layer(DefaultBodyLimit::max(META_BODY_LIMIT))),
+        )
+        .route(
+            "/v1/sessions/{id}/provider",
+            post(session_provider.layer(DefaultBodyLimit::max(META_BODY_LIMIT))),
+        )
+        .route(
+            "/v1/sessions/{id}/clearance",
+            post(session_clearance.layer(DefaultBodyLimit::max(META_BODY_LIMIT))),
+        )
+        .route(
+            "/v1/sessions/{id}/resume",
+            post(session_resume.layer(DefaultBodyLimit::max(META_BODY_LIMIT))),
+        )
+        .route("/v1/sessions/{id}/diff", get(session_diff))
+        .route("/v1/sessions/{id}/status", get(session_status))
+        .route(
+            "/v1/workers",
+            get(workers_list)
+                .post(worker_issue.layer(DefaultBodyLimit::max(META_BODY_LIMIT))),
+        )
+        .route("/v1/workers/{name}", delete(worker_revoke))
+        .route("/v1/repos", get(repos_list))
+        .route("/v1/metrics", get(metrics))
+        .layer(
+            axum::middleware::from_fn_with_state(state.clone(), daemon_auth),
+        );
+
+    let worker = Router::new()
+        .route(
+            "/v1/worker/heartbeat",
+            post(worker_heartbeat).layer(DefaultBodyLimit::max(META_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/worker/op-result",
+            post(worker_op_result).layer(DefaultBodyLimit::max(OP_RESULT_LIMIT)),
+        )
+        .route(
+            "/v1/worker/exec-events",
+            post(worker_exec_events).layer(DefaultBodyLimit::max(EXEC_EVENTS_LIMIT)),
+        )
+        .route(
+            "/v1/worker/checkpoint",
+            post(worker_checkpoint).layer(DefaultBodyLimit::max(META_BODY_LIMIT)),
+        )
+        .layer(
+            axum::middleware::from_fn_with_state(state.clone(), worker_auth),
+        );
+
+    // Enrolment authenticates with the one-time token in its body; no
+    // bearer applies (the worker has no credential yet).
+    let open = Router::new().route(
+        "/v1/worker/enrol",
+        post(worker_enrol).layer(DefaultBodyLimit::max(META_BODY_LIMIT)),
+    );
+
+    daemon
+        .merge(worker)
+        .merge(open)
+        .fallback(not_found)
         .with_state(state)
+}
+
+async fn not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "unknown route")
 }
 
 async fn health() -> impl IntoResponse {
@@ -218,23 +311,42 @@ async fn health() -> impl IntoResponse {
     )
 }
 
-/// Bearer-token auth. The comparison is constant time over SHA-256 digests
-/// so token equality doesn't leak through timing (S-18).
-pub(crate) async fn auth(
+/// Bearer-token auth for the daemon routes. The comparison is constant time
+/// over SHA-256 digests so token equality doesn't leak through timing (S-18).
+pub(crate) async fn daemon_auth(
     State(state): State<ApiState>,
     req: Request,
     next: Next,
 ) -> Response {
-    let provided = req
-        .headers()
+    if bearer(req.headers()).is_some_and(|t| tokens_match(t, &state.token)) {
+        next.run(req).await
+    } else {
+        error_response(StatusCode::UNAUTHORIZED, "unauthorised")
+    }
+}
+
+/// Worker-credential auth: resolves the worker's registry name and hands it
+/// to the handler via request extensions.
+pub(crate) async fn worker_auth(
+    State(state): State<ApiState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let Some(worker) = bearer(req.headers())
+        .and_then(|t| state.controller.fleet.registry.authenticate(t))
+    else {
+        return error_response(StatusCode::UNAUTHORIZED, "unauthorised");
+    };
+    req.extensions_mut().insert(WorkerIdentity(worker));
+    next.run(req).await
+}
+
+fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    match provided {
-        Some(t) if tokens_match(t, &state.token) => next.run(req).await,
-        _ => error_response(StatusCode::UNAUTHORIZED, "unauthorised"),
-    }
+        .map(str::trim)
 }
 
 pub(crate) fn tokens_match(provided: &str, expected: &str) -> bool {
@@ -251,18 +363,369 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     json_response(status, &serde_json::json!({ "error": message }))
 }
 
-pub(crate) fn json_response(status: StatusCode, value: &serde_json::Value) -> Response {
-    let body = value.to_string();
+/// Map the controller's [`ApiError`] onto a response.
+fn api_error(e: &ApiError) -> Response {
+    let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    error_response(status, &e.message)
+}
+
+/// The `202 {"accepted": true}` envelope for acked operations.
+fn accepted() -> Response {
+    json_response(StatusCode::ACCEPTED, &serde_json::json!({ "accepted": true }))
+}
+
+/// Parse a JSON body; the legacy error shape is kept byte-identical.
+fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
+    serde_json::from_slice(body)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, &format!("bad request body: {e}")))
+}
+
+pub(crate) fn json_response<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
+    match serde_json::to_string(value) {
+        Ok(body) => (
+            status,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "error": e.to_string() }).to_string(),
+        )
+            .into_response(),
+    }
+}
+
+// ---- daemon routes -----------------------------------------------------
+
+async fn sessions_list(State(state): State<ApiState>) -> Response {
+    json_response(StatusCode::OK, &state.controller.sessions())
+}
+
+async fn session_create(
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<CreateSession>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    match state.controller.create_session(req).await {
+        Ok(id) => json_response(StatusCode::OK, &serde_json::json!({ "session_id": id })),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_turns(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<StartTurn>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    match state.controller.start_turn(&id, &req.input).await {
+        Ok(()) => accepted(),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_cancel(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.controller.cancel_turn(&id) {
+        Ok(()) => accepted(),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_approvals(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<ApprovalPost>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    match state
+        .controller
+        .deliver_approval(&id, req.call_id.as_deref(), req.decision)
+        .await
+    {
+        Ok(()) => accepted(),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_provider(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<ProviderPost>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    match state
+        .controller
+        .set_provider(&id, req.provider.as_deref(), req.model.as_deref())
+        .await
+    {
+        Ok(()) => accepted(),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_clearance(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<ClearancePost>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    match state
+        .controller
+        .forward_clearance(&id, req.id, req.decision)
+        .await
+    {
+        Ok(()) => accepted(),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_resume(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<ResumePost>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    match state.controller.resume(&id, &req.prefix).await {
+        Ok(reply) => json_response(StatusCode::OK, &reply),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_diff(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    match state.controller.diff(&id).await {
+        Ok(text) => json_response(StatusCode::OK, &serde_json::json!({ "text": text })),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn session_status(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    match state.controller.get(&id) {
+        Ok(handle) => json_response(StatusCode::OK, &handle.status().await),
+        Err(e) => api_error(&e),
+    }
+}
+
+async fn workers_list(State(state): State<ApiState>) -> Response {
+    let list: Vec<WorkerSummary> = state
+        .controller
+        .fleet
+        .registry
+        .list()
+        .into_iter()
+        .map(|w| WorkerSummary {
+            name: w.name,
+            id: w.id,
+            status: w.status,
+            capability: w.capability,
+            load: w.load,
+            last_seen_ms: w.last_seen_ms,
+        })
+        .collect();
+    json_response(StatusCode::OK, &list)
+}
+
+async fn worker_issue(
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Response {
+    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
+    let Ok(v) = parsed else {
+        return error_response(StatusCode::BAD_REQUEST, "bad body");
+    };
+    let Some(name) = v.get("name").and_then(serde_json::Value::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "name is required");
+    };
+    match state.controller.fleet.registry.issue_enrolment(name) {
+        Ok(token) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({ "enrolment_token": token }),
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+    }
+}
+
+async fn worker_revoke(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Response {
+    match state.controller.fleet.registry.revoke(&name) {
+        Ok(true) => {
+            let lost = state.controller.fleet.board.sessions_of(&name);
+            state.controller.fleet.streams.disconnect(&name);
+            state.controller.handle_lease_loss(&name, &lost);
+            json_response(StatusCode::OK, &serde_json::json!({ "revoked": true }))
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "no such worker"),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
+    }
+}
+
+async fn repos_list(State(state): State<ApiState>) -> Response {
+    let repos = state
+        .controller
+        .forge
+        .as_ref()
+        .map(|f| f.list_repos())
+        .unwrap_or_default();
+    json_response(StatusCode::OK, &repos)
+}
+
+async fn metrics(State(state): State<ApiState>) -> Response {
+    let text = state.controller.metrics.render();
     (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        text,
     )
         .into_response()
 }
 
+// ---- worker routes -----------------------------------------------------
+
+async fn worker_enrol(State(state): State<ApiState>, body: Bytes) -> Response {
+    let Ok(req) = parse_body::<EnrolRequest>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    match state
+        .controller
+        .fleet
+        .registry
+        .enrol(&req.name, &req.enrolment_token, &req.capability)
+    {
+        Ok((worker_id, worker_token)) => json_response(
+            StatusCode::OK,
+            &EnrolReply {
+                worker_id,
+                worker_token,
+            },
+        ),
+        Err(e) => error_response(StatusCode::FORBIDDEN, &format!("{e:#}")),
+    }
+}
+
+async fn worker_heartbeat(
+    State(state): State<ApiState>,
+    Extension(worker): Extension<WorkerIdentity>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<HeartbeatRequest>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    state
+        .controller
+        .fleet
+        .metrics
+        .worker_heartbeats_total
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .controller
+        .fleet
+        .registry
+        .record_heartbeat(&worker.0, &req.capability, &req.load);
+    // Reconcile: the worker's live-lease list wins; the daemon re-learns
+    // leases it forgot across a restart (M16).
+    state.controller.relearn_leases(&worker.0, &req.live_leases);
+    let lost = state.controller.fleet.reconcile(&worker.0, &req.live_leases);
+    if !lost.is_empty() {
+        state.controller.handle_lease_loss(&worker.0, &lost);
+    }
+    json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+async fn worker_op_result(
+    State(state): State<ApiState>,
+    Extension(_worker): Extension<WorkerIdentity>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<OpResultRequest>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    let delivered = state
+        .controller
+        .fleet
+        .streams
+        .deliver_op_result(&req.exec_id, req.result);
+    json_response(StatusCode::OK, &serde_json::json!({ "delivered": delivered }))
+}
+
+async fn worker_exec_events(
+    State(state): State<ApiState>,
+    Extension(_worker): Extension<WorkerIdentity>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<ExecEventsRequest>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    for event in req.events {
+        if let ExecEventKind::Finished { duration_ms, .. } = &event.kind {
+            state
+                .controller
+                .fleet
+                .metrics
+                .exec_duration_seconds
+                .observe_ms(*duration_ms);
+        }
+        if let ExecEventKind::StdoutDelta { text } | ExecEventKind::StderrDelta { text } =
+            &event.kind
+        {
+            let is_stderr = matches!(event.kind, ExecEventKind::StderrDelta { .. });
+            if let Ok(handle) = state.controller.get(&event.lease_id) {
+                handle.journal.publish(WireEvent::ExecOutput {
+                    exec_id: event.exec_id.clone(),
+                    is_stderr,
+                    text: text.clone(),
+                });
+            }
+        }
+    }
+    json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+async fn worker_checkpoint(
+    State(state): State<ApiState>,
+    Extension(_worker): Extension<WorkerIdentity>,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = parse_body::<CheckpointRequest>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad request body");
+    };
+    if let Ok(handle) = state.controller.get(&req.session_id) {
+        // Byte-slice safely: worker-supplied strings must not panic the
+        // daemon on a multi-byte boundary (S-24).
+        let commit = req.commit.get(..12).unwrap_or(&req.commit).to_string();
+        let session = req.session_id.get(..8).unwrap_or(&req.session_id).to_string();
+        handle.journal.publish_core(CoreEvent::Notice {
+            text: format!(
+                "[checkpoint {commit} on smith/{session}{}]",
+                if req.pushed { " (pushed)" } else { " (local only)" }
+            ),
+        });
+    }
+    json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
 /// Load the TLS acceptor from `[serve].tls_cert` + `tls_key` (PEM).
-pub fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+pub fn load_tls_acceptor(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     // Fail soft if another test/server already installed a provider.

@@ -23,11 +23,11 @@ Status: 0 of 44 closed.
   - Fix: scope the helper to the configured origin with git's `credential.<URL>.helper`. Validate `repo` and `ref`, and put `--` before user-supplied URLs and refs.
   - Verify: a local server that answers every request with 401 must receive no token during a clone.
 
-- [ ] **S-03 · Request bodies buffered before auth, and unbounded framing reads** (Phases 1, 2, 4)
+- [ ] **S-03 · Request bodies buffered before auth, and unbounded framing reads** (new api done, Phases 1-2; closes at the Phase 4 cutover; the git-route half is Phase 4)
   - Where: `crates/smith-server/src/http.rs:70` (body read before auth at `:78`), `crates/smith-protocol/src/http.rs:236-268` (line reads grow without a bound before the cap check), `:214-219` (trailer lines uncounted), `:221-225` (unchecked `body.len() + size`), `:19` (256 MiB git cap, applied pre-auth)
   - Problem: an unauthenticated client can make the daemon buffer up to 256 MiB per connection, or grow memory without limit through chunk-size lines and trailers. The size arithmetic can wrap in release builds.
   - Fix: authenticate in middleware before any body is read, and let hyper handle framing with its own limits.
-  - Verify: `red_s03_unauthenticated_body_is_not_read` in `crates/smith-server/tests/serve_integration.rs` (added 15 November 2026; fails today as expected — no response within 3 s while the server waits for the declared body).
+  - Verify: `s03_unauthenticated_body_is_not_read` in `crates/smith-server/tests/api_integration.rs` (green as of Phase 2 — a 401 arrives within 3 s for a declared 256 MiB body that never arrives; the legacy loop is fixed by the same code at the cutover).
 
 - [ ] **S-04 · No connection cap and no request deadline** (fixed in the new api, Phase 1; closes at the Phase 4 cutover while the legacy loop still serves)
   - Where: `crates/smith-server/src/http.rs:38-53` (one task per connection, no limit), `crates/smith-protocol/src/http.rs:22` (timeouts apply per read, not per request)
@@ -115,11 +115,11 @@ Status: 0 of 44 closed.
   - Fix: restrict workspaces to configured roots, and refuse any ancestor of the home directory.
   - Verify: `C:\Users` is refused as a workspace.
 
-- [ ] **C-01 · Worker results above 1 MiB are silently dropped** (Phase 2)
+- [ ] **C-01 · Worker results above 1 MiB are silently dropped** (op-result fixed in the new api, Phase 2; the worker-side caps are S-13; closes at cutover)
   - Where: `crates/smith-protocol/src/http.rs:17` (1 MiB default), `crates/smith-server/src/http.rs:65-69` (applies it to `/v1/worker/op-result`), `crates/smith-worker/src/main.rs:627-637` (failed posts are ignored), `crates/smith-sandbox/src/lib.rs:628-640` (no output cap)
   - Problem: a command or `read_file` result larger than 1 MiB is rejected with the connection dropped, so the controller waits for the 300 s operation timeout.
-  - Fix: cap results on the worker (S-13, decision D-6) and set the op-result limit above that cap. Log failed posts.
-  - Verify: `red_c01_two_mib_op_result_is_accepted` in `crates/smith-server/tests/serve_integration.rs` (added 15 November 2026; fails today as expected — the connection is force-closed with `os error 10054`).
+  - Fix: cap results on the worker (S-13, decision D-6) and set the op-result limit above that cap (done: 32 MiB on the api route). Log failed posts (Phase 5, with the reqwest client).
+  - Verify: `worker_flow_and_two_mib_op_result` in `crates/smith-server/tests/api_integration.rs` (green as of Phase 2 — a 2 MiB op-result is accepted).
 
 - [ ] **C-02 · Git clients' gzip-compressed requests fail** (Phase 4; reproduced)
   - Where: `crates/smith-protocol/src/http.rs:155-186` (only `Transfer-Encoding` and `Content-Length` are read), `crates/smith-server/src/http.rs:627` (raw body passed to `upload-pack`)
@@ -162,10 +162,10 @@ Status: 0 of 44 closed.
   - Fix: parse the authority properly, and cap pending requests.
   - Verify: `http://host:8080/path` connects to port 8080.
 
-- [ ] **S-24 · Error JSON built by string formatting; panicking byte slices** (Phases 1, 2, 4)
+- [ ] **S-24 · Error JSON built by string formatting; panicking byte slices** (new api done, Phases 1-2; git errors at Phase 4; closes at cutover)
   - Where: `crates/smith-server/src/http.rs` (`git_service_info` and `git_rpc` build JSON with `format!` and `.replace('"', "'")`, which also leaks git stderr), `:424` (`commit[..12]` on worker input)
-  - Fix: `serde_json` for every error body, and `get(..n)` for slices.
-  - Verify: a git error containing quotes or backslashes produces valid JSON.
+  - Fix: `serde_json` for every error body, and `get(..n)` for slices. Done in `crates/smith-server/src/api.rs` (`error_response`/`json_response`, and the checkpoint notice slices with `get(..n)`).
+  - Verify: a git error containing quotes or backslashes produces valid JSON (Phase 4).
 
 - [ ] **S-25 · Worker and client URL parsing breaks IPv6 literals** (Phase 5)
   - Where: `crates/smith-worker/src/main.rs:55-65` and `:183-194`

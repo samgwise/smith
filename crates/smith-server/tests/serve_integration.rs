@@ -1945,17 +1945,12 @@ async fn smith_repo_scheme_mints_session_tokens() {
 
 // ---- Phase 0 red tests (HTTP migration) --------------------------------
 //
-// These pin the gaps tracked in docs/SECURITY_REVIEW.md (C-01, S-03, S-04,
-// C-02) and FAIL against the hand-rolled HTTP layer. They are #[ignore]d so
-// the default suite stays green until the migration phases land; run them
-// with:
-//   cargo test -p smith-server --test serve_integration -- --ignored
-// Each goes green in the phase noted in its ignore reason; remove the
-// attribute then. s04_* has already moved to the axum api (Phase 1) and runs
-// in the default suite; the rest still target the legacy server and turn
-// green as their phases port the routes.
-
-use smith_protocol::http::raw_request;
+// These pinned the gaps tracked in docs/SECURITY_REVIEW.md and failed
+// against the hand-rolled HTTP layer. As phases port behaviour to the axum
+// api, the red tests move across and go green: s04_* (Phase 1) and the
+// s03_*/c01_* pair (Phase 2) now live in the default suites (api_integration.rs
+// and below); the last one standing, red_c02, covers the legacy git routes
+// and goes green in Phase 4.
 
 /// A controller with a live forge, plus the port it is serving on.
 async fn forge_harness() -> (Arc<Controller>, u16, tempfile::TempDir, tempfile::TempDir) {
@@ -1994,80 +1989,6 @@ async fn seed_and_push(origin: &std::path::Path, url: &str) -> String {
     String::from_utf8_lossy(&git(origin, &["rev-parse", "HEAD"]).await.unwrap().stdout)
         .trim()
         .to_string()
-}
-
-/// RED (C-01, green in Phase 2): a 2 MiB worker op-result must be accepted.
-/// Today the 1 MiB body cap drops the connection before the route runs, so
-/// the controller would sit out the full 300 s op timeout instead.
-#[tokio::test]
-#[ignore = "red test (C-01): goes green in Phase 2 of the HTTP migration"]
-async fn red_c01_two_mib_op_result_is_accepted() {
-    let (controller, port, _ws, _state) = forge_harness().await;
-
-    // Enrol a worker directly through the registry and use its credential.
-    let enrolment = controller
-        .fleet
-        .registry
-        .issue_enrolment("red-worker")
-        .unwrap();
-    let (_worker_id, worker_token) = controller
-        .fleet
-        .registry
-        .enrol("red-worker", &enrolment, &smith_protocol::Capability::default())
-        .unwrap();
-
-    let big = "x".repeat(2 * 1024 * 1024);
-    let body = serde_json::to_string(&OpResultRequest {
-        session_id: "sess".into(),
-        exec_id: "exec".into(),
-        result: OpResult::Done { output: big },
-    })
-    .unwrap();
-
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    let (status, resp) = raw_request(&mut stream, "POST", "/v1/worker/op-result", &worker_token, Some(&body))
-        .await
-        .expect("server must answer an oversized (but within-limit) op-result");
-    assert_eq!(status, 200, "2 MiB op-result must be accepted: {resp}");
-    assert!(resp.contains("\"delivered\""), "{resp}");
-}
-
-/// RED (S-03, green in Phase 2): an unauthenticated request must be refused
-/// BEFORE its body is read. The head declares a 256 MiB body that the client
-/// never sends; a 401 must still arrive promptly. Today the daemon buffers
-/// the declared body first, so nothing arrives inside the window.
-#[tokio::test]
-#[ignore = "red test (S-03): goes green in Phase 2 (auth-before-body middleware)"]
-async fn red_s03_unauthenticated_body_is_not_read() {
-    let (_controller, port, _ws, _state) = forge_harness().await;
-
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    let head = "POST /v1/sessions HTTP/1.1\r\n\
-                Host: localhost\r\n\
-                Authorization: Bearer wrong\r\n\
-                Content-Length: 268435456\r\n\
-                Connection: close\r\n\r\n";
-    use tokio::io::AsyncWriteExt;
-    stream.write_all(head.as_bytes()).await.unwrap();
-    stream.flush().await.unwrap();
-    // Deliberately send NO body. Auth must not wait for it.
-
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
-    let text = match read {
-        Ok(Ok(_)) => String::from_utf8_lossy(&buf).into_owned(),
-        Ok(Err(e)) => panic!("connection error before a response: {e}"),
-        Err(_) => panic!(
-            "no response within 3s to an unauthenticated request whose body never arrived — \
-             the server is buffering the declared body before checking auth (S-03)"
-        ),
-    };
-    assert!(text.starts_with("HTTP/1.1 401"), "{text}");
 }
 
 /// GREEN (S-04, Phase 1): the axum api bounds connection resources. Part 1:
