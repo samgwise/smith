@@ -15,6 +15,7 @@ fn echo_server_config() -> McpConfig {
             env: BTreeMap::new(),
             approval: ApprovalMode::Ask,
             timeout_secs: 30,
+            connect_timeout_secs: 30,
         },
     );
     McpConfig { servers }
@@ -69,6 +70,7 @@ async fn failing_server_is_reported_not_fatal() {
             env: BTreeMap::new(),
             approval: ApprovalMode::Ask,
             timeout_secs: 5,
+            connect_timeout_secs: 30,
         },
     );
     let config = McpConfig { servers };

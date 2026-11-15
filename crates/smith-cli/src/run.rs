@@ -42,6 +42,7 @@ pub async fn run_headless(
     workspace: &Path,
     task: &str,
     keep_container: bool,
+    trust_workspace: bool,
 ) -> anyhow::Result<RunOutcome> {
     let (sandbox, executor) = start_executor(config, workspace).await?;
     let container = executor.session().name.clone();
@@ -56,7 +57,10 @@ pub async fn run_headless(
     println!("session: {}", session_path.display());
 
     let workspace_canon = executor.session().workspace_host.clone();
-    let mut mcp_session = connect_mcp(config, Some(&workspace_canon)).await;
+    // Headless runs never prompt: trust is the --trust-workspace opt-in,
+    // or whatever the store already records (S-01).
+    let workspace_trusted = smith_core::trust::resolve(trust_workspace, &workspace_canon);
+    let mut mcp_session = connect_mcp(config, Some(&workspace_canon), workspace_trusted).await;
     let mut tools = smith_core::builtin_tools();
     tools.extend(mcp_session.take_tools());
 
@@ -117,6 +121,7 @@ pub async fn resume_headless(
     task: Option<&str>,
     force: bool,
     keep: bool,
+    trust_workspace: bool,
 ) -> anyhow::Result<RunOutcome> {
     let canon = dunce::canonicalize(workspace)?;
     let sessions = smith_core::list_sessions()?;
@@ -157,7 +162,10 @@ pub async fn resume_headless(
     println!("resumed session {} ({})", meta.id, path.display());
 
     let workspace_canon = executor.session().workspace_host.clone();
-    let mut mcp_session = connect_mcp(config, Some(&workspace_canon)).await;
+    // Headless runs never prompt: trust is the --trust-workspace opt-in,
+    // or whatever the store already records (S-01).
+    let workspace_trusted = smith_core::trust::resolve(trust_workspace, &workspace_canon);
+    let mut mcp_session = connect_mcp(config, Some(&workspace_canon), workspace_trusted).await;
     let mut tools = smith_core::builtin_tools();
     tools.extend(mcp_session.take_tools());
 

@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use smith_core::{
     Usage,
 };
 
-use crate::stream::lines;
+use crate::stream::{STREAM_IDLE_TIMEOUT, lines};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -44,7 +45,12 @@ impl OpenAiProvider {
         model: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Dial timeout only: a total request timeout would kill long
+            // streaming responses (S-21).
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(30))
+                .build()
+                .expect("a client with a connect timeout"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
@@ -105,7 +111,18 @@ impl LlmProvider for OpenAiProvider {
                 };
                 stream::iter(items)
             });
-        Ok(Box::pin(events))
+        // A stream that goes silent for too long fails the step instead of
+        // holding the session busy forever (S-21).
+        let bounded = tokio_stream::StreamExt::timeout(events, STREAM_IDLE_TIMEOUT);
+        Ok(Box::pin(bounded.map(|item| {
+            item.map_err(|_| {
+                anyhow!(
+                    "model stream idle for more than {}s",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                )
+            })
+            .and_then(|inner| inner)
+        })))
     }
 }
 

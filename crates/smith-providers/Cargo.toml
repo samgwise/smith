@@ -12,3 +12,4 @@ futures.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 smith-core.workspace = true
+tokio-stream.workspace = true

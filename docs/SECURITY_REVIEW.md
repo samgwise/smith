@@ -7,15 +7,15 @@ How to use this file:
 - Keep IDs stable. Add new items at the end of their section rather than renumbering.
 - Each item ends with its migration phase (see the migration plan) or "Independent" when it's fixed separately.
 
-Status: 26 of 44 closed. The S-14 ref-policy half is in (its hook path is covered by an extended forge scope test); its token TTL/revocation half remains.
+Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covered by an extended forge scope test); its token TTL/revocation half remains.
 
 ## High
 
-- [ ] **S-01 · Workspace MCP config runs host commands before approval** (Independent)
-  - Where: `crates/smith-server/src/factory.rs:52-60`, `crates/smith-mcp/src/config.rs:57-68`, `crates/smith-mcp/src/manager.rs:123-160`, `crates/smith-mcp/src/bridge.rs:46-49`, `crates/smith-cli/src/doctor.rs:286-321`
+- [x] **S-01 · Workspace MCP config runs host commands before approval** (fixed, security round 2 batch 5)
+  - Where: `crates/smith-core/src/trust.rs` (the trust store), `crates/smith-server/src/factory.rs` (`connect_mcp`), `crates/smith-mcp/src/config.rs` (`merged`), `crates/smith-cli/src/main.rs` (TUI prompt, `smith trust`), `crates/smith-cli/src/doctor.rs` (`mcp_deep_check`)
   - Problem: a repository's `.smith/mcp.toml` spawns its commands at session start, can pass host variables through `${VAR}`, and can set `approval = "allow"`. `smith doctor --deep` also calls a workspace tool with `{}` arguments, bypassing approval.
-  - Fix: require per-workspace trust before loading the workspace layer. Ignore `approval` and `env` from it. Doctor never spawns or calls workspace MCP servers.
-  - Verify: a scratch repo whose `.smith/mcp.toml` writes a marker file. No marker may appear before trust is granted.
+  - Fix: the workspace layer loads only from a trusted workspace — trust is the TUI prompt (once, remembered), `--trust-workspace` for headless (also remembered), `smith trust <workspace>` for daemon-hosted sessions, keyed by workspace identity in `~/.smith/trust.json`. The layer's `approval` and `env` are ignored even when trusted. Doctor never spawns or calls workspace MCP servers.
+  - Verify: `trust_store_round_trip` (smith-core), `workspace_layer_is_sanitised` (smith-mcp), `resolve_finds_programs_on_path`; the marker-file check is a live manual reproduction.
 
 - [x] **S-02 · Git token sent to any host** (fixed, security round 2 batch 3)
   - Where: `crates/smith-server/src/controller.rs` (`resolve_source`, `prepare_source`), `crates/smith-worker/src/materialise.rs` (`credential_scope`, `credential_env`), `crates/smith-protocol/src/workers.rs` (`WorkspaceSource.credential_origin`)
@@ -146,11 +146,11 @@ Status: 26 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: the poller re-reads the token each loop (a token created after the daemon starts still works) and prunes `seen` to a bounded window.
   - Verify: `s20_clearance_poller_picks_up_a_token_created_after_start` in `crates/smith-server/tests/serve_integration.rs`.
 
-- [ ] **S-21 · No timeouts on MCP startup or provider calls** (Independent)
-  - Where: `crates/smith-mcp/src/manager.rs:149-160` (spawn, handshake, tool listing), `crates/smith-providers/src/*.rs` (no HTTP timeouts)
+- [x] **S-21 · No timeouts on MCP startup or provider calls** (fixed, security round 2 batch 5)
+  - Where: `crates/smith-mcp/src/manager.rs` (`connect_server`, per-server `connect_timeout_secs`), `crates/smith-providers/src/*` (dial timeout, stream idle timeout)
   - Problem: a hung server or model call holds the session busy indefinitely.
-  - Fix: timeouts on each step, plus a turn-level timeout.
-  - Verify: a hung MCP server fails session start after the timeout.
+  - Fix: the MCP handshake and tool listing are bounded by `connect_timeout_secs` (default 30 s, configurable per server); provider clients dial with a 30 s connect timeout, and a model stream silent for more than 120 s fails the step — the bounded tools' per-call timeout already covers tool calls.
+  - Verify: `hung_server_fails_within_the_connect_timeout` in `crates/smith-mcp/src/manager.rs` (a server that never speaks MCP fails start in 2 s).
 
 - [ ] **S-22 · Unbounded buffers** (the `ChunkedReader` half was removed with the legacy transport; provider lines and `AGENTS.md` remain)
   - Where: `crates/smith-providers/src/stream.rs:8-37`, `crates/smith-core/src/instructions.rs:11-21`
@@ -173,11 +173,11 @@ Status: 26 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: one scheme-aware URL parser handling `[::1]:port` literals, ports, and paths.
   - Verify: the `serve_url_parsing` unit test in `crates/smith-protocol/src/client.rs` (bracketed IPv6 with and without ports, schemes, and error cases).
 
-- [ ] **S-26 · MCP `command = "npx"` doesn't resolve on Windows** (Independent)
-  - Where: `crates/smith-mcp/src/manager.rs:133-154`, `README.md:228-236`
+- [x] **S-26 · MCP `command = "npx"` doesn't resolve on Windows** (fixed, security round 2 batch 5)
+  - Where: `crates/smith-mcp/src/manager.rs` (`resolve_command`)
   - Problem: Rust's `Command` only appends `.exe` on Windows, so `npx` (which is `npx.cmd`) isn't found.
-  - Fix: resolve program names with the `which` crate, which honours PATHEXT.
-  - Verify: `npx` resolves through `which` and starts.
+  - Fix: program names resolve through the `which` crate, which honours PATHEXT; an unresolvable program reports a failed server, not a spawn panic.
+  - Verify: `resolve_finds_programs_on_path` in `crates/smith-mcp/src/manager.rs`.
 
 - [x] **S-27 · Container hardening** (fixed, security round 2 batch 2)
   - Where: `crates/smith-sandbox/src/lib.rs` (`run_args`)
@@ -231,6 +231,6 @@ Status: 26 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
 - [ ] **D-03 · "Only the proxy and gateway DNS may leave the bridge"** (see S-08). `README.md:52-59`
 - [ ] **D-04 · Risky commands always re-prompt; "always" binds to the exact command** (see S-11). `README.md:32-37`
 - [ ] **D-05 · "Nothing is pushed without opting in"**. The merge gate pushes `smith/integration/<parent>` on every pass (`crates/smith-worker/src/main.rs:527-569`), which `docs/WORKER_MESH.md:72-74` describes. `README.md:196-198`
-- [ ] **D-06 · Deep checks "never touch your project directory"** (see S-01). `README.md:273-274`
-- [ ] **D-07 · `command = "npx"` example** (see S-26). `README.md:228-236`
+- [x] **D-06 · Deep checks "never touch your project directory"** (see S-01; fixed in security round 2 batch 5 — doctor no longer spawns or calls workspace MCP servers). `README.md:273-274`
+- [x] **D-07 · `command = "npx"` example** (see S-26; fixed in security round 2 batch 5 — the example resolves on Windows too). `README.md:228-236`
 - [ ] **D-08 · File tools are locked to the canonicalised workspace** (see S-07). `README.md:27`

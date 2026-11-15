@@ -46,15 +46,27 @@ pub async fn start_executor(
     Ok((sandbox.clone(), LocalExecutor::new(sandbox, session)))
 }
 
-/// Load layered MCP config (user + workspace when there is one) and
-/// connect; never fatal. Worker-mode sessions have no daemon-side workspace
-/// and use the global layer only.
-pub async fn connect_mcp(config: &Config, workspace_canon: Option<&Path>) -> smith_mcp::McpSession {
+/// Load layered MCP config (user + workspace when there is one AND the
+/// workspace is trusted) and connect; never fatal. Worker-mode sessions
+/// have no daemon-side workspace and use the global layer only. The
+/// workspace layer only loads from a TRUSTED workspace — its
+/// `.smith/mcp.toml` runs host commands at session start (S-01); the
+/// layer's approval/env are sanitised on merge even then.
+pub async fn connect_mcp(
+    config: &Config,
+    workspace_canon: Option<&Path>,
+    workspace_trusted: bool,
+) -> smith_mcp::McpSession {
     let mut mcp_config = config.mcp.clone();
-    match workspace_canon.map(smith_mcp::McpConfig::load_workspace) {
-        Some(Ok(workspace_config)) => mcp_config = mcp_config.merged(workspace_config),
-        Some(Err(e)) => tracing::warn!("could not load workspace MCP config: {e:#}"),
-        None => {}
+    if let Some(canon) = workspace_canon {
+        if !workspace_trusted {
+            tracing::info!("workspace MCP config ignored: workspace is not trusted");
+        } else {
+            match smith_mcp::McpConfig::load_workspace(canon) {
+                Ok(workspace_config) => mcp_config = mcp_config.merged(workspace_config),
+                Err(e) => tracing::warn!("could not load workspace MCP config: {e:#}"),
+            }
+        }
     }
     smith_mcp::McpSession::connect(&mcp_config).await
 }
@@ -182,7 +194,10 @@ impl SessionFactory for ConfigFactory {
             .collect::<String>();
 
         let logger = SessionLogger::new(&canon, &config.provider, &config.model)?;
-        let mut mcp_session = connect_mcp(&config, Some(&canon)).await;
+        // The daemon never prompts: hosted sessions trust a workspace only
+        // when the store already says so (`smith trust <workspace>`, S-01).
+        let workspace_trusted = smith_core::trust::is_trusted(&canon);
+        let mut mcp_session = connect_mcp(&config, Some(&canon), workspace_trusted).await;
         let mcp_status = mcp_session.status_lines();
         let mut tools = smith_core::builtin_tools();
         tools.extend(mcp_session.take_tools());

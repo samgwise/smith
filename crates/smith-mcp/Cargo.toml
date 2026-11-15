@@ -8,6 +8,8 @@ description = "MCP client: stdio servers exposed as smith tools"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+which = "8"
+tokio-stream.workspace = true
 rmcp = { version = "3.9", features = [
     "client",
     "transport-child-process",

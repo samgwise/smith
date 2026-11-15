@@ -13,6 +13,7 @@ pub mod provider;
 pub mod session;
 pub mod testing;
 pub mod tools;
+pub mod trust;
 
 pub use agent::{
     Agent, AlwaysAllowGate, ApprovalDecision, ApprovalGate, ApprovalRequest, CoreEvent, Limits,

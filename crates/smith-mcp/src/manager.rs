@@ -120,6 +120,15 @@ impl McpSession {
     }
 }
 
+/// Resolve a configured program name to an executable path. The `which`
+/// crate honours PATHEXT on Windows, where `npx` is really `npx.cmd` —
+/// Rust's `Command` only appends `.exe` (S-26).
+fn resolve_command(command: &str) -> anyhow::Result<String> {
+    which::which(command)
+        .map(|p| p.display().to_string())
+        .with_context(|| format!("`{command}` not found on PATH"))
+}
+
 async fn connect_server(
     name: &str,
     server_config: &McpServerConfig,
@@ -130,7 +139,8 @@ async fn connect_server(
     // Secret hygiene: only explicitly configured env (with ${VAR} expansion)
     // plus PATH passthrough; never the full host environment.
     let expanded = expand_env(&server_config.env);
-    let child = tokio::process::Command::new(&server_config.command);
+    let program = resolve_command(&server_config.command)?;
+    let child = tokio::process::Command::new(&program);
     let mut command = child;
     command.args(&server_config.args);
     command.env_clear();
@@ -146,17 +156,21 @@ async fn connect_server(
         command.env("SystemRoot", system_root);
     }
 
+    // Every connect step is bounded: a hung server must fail session start
+    // after the timeout instead of holding it forever (S-21). The spawn
+    // itself is synchronous; the handshake and the tool listing can hang.
+    let connect_timeout = Duration::from_secs(server_config.connect_timeout_secs.max(1));
     let transport = TokioChildProcess::new(command)
         .with_context(|| format!("spawning MCP server `{name}` ({})", server_config.command))?;
-    let service = ()
-        .serve(transport)
+    let service = tokio::time::timeout(connect_timeout, ().serve(transport))
         .await
+        .map_err(|_| anyhow::anyhow!("MCP handshake with server `{name}` timed out"))?
         .with_context(|| format!("MCP handshake with server `{name}` failed"))?;
 
     let peer = service.peer();
-    let tools_on_server = peer
-        .list_all_tools()
+    let tools_on_server = tokio::time::timeout(connect_timeout, peer.list_all_tools())
         .await
+        .map_err(|_| anyhow::anyhow!("listing tools of MCP server `{name}` timed out"))?
         .with_context(|| format!("listing tools of MCP server `{name}`"))?;
 
     let mut tools = vec![];
@@ -223,4 +237,68 @@ fn other_type(block: &ContentBlock) -> &'static str {
 /// Approval mode lookup used by the bridge.
 pub(crate) fn approved(mode: ApprovalMode) -> bool {
     mode == ApprovalMode::Allow
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::McpConfig;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn resolve_finds_programs_on_path() {
+        // Everything on PATH resolves (PATHEXT-aware on Windows, where
+        // `npx` is `npx.cmd`); a bogus program does not (S-26).
+        assert!(resolve_command("cargo").is_ok());
+        assert!(resolve_command("definitely-not-a-program-xyz").is_err());
+    }
+
+    /// S-21 red: a hung server must fail the connect within the connect
+    /// timeout instead of holding session start forever.
+    #[tokio::test]
+    async fn hung_server_fails_within_the_connect_timeout() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "hung".to_string(),
+            McpServerConfig {
+                // Starts and never speaks MCP. Bounded so a leaked process
+                // (a connect failure cannot always reap the child) dies soon.
+                command: if cfg!(windows) {
+                    "ping".into()
+                } else {
+                    "sleep".into()
+                },
+                args: if cfg!(windows) {
+                    vec!["-n".into(), "30".into(), "127.0.0.1".into()]
+                } else {
+                    vec!["30".into()]
+                },
+                env: BTreeMap::new(),
+                approval: Default::default(),
+                timeout_secs: 5,
+                connect_timeout_secs: 2,
+            },
+        );
+        let config = McpConfig { servers };
+
+        let started = std::time::Instant::now();
+        let session = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            McpSession::connect(&config),
+        )
+        .await
+        .expect("MCP connect must be bounded (S-21)");
+        assert!(
+            session
+                .status_lines()
+                .iter()
+                .any(|l| l.starts_with("✗ hung")),
+            "the hung server is reported as failed: {:?}",
+            session.status_lines()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(12),
+            "the connect timeout (2s) must fire long before the outer bound"
+        );
+        session.shutdown().await;
+    }
 }

@@ -284,10 +284,10 @@ async fn egress_live_check(sandbox: &Sandbox, session: &smith_sandbox::Session) 
 }
 
 async fn mcp_deep_check(ctx: &CheckCtx) -> CheckResult {
-    let mut config = ctx.config.mcp.clone();
-    if let Ok(ws) = smith_mcp::McpConfig::load_workspace(&ctx.workspace) {
-        config = config.merged(ws);
-    }
+    // Deep checks use the USER config layer only: a workspace's
+    // `.smith/mcp.toml` runs host commands, and doctor must never spawn or
+    // call workspace MCP servers (S-01, D-06).
+    let config = ctx.config.mcp.clone();
     if config.servers.is_empty() {
         return CheckResult {
             name: "mcp handshake".into(),

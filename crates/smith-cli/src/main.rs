@@ -30,9 +30,34 @@ async fn run_tui(config: &Config, workspace: &std::path::Path) -> anyhow::Result
     let session_label = logger.meta.id.chars().take(8).collect::<String>();
     smith_server::set_clearance_mode(config, true);
 
+    // MCP trust (S-01): the workspace's .smith/mcp.toml runs HOST commands
+    // at session start. Ask once per workspace; remembered in the store.
+    let workspace_servers = smith_mcp::McpConfig::load_workspace(&workspace_canon)
+        .map(|cfg| cfg.servers)
+        .unwrap_or_default();
+    let workspace_trusted = if workspace_servers.is_empty()
+        || smith_core::trust::is_trusted(&workspace_canon)
+    {
+        true
+    } else {
+        println!("This workspace's .smith/mcp.toml defines MCP servers, which run host commands:");
+        for (name, server) in &workspace_servers {
+            println!("  - {name}: {} {}", server.command, server.args.join(" "));
+        }
+        print!("Trust this workspace and start them? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(std::io::stdin()), &mut answer)?;
+        let yes = matches!(answer.trim().to_lowercase().as_str(), "y" | "yes");
+        if yes {
+            smith_core::trust::remember(&workspace_canon)?;
+        }
+        yes
+    };
     // MCP servers: connected for the whole TUI session, tools added to the
     // registry once (cache-stable), shut down when the session ends.
-    let mut mcp_session = smith_server::connect_mcp(config, Some(&workspace_canon)).await;
+    let mut mcp_session =
+        smith_server::connect_mcp(config, Some(&workspace_canon), workspace_trusted).await;
     let mcp_status = mcp_session.status_lines();
     let mut tools = smith_core::builtin_tools();
     tools.extend(mcp_session.take_tools());
@@ -160,6 +185,10 @@ enum Command {
         /// planner that spawns sub-agents on the fleet.
         #[arg(long)]
         orchestrate: bool,
+        /// Trust this workspace's `.smith/mcp.toml` (runs HOST commands) for
+        /// this and future sessions; remembered in ~/.smith/trust.json.
+        #[arg(long)]
+        trust_workspace: bool,
     },
     /// Continue a previous session.
     Resume {
@@ -192,6 +221,10 @@ enum Command {
         /// Workspace path on the remote host.
         #[arg(long)]
         remote_workspace: Option<String>,
+        /// Trust this workspace's `.smith/mcp.toml` (runs HOST commands) for
+        /// this and future sessions; remembered in ~/.smith/trust.json.
+        #[arg(long)]
+        trust_workspace: bool,
     },
     /// Diagnose the environment (read-only; --fix repairs, --deep runs round trips).
     Doctor {
@@ -261,6 +294,15 @@ enum Command {
     },
     /// List recent sessions.
     Sessions,
+    /// Trust a workspace's `.smith/mcp.toml` (which runs HOST commands) for
+    /// daemon-hosted and future sessions. Recorded in ~/.smith/trust.json.
+    Trust {
+        /// Workspace directory (defaults to the current directory).
+        workspace: Option<PathBuf>,
+        /// Remove the recorded trust instead of granting it.
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Sandbox utilities.
     Sandbox {
         #[command(subcommand)]
@@ -336,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
             connection,
             remote_workspace,
             orchestrate,
+            trust_workspace,
         }) => {
             if serve {
                 let code = run::run_via_serve(run::ServeRun {
@@ -373,7 +416,8 @@ async fn main() -> anyhow::Result<()> {
                 config.sandbox.remote_workspace = Some(remote_workspace);
             }
             let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-            let outcome = run::run_headless(&config, &workspace, &task, keep).await?;
+            let outcome =
+                run::run_headless(&config, &workspace, &task, keep, trust_workspace).await?;
             println!(
                 "container {} removed; session log: {}",
                 outcome.container,
@@ -391,6 +435,7 @@ async fn main() -> anyhow::Result<()> {
             verify,
             connection,
             remote_workspace,
+            trust_workspace,
         }) => {
             let mut config = config;
             if let Some(provider) = provider {
@@ -416,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
                 task.as_deref(),
                 force,
                 keep,
+                trust_workspace,
             )
             .await?;
             println!("session log: {}", outcome.session_path.display());
@@ -534,6 +580,21 @@ async fn main() -> anyhow::Result<()> {
             sandbox.ensure_ready().await?;
             let n = sandbox.clean_all().await?;
             println!("removed {n} container(s)");
+        }
+        Some(Command::Trust { workspace, revoke }) => {
+            let workspace = workspace.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+            let canon = dunce::canonicalize(&workspace)
+                .with_context(|| format!("resolving workspace {}", workspace.display()))?;
+            if revoke {
+                smith_core::trust::revoke(&canon)?;
+                println!("trust revoked for {}", canon.display());
+            } else {
+                smith_core::trust::remember(&canon)?;
+                println!(
+                    "workspace {} trusted; its .smith/mcp.toml loads for daemon-hosted sessions",
+                    canon.display()
+                );
+            }
         }
     }
     Ok(())

@@ -1,7 +1,14 @@
 //! Turn an HTTP response body into a stream of text lines. Works for both
 //! newline-delimited JSON (Ollama) and server-sent events (OpenAI).
 
+use std::time::Duration;
+
 use futures::{Stream, StreamExt};
+
+/// How long a model stream may stay silent before the step fails (S-21):
+/// a hung model call must not hold the session busy forever. Generous —
+/// large local models think between chunks.
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Yields one line per item, without the trailing `\n` or `\r\n`. Partial
 /// lines across network chunks are buffered until their terminator arrives.

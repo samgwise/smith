@@ -1,5 +1,6 @@
 //! MCP server configuration: user config `[mcp.servers.<name>]` plus
-//! workspace-scoped `.smith/mcp.toml` (workspace wins on name collision).
+//! workspace-scoped `.smith/mcp.toml` (workspace wins on name collision;
+//! the workspace layer is sanitised on merge — see [`McpConfig::merged`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,10 +34,18 @@ pub struct McpServerConfig {
     /// Timeout applied to each tool call.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Timeout applied to each connect step (spawn, handshake, tool
+    /// listing) so a hung server cannot hold the session start forever (S-21).
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
 }
 
 fn default_timeout() -> u64 {
     60
+}
+
+fn default_connect_timeout() -> u64 {
+    30
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -46,9 +55,15 @@ pub struct McpConfig {
 }
 
 impl McpConfig {
-    /// Merge workspace servers over user servers (workspace wins per name).
+    /// Merge the workspace layer over the user servers (workspace wins per
+    /// name). The workspace layer is SANITISED even from a trusted
+    /// workspace: its `approval` is forced to ask and its `env` dropped —
+    /// a repo's config must not be able to pre-approve its tools or read
+    /// host variables through `${VAR}` expansion (S-01).
     pub fn merged(mut self, workspace: McpConfig) -> Self {
-        for (name, server) in workspace.servers {
+        for (name, mut server) in workspace.servers {
+            server.approval = ApprovalMode::Ask;
+            server.env = Default::default();
             self.servers.insert(name, server);
         }
         self
@@ -174,6 +189,41 @@ command = "workspace-b"
         let merged = user.merged(workspace);
         assert_eq!(merged.servers["a"].command, "user-a");
         assert_eq!(merged.servers["b"].command, "workspace-b");
+    }
+
+    /// S-01 red: the workspace layer's `approval` and `env` must be ignored
+    /// — a repo's config cannot pre-approve its tools or read host variables
+    /// through `${VAR}` expansion, even when the workspace is trusted.
+    #[test]
+    fn workspace_layer_is_sanitised() {
+        let user: McpConfig = toml::from_str(
+            r#"
+[servers.a]
+command = "user-a"
+"#,
+        )
+        .unwrap();
+        let workspace: McpConfig = toml::from_str(
+            r#"
+[servers.b]
+command = "workspace-b"
+env = { TOKEN = "${SMITH_MCP_TEST_TOKEN}" }
+approval = "allow"
+"#,
+        )
+        .unwrap();
+        let merged = user.merged(workspace);
+        let b = &merged.servers["b"];
+        assert_eq!(
+            b.approval,
+            ApprovalMode::Ask,
+            "the workspace layer must not pre-approve its tools (S-01)"
+        );
+        assert!(
+            b.env.is_empty(),
+            "the workspace layer must not read host variables (S-01)"
+        );
+        assert_eq!(merged.servers["a"].command, "user-a");
     }
 
     #[test]
