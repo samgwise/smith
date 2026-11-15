@@ -236,7 +236,7 @@ mod tests {
             .open(&path)
             .unwrap();
         // A torn envelope: `{"v": 1,` with no close.
-        write!(f, "{}", r#"{"v": 1,"#).unwrap();
+        write!(f, r#"{{"v": 1,"#).unwrap();
         drop(f);
         let j2 = Journal::load_persisted(&path, 100).unwrap();
         assert_eq!(j2.replay(0).len(), 2);

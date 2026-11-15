@@ -11,16 +11,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Mutex;
 
 use anyhow::Context as _;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-
-use smith_protocol::http::Request;
 
 fn token_hash(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
@@ -118,25 +114,6 @@ impl Forge {
             }
         }
         n
-    }
-
-    /// Resolve a request's git token: Basic (git speaks Basic; the token
-    /// is the password) or Bearer (curl-friendly).
-    pub fn token_from_request(req: &Request) -> Option<String> {
-        if let Some(b) = req.bearer_token() {
-            return Some(b.to_string());
-        }
-        let basic = req
-            .header("authorization")?
-            .strip_prefix("Basic ")?
-            .trim()
-            .to_string();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(basic)
-            .ok()?;
-        let s = String::from_utf8(decoded).ok()?;
-        let (_user, pass) = s.split_once(':')?;
-        (!pass.is_empty()).then(|| pass.to_string())
     }
 
     /// Authenticate a token → its grant.
@@ -261,8 +238,7 @@ and smith/integration/*\" >&2\n\
 exit 1\n";
 
 /// Extract a git token from axum request headers: Bearer, or Basic with the
-/// token as the password (git's shape). The api middleware's version of
-/// [`Forge::token_from_request`].
+/// token as the password (git's shape). Used by the api's forge middleware.
 pub fn token_from_axum_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
         let value = v.to_str().ok()?;
@@ -297,57 +273,6 @@ fn valid_repo_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Run one smart-HTTP git subprocess: request body → stdin, stdout back.
-/// Git does all the protocol parsing; the daemon streams bytes.
-pub async fn run_git_svc(
-    repo_path: &Path,
-    svc: &str,
-    advertise: bool,
-    body: Vec<u8>,
-) -> anyhow::Result<Vec<u8>> {
-    let mut cmd = Command::new("git");
-    match (svc, advertise) {
-        ("upload-pack", true) => {
-            cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]);
-        }
-        ("upload-pack", false) => {
-            cmd.args(["upload-pack", "--stateless-rpc"]);
-        }
-        ("receive-pack", true) => {
-            cmd.args(["receive-pack", "--stateless-rpc", "--advertise-refs"]);
-        }
-        ("receive-pack", false) => {
-            cmd.args(["receive-pack", "--stateless-rpc"]);
-        }
-        _ => anyhow::bail!("unsupported git service `{svc}` (advertise={advertise})"),
-    }
-    cmd.arg(repo_path);
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning git (is it installed?)")?;
-    {
-        // Feed the request body, then close stdin — git's stateless RPC
-        // answers once its input ends. receive-pack reads continuously,
-        // so feeding cannot deadlock its (small) status output.
-        let mut stdin = child.stdin.take().context("git stdin")?;
-        stdin.write_all(&body).await?;
-        stdin.flush().await?;
-    }
-    let out = child
-        .wait_with_output()
-        .await
-        .context("git subprocess failed")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "git {svc} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(out.stdout)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,14 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn tokens_round_trip_through_basic_and_bearer() {
-        use smith_protocol::http::Request;
-        let mk = |auth: &str| Request {
-            method: "GET".into(),
-            path: "/x".into(),
-            query: String::new(),
-            headers: vec![("authorization".into(), auth.into())],
-            body: vec![],
+    fn basic_and_bearer_tokens_extract_from_axum_headers() {
+        use axum::http::HeaderMap;
+        let mk = |auth: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                auth.parse().expect("header value"),
+            );
+            h
         };
         // git sends Basic with the token as the password.
         let basic = format!(
@@ -380,15 +306,15 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode("smith-user:tok-123")
         );
         assert_eq!(
-            Forge::token_from_request(&mk(&basic)).as_deref(),
+            token_from_axum_headers(&mk(&basic)).as_deref(),
             Some("tok-123")
         );
         // Bearer for curl.
         assert_eq!(
-            Forge::token_from_request(&mk("Bearer tok-123")).as_deref(),
+            token_from_axum_headers(&mk("Bearer tok-123")).as_deref(),
             Some("tok-123")
         );
-        assert_eq!(Forge::token_from_request(&mk("Digest xyz")), None);
+        assert_eq!(token_from_axum_headers(&mk("Digest xyz")), None);
     }
 
     #[tokio::test]

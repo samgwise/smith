@@ -7,10 +7,10 @@ appends the worker-mesh section below): message shapes are pinned by
 round-trip tests (`smith-protocol`); any breaking change bumps `v` and this
 document.
 
-Transport note: v1 rides hand-rolled HTTP/1.1 over TCP (the same
-framework-free pattern as the egress sidecar's control API) with SSE for
-streaming. The *messages* are the contract; a future WebSocket or mesh
-carrier can transport the same envelopes unchanged (that is M14's option).
+Transport note: v1 rides HTTP/1.1 over axum on hyper, with SSE for
+streaming and reqwest on the client side (both TLS-capable via rustls).
+The *messages* are the contract; a future WebSocket or mesh carrier can
+transport the same envelopes unchanged.
 
 ## Envelope
 
@@ -61,7 +61,13 @@ sessions (skipped when empty; every other session's bytes unchanged).
 
 Every route requires `Authorization: Bearer <token>`. The token lives in
 `~/.smith/serve-token`, generated on first `smith serve`. There are no
-public endpoints.
+public endpoints. (Exceptions: `/git/*` speaks git's Basic shape, and
+`/v1/worker/enrol` carries its one-time token in the body.)
+
+For remote daemons, serve TLS (`[serve].tls_cert` + `tls_key`) and pin the
+controller's certificate on the client (`--cert` / `SMITH_SERVE_CERT` for
+`smith attach` / `smith run --serve`; `smith-worker enrol --cert`). A
+pinned leaf certificate is the client's sole trust anchor.
 
 ## Routes (all under `/v1`)
 
@@ -101,7 +107,9 @@ a `Content-Length` body (`202 {"accepted":true}` for acks, errors as
 
 `GET /v1/sessions/:id/events?since=seq` → `200` with
 `Content-Type: text/event-stream`, chunked transfer encoding. Each SSE event
-is a single `data:` line carrying one envelope:
+is a single `data:` line carrying one envelope. Idle streams emit SSE
+comment heartbeats (`: keep-alive`) every 15 seconds — every parser skips
+them:
 
 ```
 data: {"v":1,"seq":7,"event":{"type":"core","core":{"type":"turn_completed"}}}
@@ -181,21 +189,30 @@ Full semantics in `docs/WORKER_MESH.md`; the wire shapes:
   (worker-mode execution; see WORKER_MESH.md) — and the M15 flag
   `orchestrate` (the session becomes a planner; see ORCHESTRATION.md).
 
-## The forge (M17)
+## The forge (M17, re-plumbed on http-backend)
 
 The controller hosts git repos itself (`<state_dir>/repos/<name>.git`,
 bare, push-to-create on the first push):
 
 - `GET /git/<repo>/info/refs?service=git-upload-pack|git-receive-pack` —
   the smart-protocol advertisement (`application/x-git-*-advertisement`).
-- `POST /git/<repo>/git-upload-pack` / `git-receive-pack` — the RPC half;
-  request bodies may be **chunked** (git's push path) up to 256 MiB.
+- `POST /git/<repo>/git-upload-pack` / `git-receive-pack` — the RPC half.
+  Request bodies stream to `git http-backend`: git gzips bodies over
+  1 KiB (`Content-Encoding: gzip`) and the daemon streams them raw —
+  http-backend inflates. Non-gzip bodies stream by Content-Length; chunked
+  non-gzip bodies buffer (bounded by `[serve].max_git_body_mb`, default
+  256). Eight http-backend subprocesses run concurrently.
 - Auth: Basic (git's shape — the token is the password) or Bearer; tokens
   are **per-session, per-repo, read/write-scoped**, minted at dispatch for
   `smith:<name>` repo references and delivered to the worker in
   `WorkspaceSource.token`; the daemon token is a full grant. Worker mesh
-  credentials do not authorise git routes. Git itself does the protocol
-  work (`--stateless-rpc` subprocesses); the daemon pipes bytes only.
+  credentials do not authorise git routes.
+- Ref policy (S-14): each hosted repo runs an `update` hook — a session
+  token may update only `refs/heads/smith/<session>` and
+  `refs/heads/smith/integration/*`; `receive.denyDeletes` and
+  `receive.denyNonFastForwards` are set on every hosted repo. Auto-push
+  (`[orchestrate].auto_push`) mints `write_all` tokens that lift the
+  policy.
 
 ## Test anchors
 

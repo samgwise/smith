@@ -15,9 +15,12 @@ controller**.
   `~/.smith-worker/credential.json`. Tokens are random, stored **hashed**
   (SHA-256) in `~/.smith/workers.json` on the controller. No signing —
   server-side revocation is the property we need.
-- The **worker verifies the controller by its TLS certificate** (the reverse
-  proxy in front of `smith serve`), which also encrypts the traffic — the
-  same deployment shape as linguine's `/v1`.
+- **TLS is built in** (`[serve].tls_cert` + `tls_key`), and the **worker
+  pins the controller's certificate**: enrol with
+  `smith-worker enrol --url https://controller:9240 --cert controller.pem`.
+  The pinned leaf is the worker's sole trust anchor (no CA infrastructure;
+  the operator verifies the PEM out of band) and it is stored in the
+  credential so every later connection stays pinned.
 - Revisit trigger for signed enrolment (PASETO/Ed25519): the controller
   leaving a trusted network boundary.
 

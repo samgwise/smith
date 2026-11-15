@@ -118,9 +118,10 @@ attach over the wire. The pieces:
 - **`smith-protocol`** is the frozen wire contract (`docs/SERVE_PROTOCOL.md`):
   a versioned, sequenced envelope wrapping smith-core's `CoreEvent` plus
   protocol-level events (`status`, `clearance_requested`,
-  `approval_decided`), carried by hand-rolled HTTP/1.1 with SSE streaming.
-  No web framework — the egress sidecar's control API is the house pattern,
-  and the message types (not the transport) are the compatibility surface.
+  `approval_decided`). The controller serves axum on hyper; clients speak
+  reqwest; SSE decoding is eventsource-stream. The message types (not the
+  transport) are the compatibility surface — the migration off the
+  hand-rolled HTTP layer changed no bytes.
 - **`smith-server`** assembles sessions exactly like `smith run` does
   (`ConfigFactory`) behind an injectable `SessionFactory` seam, keeps a
   journal per session (sequence numbers, bounded replay ring, broadcast
@@ -137,10 +138,12 @@ attach over the wire. The pieces:
   RPCs for prompts/decisions). One UI, two topologies — the colocation
   decision stays open by construction.
 
-Security posture of the daemon: loopback bind by default, bearer token in
-`~/.smith/serve-token`, request size caps and read timeouts on the hand-
-rolled parser, and — the point of the exercise — model keys exist only in
-the daemon's environment, so the prompting device holds no secrets.
+Security posture of the daemon: loopback bind by default (a non-loopback
+bind requires TLS or an explicit `allow_plaintext_remote`), bearer token in
+`~/.smith/serve-token` (compared constant-time), connection cap and idle
+timeouts on hyper, per-route body limits, and — the point of the exercise —
+model keys exist only in the daemon's environment, so the prompting device
+holds no secrets.
 
 ## The execution plane: `smith-worker`
 

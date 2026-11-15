@@ -2,12 +2,10 @@
 //! CI issuers) and the `smith serve` controller daemon.
 //!
 //! - [`events`] — envelope and message types (the M13 compatibility freeze).
-//! - [`http`] — hand-rolled HTTP/1.1 plumbing shared by both ends.
-//! - [`client`] — the raw client + SSE envelope stream.
+//! - [`client`] — the reqwest client + SSE envelope stream.
 
 pub mod client;
 pub mod events;
-pub mod http;
 pub mod metrics;
 pub mod workers;
 

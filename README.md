@@ -135,6 +135,9 @@ smith attach
 # Attach to a specific hosted session, or a daemon elsewhere
 smith attach 73bd12a6
 smith attach --url 10.0.0.5:9240 --token <token>
+
+# Remote daemon over TLS: pin the daemon's certificate (out-of-band)
+smith attach --url https://smith.example.com:9240 --cert smith.pem
 ```
 
 What changes in attach mode:
@@ -155,9 +158,18 @@ frozen v1 protocol in [`docs/SERVE_PROTOCOL.md`](docs/SERVE_PROTOCOL.md). A
 live end-to-end check against a running daemon:
 `cargo run -p smith-cli --example serve_smoke`.
 
-Default posture: loopback bind, bearer token in `~/.smith/serve-token`, no
-TLS at this layer (put a reverse proxy in front when the daemon leaves the
-box — the same deployment shape as linguine's `/v1`).
+Default posture: loopback bind, bearer token in `~/.smith/serve-token`.
+For a remote daemon, serve TLS and pin the certificate on the clients:
+
+```toml
+[serve]
+tls_cert = "/etc/smith/serve.pem"   # with tls_key; unlocks remote binds
+allow_plaintext_remote = false       # explicit opt-in to remote plaintext
+max_git_body_mb = 256                # the forge's pack-upload cap
+```
+
+Copy `serve.pem` to clients and pass `--cert` (or `SMITH_SERVE_CERT`);
+the pinned leaf is the client's sole trust anchor.
 
 ## The fleet: `smith-worker`
 
@@ -174,7 +186,8 @@ smith serve
 smith worker issue gpu-box        # → one-time enrolment token
 
 # On a worker host (Linux with podman; Windows works for dev):
-smith-worker enrol --url controller:9240 --token <token> --name gpu-box
+smith-worker enrol --url https://controller:9240 --token <token> --name gpu-box \
+  --cert smith.pem                # pin the controller's certificate
 smith-worker run                  # metrics on 127.0.0.1:9241/metrics
 
 # Anywhere:

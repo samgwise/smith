@@ -462,26 +462,22 @@ async fn main() -> anyhow::Result<()> {
             git_ref,
             orchestrate,
         }) => {
-            attach::run_attach(
-                url.as_deref(),
-                token.as_deref(),
-                cert.as_deref(),
-                id.as_deref(),
-                worker.as_deref(),
-                repo.as_deref(),
-                git_ref.as_deref(),
+            attach::run_attach(attach::AttachOpts {
+                url: url.as_deref(),
+                token: token.as_deref(),
+                cert: cert.as_deref(),
+                id: id.as_deref(),
+                worker: worker.as_deref(),
+                repo: repo.as_deref(),
+                git_ref: git_ref.as_deref(),
                 orchestrate,
-            )
+            })
             .await?;
         }
         Some(Command::Worker { cmd }) => match cmd {
-            WorkerCmd::Issue { name } => {
-                attach::worker_issue(None, None, None, &name).await?
-            }
+            WorkerCmd::Issue { name } => attach::worker_issue(None, None, None, &name).await?,
             WorkerCmd::List => attach::workers_list(None, None, None).await?,
-            WorkerCmd::Revoke { name } => {
-                attach::worker_revoke(None, None, None, &name).await?
-            }
+            WorkerCmd::Revoke { name } => attach::worker_revoke(None, None, None, &name).await?,
         },
         Some(Command::Sessions) => {
             for (path, meta) in smith_core::list_sessions()? {

@@ -77,11 +77,18 @@ impl ServeClient {
     /// Client for an explicit host and port (plain HTTP — the legacy shape).
     /// Also accepts a host that already carries an `http(s)://` scheme.
     pub fn new(host: &str, port: u16, token: String) -> Self {
-        let (tls, host, _) = parse_serve_url(host)
-            .unwrap_or((false, host.trim_matches(|c| c == '[' || c == ']').to_string(), port));
+        let (tls, host, _) = parse_serve_url(host).unwrap_or((
+            false,
+            host.trim_matches(|c| c == '[' || c == ']').to_string(),
+            port,
+        ));
         let _ = port;
-        Self::from_target(&format!("{}://{host}:{port}", if tls { "https" } else { "http" }), token, None)
-            .expect("reqwest client initialisation")
+        Self::from_target(
+            &format!("{}://{host}:{port}", if tls { "https" } else { "http" }),
+            token,
+            None,
+        )
+        .expect("reqwest client initialisation")
     }
 
     /// Client for a full target with optional certificate pinning: when
@@ -94,12 +101,10 @@ impl ServeClient {
     ) -> anyhow::Result<Self> {
         let (tls, host, port) = parse_serve_url(target)?;
         let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
-        if tls && ca_cert_pem.is_some() {
+        if let Some(pem) = ca_cert_pem.filter(|_| tls) {
             builder = builder
                 .tls_built_in_root_certs(false)
-                .add_root_certificate(reqwest::Certificate::from_pem(
-                    ca_cert_pem.expect("pinned checked").as_bytes(),
-                )?);
+                .add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes())?);
         }
         Ok(Self {
             base_url: format!("{}://{host}:{port}", if tls { "https" } else { "http" }),
@@ -159,9 +164,14 @@ impl ServeClient {
             .bearer_auth(&self.token)
             .timeout(budget);
         if let Some(b) = body {
-            req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(b.to_string());
+            req = req
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(b.to_string());
         }
-        let response = req.send().await.with_context(|| format!("connecting to {url}"))?;
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("connecting to {url}"))?;
         let status = response.status();
         let text = response
             .text()
@@ -368,7 +378,9 @@ impl ServeClient {
             "event stream returned {}",
             status.as_u16()
         );
-        Ok(EventStream::new(Box::pin(response.bytes_stream().eventsource())))
+        Ok(EventStream::new(Box::pin(
+            response.bytes_stream().eventsource(),
+        )))
     }
 
     /// POST a body to an arbitrary path (worker mesh routes), requiring
@@ -521,21 +533,20 @@ pub fn decision_word(decision: smith_core::ApprovalDecision) -> &'static str {
 /// Connection-refused style errors mean the daemon is not running; surface
 /// that hint once rather than a raw socket error.
 pub fn is_connection_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| {
-            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-                matches!(
-                    io.kind(),
-                    std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::NotFound
-                )
-            } else if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
-                re.is_connect() || re.is_timeout()
-            } else {
-                false
-            }
-        })
+    err.chain().any(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotFound
+            )
+        } else if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
+            re.is_connect() || re.is_timeout()
+        } else {
+            false
+        }
+    })
 }
 
 #[cfg(test)]
@@ -575,7 +586,11 @@ mod tests {
         );
         assert_eq!(
             parse_serve_url("https://smith.example.com").unwrap(),
-            (true, "smith.example.com".into(), crate::events::DEFAULT_SERVE_PORT)
+            (
+                true,
+                "smith.example.com".into(),
+                crate::events::DEFAULT_SERVE_PORT
+            )
         );
         // IPv6 literals (S-25).
         assert_eq!(

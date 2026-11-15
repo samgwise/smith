@@ -7,7 +7,7 @@ How to use this file:
 - Keep IDs stable. Add new items at the end of their section rather than renumbering.
 - Each item ends with its migration phase (see the migration plan) or "Independent" when it's fixed separately.
 
-Status: 0 of 44 closed.
+Status: 8 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation half remains.
 
 ## High
 
@@ -23,22 +23,22 @@ Status: 0 of 44 closed.
   - Fix: scope the helper to the configured origin with git's `credential.<URL>.helper`. Validate `repo` and `ref`, and put `--` before user-supplied URLs and refs.
   - Verify: a local server that answers every request with 401 must receive no token during a clone.
 
-- [ ] **S-03 · Request bodies buffered before auth, and unbounded framing reads** (new api done, Phases 1-2; closes at the Phase 4 cutover; the git-route half is Phase 4)
-  - Where: `crates/smith-server/src/http.rs:70` (body read before auth at `:78`), `crates/smith-protocol/src/http.rs:236-268` (line reads grow without a bound before the cap check), `:214-219` (trailer lines uncounted), `:221-225` (unchecked `body.len() + size`), `:19` (256 MiB git cap, applied pre-auth)
-  - Problem: an unauthenticated client can make the daemon buffer up to 256 MiB per connection, or grow memory without limit through chunk-size lines and trailers. The size arithmetic can wrap in release builds.
-  - Fix: authenticate in middleware before any body is read, and let hyper handle framing with its own limits.
-  - Verify: `s03_unauthenticated_body_is_not_read` in `crates/smith-server/tests/api_integration.rs` (green as of Phase 2 — a 401 arrives within 3 s for a declared 256 MiB body that never arrives; the legacy loop is fixed by the same code at the cutover).
+- [x] **S-03 · Request bodies buffered before auth, and unbounded framing reads** (fixed; the legacy HTTP layer was deleted at the Phase 6 cutover)
+  - Where: was `crates/smith-server/src/http.rs:70` and `crates/smith-protocol/src/http.rs` (deleted)
+  - Problem: an unauthenticated client could make the daemon buffer up to 256 MiB per connection, or grow memory without limit through chunk-size lines and trailers.
+  - Fix: authenticate in middleware before any body is read; hyper handles framing with its own limits.
+  - Verify: `s03_unauthenticated_body_is_not_read` in `crates/smith-server/tests/api_integration.rs`.
 
-- [ ] **S-04 · No connection cap and no request deadline** (fixed in the new api, Phase 1; closes at the Phase 4 cutover while the legacy loop still serves)
-  - Where: `crates/smith-server/src/http.rs:38-53` (one task per connection, no limit), `crates/smith-protocol/src/http.rs:22` (timeouts apply per read, not per request)
-  - Problem: any number of connections can be opened, and each can stall by sending bytes just often enough to beat the per-read timeout.
-  - Fix: a connection semaphore, hyper's header-read timeout, and a per-frame upload timeout (tower-http `RequestBodyTimeoutLayer`). Phase 0 finding: hyper's header timeout also closes idle keep-alive connections, so no separate idle knob is needed.
-  - Verify: `s04_idle_connection_is_bounded_and_cap_refuses_extras` in `crates/smith-server/tests/serve_integration.rs` and the api tests in `crates/smith-server/tests/api_integration.rs` (green as of Phase 1, against the new server; the legacy loop the daemon still runs is fixed by the same code at the cutover).
+- [x] **S-04 · No connection cap and no request deadline** (fixed at the Phase 6 cutover)
+  - Where: was `crates/smith-server/src/http.rs:38-53` (deleted)
+  - Problem: any number of connections could be opened, and each could stall indefinitely.
+  - Fix: a connection semaphore, hyper's header-read timeout (which also bounds idle keep-alive), and a per-frame idle timeout on git uploads.
+  - Verify: `s04_idle_connection_is_bounded_and_cap_refuses_extras` in `crates/smith-server/tests/serve_integration.rs` and `connection_cap_closes_extra_connections` / `idle_connections_close_within_the_header_timeout` in `crates/smith-server/tests/api_integration.rs`.
 
-- [ ] **S-05 · Plaintext transport; TLS verification documented but not built** (server + clients built, Phases 1 and 5; the production daemon still serves the legacy loop until the Phase 6 cutover)
-  - Where: the legacy `crates/smith-protocol/src/client.rs` (rewritten on reqwest/rustls in Phase 5), `crates/smith-worker/src/main.rs` (the credential carries the pinned cert), `docs/WORKER_MESH.md:18-20`, `crates/smith-server/src/config.rs`
+- [x] **S-05 · Plaintext transport; TLS verification documented but not built** (fixed at the Phase 6 cutover)
+  - Where: `crates/smith-server/src/api.rs` (tokio-rustls server), `crates/smith-protocol/src/client.rs` (reqwest/rustls client with pinning), `crates/smith-worker/src/main.rs` (the credential carries the pinned cert)
   - Problem: enrolment tokens, worker credentials, per-session forge tokens, and command streams crossed the network in cleartext, and the documented TLS verification was never built.
-  - Fix: TLS on the api server (tokio-rustls/ring); reqwest clients with scheme-aware targets (`https://` selects TLS) and certificate pinning — the controller's PEM is the sole trust anchor (`--cert` / `SMITH_SERVE_CERT` for the CLI, `--cert` at worker enrolment, stored in the credential). Non-loopback binds need TLS or an explicit `allow_plaintext_remote` (Phase 1).
+  - Fix: TLS on the api server (tokio-rustls/ring); reqwest clients with scheme-aware targets (`https://` selects TLS) and certificate pinning — the controller's PEM is the sole trust anchor (`--cert` / `SMITH_SERVE_CERT` for the CLI, `--cert` at worker enrolment, stored in the credential). Non-loopback binds need TLS or an explicit `allow_plaintext_remote`.
   - Verify: `serve_client_over_pinned_tls` in `crates/smith-server/tests/api_integration.rs` (health and SSE over a pinned self-signed cert; a mismatched pin is refused).
 
 - [ ] **S-06 · Agent can write files that run on the host, without approval** (Independent)
@@ -116,23 +116,23 @@ Status: 0 of 44 closed.
   - Fix: restrict workspaces to configured roots, and refuse any ancestor of the home directory.
   - Verify: `C:\Users` is refused as a workspace.
 
-- [ ] **C-01 · Worker results above 1 MiB are silently dropped** (op-result fixed in the new api, Phase 2; the worker-side caps are S-13; closes at cutover)
-  - Where: `crates/smith-protocol/src/http.rs:17` (1 MiB default), `crates/smith-server/src/http.rs:65-69` (applies it to `/v1/worker/op-result`), `crates/smith-worker/src/main.rs:627-637` (failed posts are ignored), `crates/smith-sandbox/src/lib.rs:628-640` (no output cap)
-  - Problem: a command or `read_file` result larger than 1 MiB is rejected with the connection dropped, so the controller waits for the 300 s operation timeout.
-  - Fix: cap results on the worker (S-13, decision D-6) and set the op-result limit above that cap (done: 32 MiB on the api route). Log failed posts (Phase 5, with the reqwest client).
-  - Verify: `worker_flow_and_two_mib_op_result` in `crates/smith-server/tests/api_integration.rs` (green as of Phase 2 — a 2 MiB op-result is accepted).
+- [x] **C-01 · Worker results above 1 MiB are silently dropped** (fixed at the Phase 6 cutover; the worker-side output caps are S-13)
+  - Where: was the 1 MiB cap on `/v1/worker/op-result` in the legacy HTTP layer
+  - Problem: a command or `read_file` result larger than 1 MiB was rejected with the connection dropped, so the controller waited for the 300 s operation timeout.
+  - Fix: the op-result route cap is 32 MiB (D-6) and failed controller posts are logged by the worker.
+  - Verify: `worker_flow_and_two_mib_op_result` in `crates/smith-server/tests/api_integration.rs` (a 2 MiB op-result is accepted).
 
-- [ ] **C-02 · Git clients' gzip-compressed requests fail** (fixed in the new api, Phase 4; closes at cutover)
-  - Where: `crates/smith-protocol/src/http.rs:155-186` (only `Transfer-Encoding` and `Content-Length` are read), `crates/smith-server/src/http.rs:627` (raw body passed to `upload-pack`)
-  - Problem: git gzips RPC request bodies above 1024 bytes (`remote-curl.c:1008`), and `http-backend` inflates them (`http-backend.c:477-485`). Clones or fetches with many refs fail. REPRODUCED 15 November 2026 by `red_c02_gzipped_upload_pack_request_is_decoded` in `crates/smith-server/tests/serve_integration.rs`: a gzipped upload-pack request returns 500 with `bad line length character`.
-  - Fix: the api streams gzipped bodies raw to `git http-backend` with `HTTP_CONTENT_ENCODING` set and no `CONTENT_LENGTH` — git inflates to EOF (`inflate_request`).
-  - Verify: `red_c02_gzipped_upload_pack_request_is_decoded` (green) and `clone_with_many_branches_goes_through_gzip` (a real 31-ref clone, gzipped by git) in `crates/smith-server/tests/serve_integration.rs`.
+- [x] **C-02 · Git clients' gzip-compressed requests fail** (fixed at the Phase 6 cutover; git http-backend inflates gzip request bodies)
+  - Where: was `crates/smith-protocol/src/http.rs:155-186` and `crates/smith-server/src/http.rs:627` (deleted)
+  - Problem: git gzips RPC request bodies above 1024 bytes (`remote-curl.c:1008`), and the old forge passed them through un-decoded — upload-pack failed with `bad line length character`.
+  - Fix: git http-backend inflates gzip request bodies (`HTTP_CONTENT_ENCODING`); the api streams bodies to it raw.
+  - Verify: `red_c02_gzipped_upload_pack_request_is_decoded` and `clone_with_many_branches_goes_through_gzip` in `crates/smith-server/tests/serve_integration.rs`.
 
 ## Low
 
-- [ ] **S-18 · Non-constant-time token comparisons** (new api done in Phase 1; legacy server and sidecar at cutover / Independent)
-  - Where: `crates/smith-server/src/http.rs:78` and `:453`, `crates/smith-egress/src/bin/smith-egress-proxy.rs:217-222`
-  - Fix: compare hashes with `subtle::ConstantTimeEq`. Done in `crates/smith-server/src/api.rs` (`tokens_match`, SHA-256 digests compared constant time); the legacy loop and the egress sidecar keep their direct comparisons until cutover / their own fix.
+- [ ] **S-18 · Non-constant-time token comparisons** (server side fixed at the cutover; the egress sidecar remains)
+  - Where: `crates/smith-egress/src/bin/smith-egress-proxy.rs:217-222`
+  - Fix: compare hashes with `subtle::ConstantTimeEq`. Done for the serve api in `crates/smith-server/src/api.rs` (`tokens_match`, SHA-256 digests compared constant time); the egress sidecar still compares directly.
   - Verify: no `==` comparisons on secret values remain.
 
 - [ ] **S-19 · Fleet registry resets silently on a corrupt file; enrolment tokens never expire** (Independent)
@@ -152,8 +152,8 @@ Status: 0 of 44 closed.
   - Fix: timeouts on each step, plus a turn-level timeout.
   - Verify: a hung MCP server fails session start after the timeout.
 
-- [ ] **S-22 · Unbounded buffers** (Independent; `ChunkedReader` is removed in Phases 5 and 6)
-  - Where: `crates/smith-providers/src/stream.rs:8-37`, `crates/smith-protocol/src/http.rs:439-513`, `crates/smith-core/src/instructions.rs:11-21`
+- [ ] **S-22 · Unbounded buffers** (the `ChunkedReader` half was removed with the legacy transport; provider lines and `AGENTS.md` remain)
+  - Where: `crates/smith-providers/src/stream.rs:8-37`, `crates/smith-core/src/instructions.rs:11-21`
   - Problem: a line without a newline, or a very large `AGENTS.md`, grows memory or the prompt without limit.
   - Fix: caps on line length and instruction size, with a notice when truncated.
   - Verify: a 10 MB line without a newline is rejected.
@@ -163,10 +163,10 @@ Status: 0 of 44 closed.
   - Fix: parse the authority properly, and cap pending requests.
   - Verify: `http://host:8080/path` connects to port 8080.
 
-- [ ] **S-24 · Error JSON built by string formatting; panicking byte slices** (new api done, Phases 1-2; git errors at Phase 4; closes at cutover)
-  - Where: `crates/smith-server/src/http.rs` (`git_service_info` and `git_rpc` build JSON with `format!` and `.replace('"', "'")`, which also leaks git stderr), `:424` (`commit[..12]` on worker input)
-  - Fix: `serde_json` for every error body, and `get(..n)` for slices. Done in `crates/smith-server/src/api.rs` (`error_response`/`json_response`, and the checkpoint notice slices with `get(..n)`).
-  - Verify: a git error containing quotes or backslashes produces valid JSON (Phase 4).
+- [x] **S-24 · Error JSON built by string formatting; panicking byte slices** (fixed at the Phase 6 cutover)
+  - Where: was `crates/smith-server/src/http.rs` (git errors built with `format!` and `.replace('"', "'")`, which also leaked git stderr) and `:424` (`commit[..12]` on worker input)
+  - Fix: every error body is serde-built (`error_response`/`json_response` in `crates/smith-server/src/api.rs`), and slices use `get(..n)`.
+  - Verify: `cargo clippy --workspace --all-targets -- -D warnings` passes; the git error path returns serde-built JSON.
 
 - [x] **S-25 · Worker and client URL parsing breaks IPv6 literals** (fixed, Phase 5)
   - Where: `crates/smith-protocol/src/client.rs` (`parse_serve_url`, shared by `ServeClient` and the worker)
@@ -227,7 +227,7 @@ Status: 0 of 44 closed.
 ## Documentation to correct
 
 - [ ] **D-01 · Home and sensitive path refusal is overstated** (see S-17). `README.md:28-29`
-- [ ] **D-02 · TLS verification is described but not built** (see S-05). `docs/WORKER_MESH.md:18-20`. Phase 6.
+- [x] **D-02 · TLS verification is described but not built** (see S-05; built and documented in WORKER_MESH.md at the Phase 6 cutover).
 - [ ] **D-03 · "Only the proxy and gateway DNS may leave the bridge"** (see S-08). `README.md:52-59`
 - [ ] **D-04 · Risky commands always re-prompt; "always" binds to the exact command** (see S-11). `README.md:32-37`
 - [ ] **D-05 · "Nothing is pushed without opting in"**. The merge gate pushes `smith/integration/<parent>` on every pass (`crates/smith-worker/src/main.rs:527-569`), which `docs/WORKER_MESH.md:72-74` describes. `README.md:196-198`

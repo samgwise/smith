@@ -314,7 +314,7 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                 }
             };
             let cred = state.credential.lock().await.clone();
-            let _ = controller_client(&cred)
+            if let Err(e) = controller_client(&cred)
                 .post_body(
                     "/v1/worker/op-result",
                     serde_json::to_string(&smith_protocol::OpResultRequest {
@@ -324,7 +324,10 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                     })
                     .unwrap_or_else(|_| "{\"result\":\"failed\"}".into()),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("controller post failed: {e:#}");
+            }
         }
         WorkerCommand::Exec {
             session_id,
@@ -360,7 +363,7 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                 }
             };
             let cred = state.credential.lock().await.clone();
-            let _ = controller_client(&cred)
+            if let Err(e) = controller_client(&cred)
                 .post_body(
                     "/v1/worker/op-result",
                     serde_json::to_string(&smith_protocol::OpResultRequest {
@@ -370,7 +373,10 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                     })
                     .unwrap_or_else(|_| "{\"result\":\"failed\"}".into()),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("controller post failed: {e:#}");
+            }
         }
         WorkerCommand::PushBranch {
             session_id,
@@ -403,7 +409,7 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                 },
             };
             let cred = state.credential.lock().await.clone();
-            let _ = controller_client(&cred)
+            if let Err(e) = controller_client(&cred)
                 .post_body(
                     "/v1/worker/op-result",
                     serde_json::to_string(&smith_protocol::OpResultRequest {
@@ -413,7 +419,10 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                     })
                     .unwrap_or_else(|_| "{\"result\":\"failed\"}".into()),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("controller post failed: {e:#}");
+            }
         }
         WorkerCommand::Checkpoint { session_id } => {
             let record = state
@@ -440,7 +449,7 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                 }
             };
             let cred = state.credential.lock().await.clone();
-            let _ = controller_client(&cred)
+            if let Err(e) = controller_client(&cred)
                 .post_body(
                     "/v1/worker/checkpoint",
                     serde_json::to_string(&CheckpointRequest {
@@ -450,7 +459,10 @@ async fn handle_command(state: Arc<WorkerState>, cmd: WorkerCommand) {
                     })
                     .unwrap_or_else(|_| "{\"error\":true}".into()),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("controller post failed: {e:#}");
+            }
         }
     }
 }
@@ -634,7 +646,7 @@ async fn execute_op(state: &Arc<WorkerState>, session_id: &str, exec_id: &str, o
         },
     };
     let cred = state.credential.lock().await.clone();
-    let _ = controller_client(&cred)
+    if let Err(e) = controller_client(&cred)
         .post_body(
             "/v1/worker/op-result",
             serde_json::to_string(&smith_protocol::OpResultRequest {
@@ -644,7 +656,10 @@ async fn execute_op(state: &Arc<WorkerState>, session_id: &str, exec_id: &str, o
             })
             .unwrap_or_else(|_| "{\"result\":\"failed\"}".into()),
         )
-        .await;
+        .await
+    {
+        tracing::warn!("controller post failed: {e:#}");
+    }
 }
 
 async fn run_op(
@@ -683,7 +698,7 @@ async fn run_op(
                     kind,
                 };
                 let cred = event_state.credential.lock().await.clone();
-                let _ = controller_client(&cred)
+                if let Err(e) = controller_client(&cred)
                     .post_body(
                         "/v1/worker/exec-events",
                         serde_json::to_string(&ExecEventsRequest {
@@ -695,7 +710,10 @@ async fn run_op(
                         })
                         .expect("exec event json"),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!("controller post failed: {e:#}");
+                }
                 while let Some((is_stderr, text)) = rx.recv().await {
                     let ev = next(
                         &pump_session_id,
@@ -707,13 +725,16 @@ async fn run_op(
                         },
                     );
                     let cred = event_state.credential.lock().await.clone();
-                    let _ = controller_client(&cred)
+                    if let Err(e) = controller_client(&cred)
                         .post_body(
                             "/v1/worker/exec-events",
                             serde_json::to_string(&ExecEventsRequest { events: vec![ev] })
                                 .expect("exec event json"),
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!("controller post failed: {e:#}");
+                    }
                 }
             });
 
@@ -748,7 +769,7 @@ async fn run_op(
                 },
             };
             let cred = state.credential.lock().await.clone();
-            let _ = controller_client(&cred)
+            if let Err(e) = controller_client(&cred)
                 .post_body(
                     "/v1/worker/exec-events",
                     serde_json::to_string(&ExecEventsRequest {
@@ -756,7 +777,10 @@ async fn run_op(
                     })
                     .unwrap_or_else(|_| "{\"events\":[]}".into()),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("controller post failed: {e:#}");
+            }
             let outcome = outcome?;
             Ok(OpResult::ExecShell(smith_protocol::ExecResultDto {
                 exit_code: outcome.exit_code,
@@ -867,7 +891,8 @@ async fn heartbeat_loop(state: Arc<WorkerState>) {
     }
 }
 
-/// Loopback metrics endpoint (`/metrics`).
+/// Loopback metrics endpoint (`/metrics`). One GET per connection, no auth
+/// (loopback only) — the smallest possible HTTP surface.
 async fn metrics_server(port: u16, state: Arc<WorkerState>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -877,12 +902,34 @@ async fn metrics_server(port: u16, state: Arc<WorkerState>) -> anyhow::Result<()
         let (mut stream, _) = listener.accept().await?;
         let metrics = state.metrics.clone();
         tokio::spawn(async move {
-            let Ok(req) = smith_protocol::http::read_request(&mut stream).await else {
-                return;
-            };
-            let _ = req; // no auth: loopback only
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            // Drain the request head (bounded); the method and path are not
+            // interesting — this port serves one endpoint.
+            let mut head: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                {
+                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => return,
+                    Ok(Ok(n)) => n,
+                };
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if head.len() > 16 * 1024 {
+                    return; // absurd head: drop the connection
+                }
+            }
             let text = metrics.render();
-            let _ = smith_protocol::http::write_plain_text(&mut stream, &text).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
         });
     }
 }

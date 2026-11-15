@@ -43,31 +43,36 @@ pub fn resolve_client(
     ServeClient::from_target(&url, token, cert_pem)
 }
 
+/// The attach flow's options (from the CLI flags).
+pub struct AttachOpts<'a> {
+    pub url: Option<&'a str>,
+    pub token: Option<&'a str>,
+    /// PEM file pinning the daemon's certificate (https targets).
+    pub cert: Option<&'a str>,
+    /// Session id (or unique prefix); newest for this workspace when None.
+    pub id: Option<&'a str>,
+    pub worker: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub git_ref: Option<&'a str>,
+    pub orchestrate: bool,
+}
+
 /// Run the attach flow: health check, find-or-create the session, then the
 /// TUI over a `RemoteLink`. Worker-mode flags (`--worker/--repo/--ref`)
 /// lease a fleet worker for the session.
-pub async fn run_attach(
-    url: Option<&str>,
-    token: Option<&str>,
-    cert: Option<&str>,
-    id: Option<&str>,
-    worker: Option<&str>,
-    repo: Option<&str>,
-    git_ref: Option<&str>,
-    orchestrate: bool,
-) -> anyhow::Result<()> {
-    let client = resolve_client(url, token, cert)?;
+pub async fn run_attach(opts: AttachOpts<'_>) -> anyhow::Result<()> {
+    let client = resolve_client(opts.url, opts.token, opts.cert)?;
     client
         .health()
         .await
         .context("daemon unreachable — is `smith serve` running?")?;
-    let worker_mode = worker.is_some() || repo.is_some();
+    let worker_mode = opts.worker.is_some() || opts.repo.is_some();
 
     let cwd = std::env::current_dir().context("cannot resolve working directory")?;
     let canon = dunce::canonicalize(&cwd)?;
     let identity = workspace_identity(&canon);
 
-    let session_id = match id {
+    let session_id = match opts.id {
         Some(prefix) => {
             let sessions = client.sessions().await?;
             let matches: Vec<_> = sessions
@@ -94,7 +99,7 @@ pub async fn run_attach(
                 _ => {
                     println!(
                         "starting a session for {} ...",
-                        repo.unwrap_or(&canon.display().to_string())
+                        opts.repo.unwrap_or(&canon.display().to_string())
                     );
                     client
                         .create_session_req(&smith_protocol::CreateSession {
@@ -102,10 +107,10 @@ pub async fn run_attach(
                             provider: None,
                             model: None,
                             approval_mode: smith_protocol::ApprovalMode::Ask,
-                            worker: worker.map(str::to_string),
-                            repo: repo.map(str::to_string),
-                            git_ref: git_ref.map(str::to_string),
-                            orchestrate,
+                            worker: opts.worker.map(str::to_string),
+                            repo: opts.repo.map(str::to_string),
+                            git_ref: opts.git_ref.map(str::to_string),
+                            orchestrate: opts.orchestrate,
                         })
                         .await?
                 }
@@ -215,11 +220,7 @@ mod tests {
         );
         assert_eq!(
             smith_protocol::parse_serve_url("gpu-box").unwrap(),
-            (
-                false,
-                "gpu-box".into(),
-                smith_protocol::DEFAULT_SERVE_PORT
-            )
+            (false, "gpu-box".into(), smith_protocol::DEFAULT_SERVE_PORT)
         );
         assert_eq!(
             smith_protocol::parse_serve_url("localhost:9999").unwrap(),

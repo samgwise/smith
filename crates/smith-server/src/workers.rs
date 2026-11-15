@@ -3,8 +3,8 @@
 //!
 //! Trust model (the linguine split): the controller **mints access keys**
 //! (opaque random tokens, stored hashed, revocable); workers verify the
-//! controller by its TLS certificate (the reverse proxy in front of
-//! `smith serve`), which also encrypts the traffic. No signing.
+//! controller by its TLS certificate — served by the api and pinned at
+//! enrolment with `--cert` — which also encrypts the traffic. No signing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

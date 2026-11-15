@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use tokio::io::AsyncReadExt as _;
 
 use smith_core::{Agent, ApprovalDecision, ApprovalGate, LlmProvider};
@@ -18,14 +19,40 @@ use tempfile::TempDir;
 
 const TOKEN: &str = "test-token";
 
-/// Deterministic api server options: no comment heartbeats, so byte-level
-/// assertions never race a keep-alive. (The dedicated heartbeat test turns
-/// them on deliberately.)
-fn api_options() -> smith_server::api::ApiOptions {
-    smith_server::api::ApiOptions {
-        sse_heartbeat: None,
-        ..Default::default()
-    }
+/// Minimal raw request (one per connection), generic over the transport so
+/// it works over TLS streams too. Returns (status, body).
+async fn raw_request<S>(
+    stream: &mut S,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&str>,
+) -> anyhow::Result<(u16, String)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let auth = format!("Authorization: Bearer {token}\r\n");
+    let length = body
+        .map(|b| format!("Content-Length: {}\r\n", b.len()))
+        .unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}{length}Connection: close\r\n\r\n{}",
+        body.unwrap_or("")
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status: u16 = text
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .context("malformed HTTP response")?;
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Ok((status, body))
 }
 
 // ---- fakes (a scripted provider so turns complete) ---------------------
@@ -44,7 +71,8 @@ impl smith_server::SessionFactory for ScriptedFactory {
         gate: Arc<dyn ApprovalGate>,
     ) -> anyhow::Result<smith_server::SessionParts> {
         use smith_core::testing::{RecordingExecutor, ScriptedProvider};
-        let provider_impl: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(self.script.clone()));
+        let provider_impl: Arc<dyn LlmProvider> =
+            Arc::new(ScriptedProvider::new(self.script.clone()));
         let executor = Arc::new(RecordingExecutor::new());
         let agent = Agent::new(
             provider_impl,
@@ -81,9 +109,15 @@ impl smith_server::SessionFactory for ScriptedFactory {
 
 // ---- harness -----------------------------------------------------------
 
-fn api_controller(ws: &std::path::Path, script: Vec<smith_core::testing::MockResponse>) -> Arc<smith_server::Controller> {
+fn api_controller(
+    ws: &std::path::Path,
+    script: Vec<smith_core::testing::MockResponse>,
+) -> Arc<smith_server::Controller> {
     let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-    let fleet = Arc::new(smith_server::Fleet::new(ws.join("workers.json"), metrics.clone()));
+    let fleet = Arc::new(smith_server::Fleet::new(
+        ws.join("workers.json"),
+        metrics.clone(),
+    ));
     smith_server::Controller::with_parts(
         Arc::new(ScriptedFactory { script }),
         Duration::from_secs(60),
@@ -144,10 +178,15 @@ async fn connection_cap_closes_extra_connections() {
     // Four connections fill the cap; the fifth must be closed at once.
     let mut conns = Vec::new();
     for _ in 0..5 {
-        conns.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        conns.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
     }
     let mut probe = Vec::new();
-    let closed = tokio::time::timeout(Duration::from_secs(5), conns[4].read_to_end(&mut probe)).await;
+    let closed =
+        tokio::time::timeout(Duration::from_secs(5), conns[4].read_to_end(&mut probe)).await;
     assert!(
         matches!(closed, Ok(Ok(0))),
         "a connection beyond the cap stayed open — the semaphore is not enforced"
@@ -168,7 +207,9 @@ async fn idle_connections_close_within_the_header_timeout() {
     .await;
 
     // (a) A client that never sends a head.
-    let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let mut buf = Vec::new();
     let closed = tokio::time::timeout(Duration::from_secs(5), silent.read_to_end(&mut buf)).await;
     assert!(
@@ -177,11 +218,15 @@ async fn idle_connections_close_within_the_header_timeout() {
     );
 
     // (b) A keep-alive connection idle after one completed request.
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    use tokio::io::AsyncWriteExt;
-    s.write_all(b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n")
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
+    use tokio::io::AsyncWriteExt;
+    s.write_all(
+        b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n",
+    )
+    .await
+    .unwrap();
     // Read the complete content-length-framed response.
     let mut resp: Vec<u8> = Vec::new();
     loop {
@@ -236,10 +281,15 @@ async fn tls_serves_health_with_a_pinned_certificate() {
     let pinned = pinned_client(cert.cert.pem().as_bytes()).unwrap();
     let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
     let mut stream = pinned
-        .connect(name, tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap())
+        .connect(
+            name,
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        )
         .await
         .expect("TLS handshake with the pinned leaf");
-    let (status, body) = smith_protocol::http::raw_request(&mut stream, "GET", "/v1/health", TOKEN, None)
+    let (status, body) = raw_request(&mut stream, "GET", "/v1/health", TOKEN, None)
         .await
         .expect("health over TLS");
     assert_eq!(status, 200, "{body}");
@@ -248,7 +298,9 @@ async fn tls_serves_health_with_a_pinned_certificate() {
     // A client pinning a DIFFERENT certificate: refused.
     let decoy = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let wrong = pinned_client(decoy.cert.pem().as_bytes()).unwrap();
-    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
     let refused = wrong.connect(name, stream).await.is_err();
     assert!(refused, "a mismatched certificate pin must be refused");
@@ -304,8 +356,8 @@ async fn serve_client_over_pinned_tls() {
 }
 
 fn pinned_client(pem: &[u8]) -> anyhow::Result<tokio_rustls::TlsConnector> {
-    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from_pem_slice(pem)?)?;
@@ -326,7 +378,11 @@ async fn auth_matrix_routes_by_group() {
     let (port, _ws, controller) = api_harness(Default::default(), vec![]).await;
 
     // A live worker credential for the worker rows.
-    let enrolment = controller.fleet.registry.issue_enrolment("matrix-worker").unwrap();
+    let enrolment = controller
+        .fleet
+        .registry
+        .issue_enrolment("matrix-worker")
+        .unwrap();
     let (_wid, worker_token) = controller
         .fleet
         .registry
@@ -368,10 +424,28 @@ async fn auth_matrix_routes_by_group() {
         ("GET", "/v1/metrics", None, daemon, 200),
         ("GET", "/v1/metrics", None, worker, 401),
         // worker group
-        ("POST", "/v1/worker/heartbeat", Some(heartbeat.clone()), worker, 200),
-        ("POST", "/v1/worker/heartbeat", Some(heartbeat.clone()), daemon, 401),
+        (
+            "POST",
+            "/v1/worker/heartbeat",
+            Some(heartbeat.clone()),
+            worker,
+            200,
+        ),
+        (
+            "POST",
+            "/v1/worker/heartbeat",
+            Some(heartbeat.clone()),
+            daemon,
+            401,
+        ),
         ("POST", "/v1/worker/heartbeat", Some(heartbeat), none, 401),
-        ("POST", "/v1/worker/op-result", Some(op_result.clone()), worker, 200),
+        (
+            "POST",
+            "/v1/worker/op-result",
+            Some(op_result.clone()),
+            worker,
+            200,
+        ),
         ("POST", "/v1/worker/op-result", Some(op_result), none, 401),
         // enrol is OPEN: no bearer is fine; the body token decides (403 for a
         // bogus one) — the point is that this is never a bearer 401.
@@ -382,11 +456,16 @@ async fn auth_matrix_routes_by_group() {
     ];
 
     for (method, path, body, token, expected) in rows {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let (status, resp) = smith_protocol::http::raw_request(&mut stream, method, path, token, body.as_deref())
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (status, resp) = raw_request(&mut stream, method, path, token, body.as_deref())
             .await
             .unwrap_or_else(|e| panic!("{method} {path} (token {token:?}) transport error: {e}"));
-        assert_eq!(status, *expected, "{method} {path} (token {token:?}): {resp}");
+        assert_eq!(
+            status, *expected,
+            "{method} {path} (token {token:?}): {resp}"
+        );
     }
 }
 
@@ -399,7 +478,11 @@ async fn oversized_bodies_get_413() {
 
     // A heartbeat (64 KiB cap) carrying a 100 KiB name. Worker credential:
     // the daemon token is 401 on this route before the limit applies.
-    let enrolment = controller.fleet.registry.issue_enrolment("limit-worker").unwrap();
+    let enrolment = controller
+        .fleet
+        .registry
+        .issue_enrolment("limit-worker")
+        .unwrap();
     let (_wid, worker_token) = controller
         .fleet
         .registry
@@ -440,7 +523,11 @@ async fn session_flow_over_the_api() {
     use smith_core::testing::{MockResponse, tool_named};
     let script = vec![MockResponse {
         text: "done".into(),
-        calls: vec![tool_named("c1", "list_dir", serde_json::json!({ "path": "." }))],
+        calls: vec![tool_named(
+            "c1",
+            "list_dir",
+            serde_json::json!({ "path": "." }),
+        )],
     }];
     let (port, ws, _c) = api_harness(Default::default(), script).await;
     let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
@@ -558,7 +645,10 @@ async fn worker_flow_and_two_mib_op_result() {
 
     // The registry lists the worker.
     let workers = daemon_client.workers().await.unwrap();
-    assert!(workers.iter().any(|w| w.name == "api-worker"), "{workers:?}");
+    assert!(
+        workers.iter().any(|w| w.name == "api-worker"),
+        "{workers:?}"
+    );
 }
 
 /// GREEN (S-03, Phase 2): an unauthenticated request is refused before its
@@ -568,7 +658,9 @@ async fn worker_flow_and_two_mib_op_result() {
 async fn s03_unauthenticated_body_is_not_read() {
     let (port, _ws, _c) = api_harness(Default::default(), vec![]).await;
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let head = "POST /v1/sessions HTTP/1.1\r\n\
                 Host: localhost\r\n\
                 Authorization: Bearer wrong\r\n\
@@ -593,93 +685,9 @@ async fn s03_unauthenticated_body_is_not_read() {
 }
 
 // ---- Phase 3 (SSE) -----------------------------------------------------
-
-use smith_protocol::Envelope;
-
-/// The golden-bytes guarantee: both servers serve the same journal, and the
-/// SSE payloads are identical envelope JSON, replay and live. (Chunk framing
-/// differs by transport and is not part of the frozen contract.)
-#[tokio::test]
-async fn sse_payloads_are_identical_across_legacy_and_api() {
-    let ws = tempfile::tempdir().unwrap();
-    let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-    let fleet = Arc::new(smith_server::Fleet::new(ws.path().join("workers.json"), metrics.clone()));
-    let controller = smith_server::Controller::with_parts(
-        Arc::new(ScriptedFactory { script: vec![] }),
-        Duration::from_secs(60),
-        fleet,
-        metrics,
-        smith_server::WorkerDefaults::default(),
-        smith_server::OrchestrateSection::default(),
-        None,
-        None,
-    );
-
-    // The legacy server on one port, the api server on another — one journal.
-    let legacy_listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
-    let legacy_port = legacy_listener.local_addr().unwrap().port();
-    tokio::spawn(smith_server::http::accept_loop(
-        legacy_listener,
-        controller.clone(),
-        TOKEN.to_string(),
-    ));
-    let api_listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
-    let api_port = api_listener.local_addr().unwrap().port();
-    tokio::spawn(smith_server::api::accept_loop(
-        api_listener,
-        controller.clone(),
-        TOKEN.to_string(),
-        api_options(),
-    ));
-
-    let legacy = ServeClient::new("127.0.0.1", legacy_port, TOKEN.to_string());
-    let api = ServeClient::new("127.0.0.1", api_port, TOKEN.to_string());
-    let id = legacy
-        .create_session(ws.path().to_str().unwrap(), None, None)
-        .await
-        .unwrap();
-    let handle = controller.get(&id).unwrap();
-
-    // Replay path: two notices journalled before anyone connects.
-    handle
-        .journal
-        .publish_core(smith_core::CoreEvent::Notice { text: "one".into() });
-    handle
-        .journal
-        .publish_core(smith_core::CoreEvent::Notice { text: "two".into() });
-
-    let mut legacy_stream = legacy.events(&id, 0).await.unwrap();
-    let mut api_stream = api.events(&id, 0).await.unwrap();
-
-    // Live path: more events while both streams are attached.
-    handle
-        .journal
-        .publish_core(smith_core::CoreEvent::Notice { text: "live-1".into() });
-    handle
-        .journal
-        .publish_core(smith_core::CoreEvent::Notice { text: "live-2".into() });
-
-    let mut legacy_json = Vec::new();
-    let mut api_json = Vec::new();
-    for _ in 0..5 {
-        // Status(create) + notice1 + notice2 (replay) + live-1 + live-2.
-        let l: Envelope = tokio::time::timeout(Duration::from_secs(5), legacy_stream.next())
-            .await
-            .expect("legacy stream event")
-            .expect("legacy stream error")
-            .expect("legacy stream ended");
-        let a: Envelope = tokio::time::timeout(Duration::from_secs(5), api_stream.next())
-            .await
-            .expect("api stream event")
-            .expect("api stream error")
-            .expect("api stream ended");
-        legacy_json.push(serde_json::to_string(&l).unwrap());
-        api_json.push(serde_json::to_string(&a).unwrap());
-    }
-    assert_eq!(legacy_json, api_json, "the two servers must emit identical bytes");
-    assert!(legacy_json.iter().any(|j| j.contains("\"one\"")), "{legacy_json:?}");
-    assert!(legacy_json.iter().any(|j| j.contains("\"live-2\"")), "{legacy_json:?}");
-}
+// (The Phase 3 golden-bytes equivalence test compared the api against the
+// legacy server; it retired with the legacy transport at the Phase 6
+// cutover. Replay behaviour stays covered by late_viewer_replays_the_journal.)
 
 /// Heartbeats: comment frames appear on an idle stream (raw bytes) and are
 /// skipped by the client-side SSE parser (no phantom payloads).
@@ -700,7 +708,9 @@ async fn sse_heartbeats_are_comments_the_client_ignores() {
         .unwrap();
 
     // (a) Raw socket: the comment frames are on the wire while idle.
-    let mut raw_sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut raw_sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     use tokio::io::AsyncWriteExt;
     raw_sock
         .write_all(
@@ -727,7 +737,7 @@ async fn sse_heartbeats_are_comments_the_client_ignores() {
     let mut quiet_stream = client.events(&id, 1).await.unwrap();
     let quiet = tokio::time::timeout(Duration::from_millis(400), quiet_stream.next_raw()).await;
     match quiet {
-        Err(_) => {} // quiet window: no payload surfaced from the comments
+        Err(_) => {}       // quiet window: no payload surfaced from the comments
         Ok(Ok(None)) => {} // stream ended: also fine
         Ok(Ok(Some(payload))) => panic!("a comment leaked as a payload: {payload}"),
         Ok(Err(e)) => panic!("stream error: {e}"),
@@ -759,11 +769,7 @@ async fn lagged_sse_subscribers_refill_from_the_ring() {
     let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
     let id = client
         .create_session(
-            tempfile::tempdir()
-                .unwrap()
-                .path()
-                .to_str()
-                .unwrap(),
+            tempfile::tempdir().unwrap().path().to_str().unwrap(),
             None,
             None,
         )
@@ -774,9 +780,9 @@ async fn lagged_sse_subscribers_refill_from_the_ring() {
     let mut stream = client.events(&id, 0).await.unwrap();
     // The broadcast queue (4096) overflows while nothing polls the stream.
     for i in 0..4200 {
-        handle
-            .journal
-            .publish_core(smith_core::CoreEvent::Notice { text: format!("n{i}") });
+        handle.journal.publish_core(smith_core::CoreEvent::Notice {
+            text: format!("n{i}"),
+        });
     }
 
     // Everything: status(seq 1) + 4200 notices, in order, no dups.
@@ -787,7 +793,12 @@ async fn lagged_sse_subscribers_refill_from_the_ring() {
             .expect("timed out waiting for an event")
             .expect("stream error")
             .expect("stream ended early");
-        assert!(env.seq > last, "sequence went backwards: {} after {}", env.seq, last);
+        assert!(
+            env.seq > last,
+            "sequence went backwards: {} after {}",
+            env.seq,
+            last
+        );
         last = env.seq;
     }
     assert_eq!(last, 4201);

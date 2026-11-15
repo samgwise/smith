@@ -8,19 +8,19 @@
 //! phase by phase; the legacy loop keeps serving until the cutover.
 
 use std::net::ToSocketAddrs as _;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Request, State};
 use axum::handler::Handler;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Router;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::net::{TcpListener, TcpStream};
@@ -30,8 +30,8 @@ use futures::Stream;
 use smith_core::CoreEvent;
 use smith_protocol::{
     ApprovalPost, CheckpointRequest, ClearancePost, CreateSession, EnrolReply, EnrolRequest,
-    Envelope, ExecEventKind, ExecEventsRequest, HeartbeatRequest, OpResultRequest, ProviderPost,
-    ResumePost, StartTurn, WireEvent, WorkerCommand, WorkerSummary, PROTOCOL_VERSION,
+    Envelope, ExecEventKind, ExecEventsRequest, HeartbeatRequest, OpResultRequest,
+    PROTOCOL_VERSION, ProviderPost, ResumePost, StartTurn, WireEvent, WorkerCommand, WorkerSummary,
 };
 
 use crate::controller::{ApiError, Controller};
@@ -55,7 +55,7 @@ const MAX_GIT_SUBPROCESSES: usize = 8;
 /// Anything we can serve a connection over: plain TCP or a TLS stream.
 enum ConnIo {
     Plain(TcpStream),
-    Tls(tokio_rustls::server::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
 }
 
 impl tokio::io::AsyncRead for ConnIo {
@@ -201,7 +201,7 @@ pub async fn accept_loop(
         tokio::spawn(async move {
             let io: ConnIo = match &tls {
                 Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls_stream) => ConnIo::Tls(tls_stream),
+                    Ok(tls_stream) => ConnIo::Tls(Box::new(tls_stream)),
                     Err(e) => {
                         tracing::debug!("TLS accept failed: {e}");
                         return;
@@ -214,10 +214,13 @@ pub async fn accept_loop(
                 .timer(TokioTimer::new())
                 .header_read_timeout(header_timeout)
                 .max_header_size(MAX_HEADER_BYTES);
-            if let Err(e) = builder.serve_connection(
-                TokioIo::new(io),
-                TowerToHyperService::new((*router).clone()),
-            ).await {
+            if let Err(e) = builder
+                .serve_connection(
+                    TokioIo::new(io),
+                    TowerToHyperService::new((*router).clone()),
+                )
+                .await
+            {
                 tracing::debug!("serve connection ended: {e}");
             }
             drop(permit);
@@ -248,8 +251,7 @@ pub(crate) fn build_router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route(
             "/v1/sessions",
-            get(sessions_list)
-                .post(session_create.layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))),
+            get(sessions_list).post(session_create.layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))),
         )
         .route(
             "/v1/sessions/{id}/turns",
@@ -277,15 +279,15 @@ pub(crate) fn build_router(state: ApiState) -> Router {
         .route("/v1/sessions/{id}/events", get(session_events))
         .route(
             "/v1/workers",
-            get(workers_list)
-                .post(worker_issue.layer(DefaultBodyLimit::max(META_BODY_LIMIT))),
+            get(workers_list).post(worker_issue.layer(DefaultBodyLimit::max(META_BODY_LIMIT))),
         )
         .route("/v1/workers/{name}", delete(worker_revoke))
         .route("/v1/repos", get(repos_list))
         .route("/v1/metrics", get(metrics))
-        .layer(
-            axum::middleware::from_fn_with_state(state.clone(), daemon_auth),
-        );
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            daemon_auth,
+        ));
 
     let worker = Router::new()
         .route(
@@ -305,9 +307,10 @@ pub(crate) fn build_router(state: ApiState) -> Router {
             post(worker_checkpoint).layer(DefaultBodyLimit::max(META_BODY_LIMIT)),
         )
         .route("/v1/worker/events", get(worker_events))
-        .layer(
-            axum::middleware::from_fn_with_state(state.clone(), worker_auth),
-        );
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            worker_auth,
+        ));
 
     // The forge: git smart HTTP with its own token shape (Basic with the
     // token as the password, or Bearer), checked before any body is read.
@@ -315,9 +318,10 @@ pub(crate) fn build_router(state: ApiState) -> Router {
         .route("/git/{repo}/info/refs", get(git_info_refs))
         .route("/git/{repo}/git-upload-pack", post(git_upload_pack))
         .route("/git/{repo}/git-receive-pack", post(git_receive_pack))
-        .layer(
-            axum::middleware::from_fn_with_state(state.clone(), forge_auth),
-        );
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            forge_auth,
+        ));
 
     // Enrolment authenticates with the one-time token in its body; no
     // bearer applies (the worker has no credential yet).
@@ -370,8 +374,8 @@ pub(crate) async fn worker_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let Some(worker) = bearer(req.headers())
-        .and_then(|t| state.controller.fleet.registry.authenticate(t))
+    let Some(worker) =
+        bearer(req.headers()).and_then(|t| state.controller.fleet.registry.authenticate(t))
     else {
         return error_response(StatusCode::UNAUTHORIZED, "unauthorised");
     };
@@ -409,10 +413,14 @@ fn api_error(e: &ApiError) -> Response {
 
 /// The `202 {"accepted": true}` envelope for acked operations.
 fn accepted() -> Response {
-    json_response(StatusCode::ACCEPTED, &serde_json::json!({ "accepted": true }))
+    json_response(
+        StatusCode::ACCEPTED,
+        &serde_json::json!({ "accepted": true }),
+    )
 }
 
 /// Parse a JSON body; the legacy error shape is kept byte-identical.
+#[allow(clippy::result_large_err)] // an axum Response is cheap to move here
 fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
     serde_json::from_slice(body)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, &format!("bad request body: {e}")))
@@ -420,12 +428,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Respons
 
 pub(crate) fn json_response<T: serde::Serialize>(status: StatusCode, value: &T) -> Response {
     match serde_json::to_string(value) {
-        Ok(body) => (
-            status,
-            [(header::CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response(),
+        Ok(body) => (status, [(header::CONTENT_TYPE, "application/json")], body).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/json")],
@@ -441,10 +444,7 @@ async fn sessions_list(State(state): State<ApiState>) -> Response {
     json_response(StatusCode::OK, &state.controller.sessions())
 }
 
-async fn session_create(
-    State(state): State<ApiState>,
-    body: Bytes,
-) -> Response {
+async fn session_create(State(state): State<ApiState>, body: Bytes) -> Response {
     let Ok(req) = parse_body::<CreateSession>(&body) else {
         return error_response(StatusCode::BAD_REQUEST, "bad request body");
     };
@@ -468,10 +468,7 @@ async fn session_turns(
     }
 }
 
-async fn session_cancel(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn session_cancel(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     match state.controller.cancel_turn(&id) {
         Ok(()) => accepted(),
         Err(e) => api_error(&e),
@@ -579,10 +576,7 @@ async fn workers_list(State(state): State<ApiState>) -> Response {
     json_response(StatusCode::OK, &list)
 }
 
-async fn worker_issue(
-    State(state): State<ApiState>,
-    body: Bytes,
-) -> Response {
+async fn worker_issue(State(state): State<ApiState>, body: Bytes) -> Response {
     let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
     let Ok(v) = parsed else {
         return error_response(StatusCode::BAD_REQUEST, "bad body");
@@ -599,10 +593,7 @@ async fn worker_issue(
     }
 }
 
-async fn worker_revoke(
-    State(state): State<ApiState>,
-    Path(name): Path<String>,
-) -> Response {
+async fn worker_revoke(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
     match state.controller.fleet.registry.revoke(&name) {
         Ok(true) => {
             let lost = state.controller.fleet.board.sessions_of(&name);
@@ -680,7 +671,10 @@ async fn worker_heartbeat(
     // Reconcile: the worker's live-lease list wins; the daemon re-learns
     // leases it forgot across a restart (M16).
     state.controller.relearn_leases(&worker.0, &req.live_leases);
-    let lost = state.controller.fleet.reconcile(&worker.0, &req.live_leases);
+    let lost = state
+        .controller
+        .fleet
+        .reconcile(&worker.0, &req.live_leases);
     if !lost.is_empty() {
         state.controller.handle_lease_loss(&worker.0, &lost);
     }
@@ -700,7 +694,10 @@ async fn worker_op_result(
         .fleet
         .streams
         .deliver_op_result(&req.exec_id, req.result);
-    json_response(StatusCode::OK, &serde_json::json!({ "delivered": delivered }))
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({ "delivered": delivered }),
+    )
 }
 
 async fn worker_exec_events(
@@ -748,11 +745,19 @@ async fn worker_checkpoint(
         // Byte-slice safely: worker-supplied strings must not panic the
         // daemon on a multi-byte boundary (S-24).
         let commit = req.commit.get(..12).unwrap_or(&req.commit).to_string();
-        let session = req.session_id.get(..8).unwrap_or(&req.session_id).to_string();
+        let session = req
+            .session_id
+            .get(..8)
+            .unwrap_or(&req.session_id)
+            .to_string();
         handle.journal.publish_core(CoreEvent::Notice {
             text: format!(
                 "[checkpoint {commit} on smith/{session}{}]",
-                if req.pushed { " (pushed)" } else { " (local only)" }
+                if req.pushed {
+                    " (pushed)"
+                } else {
+                    " (local only)"
+                }
             ),
         });
     }
@@ -1018,14 +1023,20 @@ async fn git_http_backend(
         } else if let Some(len) = content_length {
             // Oversize up front: refuse without reading a byte.
             if len > state.max_git_body_bytes as u64 {
-                return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the size cap");
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the size cap",
+                );
             }
             body_transport = Some((body, Some(len)));
         } else {
             let buffered = match axum::body::to_bytes(body, state.max_git_body_bytes).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the size cap");
+                    return error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body exceeds the size cap",
+                    );
                 }
             };
             let len = buffered.len() as u64;
@@ -1053,8 +1064,12 @@ async fn git_http_backend(
         let mut written: u64 = 0;
         let mut too_big = false;
         loop {
-            let next = tokio::time::timeout(Duration::from_secs(60), stream.next()).await;
-            let Some(chunk) = next.unwrap_or(None) else { break };
+            // Per-frame idle timeout (D-5): a stalled upload cannot hold the
+            // connection and subprocess forever.
+            let next = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+            let Some(chunk) = next.unwrap_or(None) else {
+                break;
+            };
             let Ok(chunk) = chunk else { break };
             written += chunk.len() as u64;
             if written > state.max_git_body_bytes as u64 {
@@ -1073,7 +1088,10 @@ async fn git_http_backend(
         drop(stdin); // EOF: git's stateless RPC answers once input ends
         if too_big {
             let _ = child.kill().await;
-            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the size cap");
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the size cap",
+            );
         }
     }
 
@@ -1099,7 +1117,9 @@ async fn git_http_backend(
     let mut status = "200 OK".to_string();
     let mut pass_headers: Vec<(header::HeaderName, String)> = Vec::new();
     for line in cgi_head.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let k = k.trim();
         let v = v.trim();
         if k.eq_ignore_ascii_case("status") {
@@ -1165,9 +1185,9 @@ where
 fn heartbeat_interval(state: &ApiState) -> Option<tokio::time::Interval> {
     // The first tick of `interval` is immediate; delay it by one period so a
     // fresh stream starts silent.
-    state.sse_heartbeat.map(|period| {
-        tokio::time::interval_at(tokio::time::Instant::now() + period, period)
-    })
+    state
+        .sse_heartbeat
+        .map(|period| tokio::time::interval_at(tokio::time::Instant::now() + period, period))
 }
 
 /// `?since=` from the raw query (legacy semantics: absent or unparseable → 0;
@@ -1241,10 +1261,11 @@ impl SessionEvents {
             replay: replay.into_iter(),
             replaying: true,
             last_sent: since,
-            heartbeat: heartbeat
-                .map(|period| tokio::time::interval_at(tokio::time::Instant::now() + period, period)),
+            heartbeat: heartbeat.map(|period| {
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+            }),
         };
-            Self {
+        Self {
             inner: Box::pin(futures::stream::unfold(state, |mut s| async move {
                 loop {
                     // Replay first (the subscription predates the snapshot).
@@ -1336,27 +1357,22 @@ impl Stream for WorkerCommands {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        loop {
-            match self.rx.poll_recv(cx) {
-                std::task::Poll::Ready(Some(cmd)) => {
-                    let json = serde_json::to_string(&cmd).expect("command serialisation");
-                    return std::task::Poll::Ready(Some(Ok(Bytes::from(format!(
-                        "data: {json}\n\n"
-                    )))));
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(cmd)) => {
+                let json = serde_json::to_string(&cmd).expect("command serialisation");
+                std::task::Poll::Ready(Some(Ok(Bytes::from(format!("data: {json}\n\n")))))
+            }
+            // The registry dropped this stream's sender (worker replaced or
+            // revoked): the stream ends.
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => {
+                // Idle: fire the heartbeat comment if one is due.
+                if let Some(interval) = self.heartbeat.as_mut()
+                    && interval.poll_tick(cx).is_ready()
+                {
+                    return std::task::Poll::Ready(Some(Ok(sse_comment_frame("keep-alive"))));
                 }
-                // The registry dropped this stream's sender (worker replaced
-                // or revoked): the stream ends.
-                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
-                std::task::Poll::Pending => {
-                    if let Some(interval) = self.heartbeat.as_mut() {
-                        if interval.poll_tick(cx).is_ready() {
-                            return std::task::Poll::Ready(Some(Ok(sse_comment_frame(
-                                "keep-alive",
-                            ))));
-                        }
-                    }
-                    return std::task::Poll::Pending;
-                }
+                std::task::Poll::Pending
             }
         }
     }
@@ -1382,7 +1398,11 @@ pub fn load_tls_acceptor(
         .with_context(|| format!("reading TLS certificate {}", cert_path.display()))?
         .collect::<Result<_, _>>()
         .with_context(|| format!("parsing TLS certificate {}", cert_path.display()))?;
-    anyhow::ensure!(!certs.is_empty(), "TLS certificate file is empty: {}", cert_path.display());
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "TLS certificate file is empty: {}",
+        cert_path.display()
+    );
     let key = PrivateKeyDer::from_pem_file(key_path)
         .with_context(|| format!("parsing TLS key {}", key_path.display()))?;
     let config = rustls::ServerConfig::builder()

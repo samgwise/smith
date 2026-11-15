@@ -12,7 +12,6 @@ pub mod controller;
 pub mod factory;
 pub mod forge;
 pub mod gate;
-pub mod http;
 pub mod journal;
 pub mod orchestrator;
 pub mod workers;
@@ -47,26 +46,25 @@ pub fn ensure_token() -> anyhow::Result<String> {
     Ok(token)
 }
 
-/// Run the daemon: bind, install the clearance poller, serve forever.
-/// Session containers are left running on shutdown (same contract as a TUI
-/// exit; `smith clean` reaps them).
+/// Run the daemon: bind, install the clearance poller, serve until
+/// interrupted. Session containers are left running on shutdown (same
+/// contract as a TUI exit; `smith clean` reaps them).
 pub async fn serve(config: &Config, bind_override: Option<String>) -> anyhow::Result<()> {
     let bind = bind_override.unwrap_or_else(|| config.serve.bind.clone());
-    // Validate the TLS pair eagerly (fail fast on bad files). The axum api
-    // serves TLS from the Phase 4 cutover; until then the legacy loop here
-    // cannot speak TLS, so `tls_served` is false and a non-loopback bind
-    // needs an explicit allow_plaintext_remote (S-05).
+    // Validate the TLS pair eagerly (fail fast on bad files) — the api
+    // serves it.
     let tls = match (&config.serve.tls_cert, &config.serve.tls_key) {
         (Some(cert), Some(key)) => {
             let acceptor = api::load_tls_acceptor(Path::new(cert), Path::new(key))?;
-            tracing::info!("TLS configured (served by the axum api at the migration cutover)");
+            tracing::info!("TLS configured on the serve api");
             Some(acceptor)
         }
         (None, None) => None,
         _ => anyhow::bail!("serve.tls_cert and serve.tls_key must be set together"),
     };
-    drop(tls); // honoured by the api accept loop at cutover
-    api::ensure_bind_policy(&bind, false, config.serve.allow_plaintext_remote)?;
+    // A non-loopback bind needs TLS actually being served (it is), or an
+    // explicit allow_plaintext_remote (S-05).
+    api::ensure_bind_policy(&bind, tls.is_some(), config.serve.allow_plaintext_remote)?;
     let token = ensure_token()?;
     let controller = Controller::new(config);
     // M16: rebuild the session table from the state dir before serving —
@@ -78,11 +76,33 @@ pub async fn serve(config: &Config, bind_override: Option<String>) -> anyhow::Re
     controller::spawn_clearance_poller(controller.clone());
     controller::spawn_fleet_sweeper(controller.clone());
 
-    let listener = http::bind(&bind).await?;
+    let listener = api::bind(&bind).await?;
     tracing::info!("smith serve listening on {bind}");
     println!(
         "smith serve: listening on {bind} (token: {})",
         token_file()?.display()
     );
-    http::accept_loop(listener, controller, token).await
+    // Ctrl+C stops the accept loop; in-flight connections finish under
+    // their own timeouts.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("interrupted — shutting down the serve api");
+            shutdown.cancel();
+        }
+    });
+    api::accept_loop(
+        listener,
+        controller,
+        token,
+        api::ApiOptions {
+            tls,
+            max_git_body_bytes: (config.serve.max_git_body_mb.max(1) as usize) * 1024 * 1024,
+            shutdown,
+            ..Default::default()
+        },
+    )
+    .await
 }

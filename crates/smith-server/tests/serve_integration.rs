@@ -14,11 +14,78 @@ use tokio::net::TcpListener;
 use smith_core::{
     Agent, ApprovalDecision, ApprovalGate, LlmProvider, Message, ProviderEvent, ToolDef,
 };
-use smith_protocol::http::{read_request, write_json_response};
 use smith_protocol::{
     Capability, EnrolRequest, Envelope, EventStream, HeartbeatRequest, Load, OpResult,
     OpResultRequest, ServeClient, WireEvent, WorkerCommand,
 };
+
+/// Minimal request reader for the clearance stub (the legacy protocol
+/// helpers went away with the old transport): returns (path, body).
+async fn stub_read_request(
+    stream: &mut tokio::net::TcpStream,
+) -> anyhow::Result<(String, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            let path = head
+                .lines()
+                .next()
+                .and_then(|l| l.split(' ').nth(1))
+                .map(|t| {
+                    t.split_once('?')
+                        .map_or(t.to_string(), |(p, _)| p.to_string())
+                })
+                .unwrap_or_default();
+            let mut body = buf[pos + 4..].to_vec();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            while body.len() < len {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    anyhow::bail!("connection closed mid-body");
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            body.truncate(len);
+            return Ok((path, body));
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            anyhow::bail!("connection closed mid-head");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > 64 * 1024 {
+            anyhow::bail!("stub request head too large");
+        }
+    }
+}
+
+/// Minimal JSON response writer for the stub.
+async fn stub_write_json(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r
+\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
 use smith_server::Controller;
 use smith_server::OrchestrateSection;
 use smith_server::factory::{SessionFactory, SessionParts};
@@ -619,17 +686,17 @@ async fn clearance_requests_fan_out_and_decisions_are_forwarded() {
             // controller forwards the decision.
             loop {
                 let (mut stream, _) = stub_listener.accept().await.unwrap();
-                let req = read_request(&mut stream).await.unwrap();
-                if req.path == "/pending" {
-                    write_json_response(&mut stream, 200, r#"[{"id":7,"host":"example.com"}]"#)
+                let (path, body) = stub_read_request(&mut stream).await.unwrap();
+                if path == "/pending" {
+                    stub_write_json(&mut stream, 200, r#"[{"id":7,"host":"example.com"}]"#)
                         .await
                         .unwrap();
-                } else if req.path == "/decide" {
+                } else if path == "/decide" {
                     decided
                         .lock()
                         .unwrap()
-                        .push(String::from_utf8_lossy(&req.body).into_owned());
-                    write_json_response(&mut stream, 200, r#"{"applied":true}"#)
+                        .push(String::from_utf8_lossy(&body).into_owned());
+                    stub_write_json(&mut stream, 200, r#"{"applied":true}"#)
                         .await
                         .unwrap();
                     return;
@@ -1405,12 +1472,12 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
             .unwrap()
             .unwrap()
             .unwrap();
-        if let WireEvent::Orchestration { kind, .. } = &next.event {
-            if *kind == smith_protocol::OrchestrationKind::Spawned {
-                spawned += 1;
-                if spawned == 2 {
-                    break;
-                }
+        if let WireEvent::Orchestration { kind, .. } = &next.event
+            && *kind == smith_protocol::OrchestrationKind::Spawned
+        {
+            spawned += 1;
+            if spawned == 2 {
+                break;
             }
         }
     }
@@ -1957,11 +2024,7 @@ async fn smith_repo_scheme_mints_session_tokens() {
     expect_ok(
         git(
             &seed,
-            &[
-                "push",
-                &url,
-                &format!("HEAD:refs/heads/smith/{child_id}"),
-            ],
+            &["push", &url, &format!("HEAD:refs/heads/smith/{child_id}")],
         )
         .await
         .unwrap(),
@@ -2052,7 +2115,10 @@ async fn large_push_streams_through_the_api() {
     .await
     .unwrap();
     let url = format!("http://smith:{TOKEN}@127.0.0.1:{port}/git/demo.git");
-    expect_ok(git(&origin, &["push", &url, "main"]).await.unwrap(), "push-to-create");
+    expect_ok(
+        git(&origin, &["push", &url, "main"]).await.unwrap(),
+        "push-to-create",
+    );
 
     // 50 MiB of incompressible data (LCG — cheap and deterministic).
     let mut data = Vec::with_capacity(50 * 1024 * 1024);
@@ -2077,7 +2143,10 @@ async fn large_push_streams_through_the_api() {
     )
     .await
     .unwrap();
-    expect_ok(git(&origin, &["push", &url, "main"]).await.unwrap(), "50 MiB push");
+    expect_ok(
+        git(&origin, &["push", &url, "main"]).await.unwrap(),
+        "50 MiB push",
+    );
 }
 
 // ---- Phase 0 red tests (HTTP migration) --------------------------------
@@ -2114,7 +2183,15 @@ async fn seed_and_push(origin: &std::path::Path, url: &str) -> String {
     git(origin, &["add", "-A"]).await.unwrap();
     git(
         origin,
-        &["-c", "user.email=s@x", "-c", "user.name=s", "commit", "-m", "seed"],
+        &[
+            "-c",
+            "user.email=s@x",
+            "-c",
+            "user.name=s",
+            "commit",
+            "-m",
+            "seed",
+        ],
     )
     .await
     .unwrap();
@@ -2158,7 +2235,9 @@ async fn s04_idle_connection_is_bounded_and_cap_refuses_extras() {
     ));
 
     // Part 1: header-read timeout. A silent client is disconnected.
-    let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
     let closed = tokio::time::timeout(Duration::from_secs(5), idle.read_to_end(&mut buf)).await;
@@ -2170,14 +2249,20 @@ async fn s04_idle_connection_is_bounded_and_cap_refuses_extras() {
     // Part 2: the connection cap. Over-cap connections are closed promptly.
     let mut extra: Vec<tokio::net::TcpStream> = Vec::new();
     for _ in 0..1026 {
-        extra.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        extra.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
     }
     let mut saw_close = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline && !saw_close {
         for s in extra.iter_mut() {
             let mut probe = Vec::new();
-            if let Ok(Ok(0)) = tokio::time::timeout(Duration::from_millis(200), s.read_to_end(&mut probe)).await {
+            if let Ok(Ok(0)) =
+                tokio::time::timeout(Duration::from_millis(200), s.read_to_end(&mut probe)).await
+            {
                 saw_close = true;
                 break;
             }
@@ -2201,7 +2286,11 @@ async fn s04_idle_connection_is_bounded_and_cap_refuses_extras() {
 async fn red_c02_gzipped_upload_pack_request_is_decoded() {
     let (_controller, port, ws, _state) = forge_harness().await;
     let origin = ws.path().join("seed");
-    let sha = seed_and_push(&origin, &format!("http://smith:{TOKEN}@127.0.0.1:{port}/git/demo.git")).await;
+    let sha = seed_and_push(
+        &origin,
+        &format!("http://smith:{TOKEN}@127.0.0.1:{port}/git/demo.git"),
+    )
+    .await;
 
     // A minimal, complete upload-pack request: want + flush + done.
     let want = format!("want {sha} multi_ack_detailed side-band-64k thin-pack ofs-delta\n");
@@ -2216,7 +2305,9 @@ async fn red_c02_gzipped_upload_pack_request_is_decoded() {
     let gzipped = enc.finish().unwrap();
 
     // Send it with Content-Encoding: gzip (raw_request has no header knobs).
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let request = format!(
         "POST /git/demo.git/git-upload-pack HTTP/1.1\r\n\
