@@ -122,6 +122,10 @@ enum Command {
         /// Daemon token (with --serve; env SMITH_SERVE_TOKEN).
         #[arg(long)]
         token: Option<String>,
+        /// The daemon's TLS certificate (PEM file) to pin for an https://
+        /// daemon URL (with --serve; env SMITH_SERVE_CERT).
+        #[arg(long)]
+        cert: Option<String>,
         /// Lease a fleet worker for the session (with --serve).
         #[arg(long)]
         worker: Option<String>,
@@ -232,6 +236,10 @@ enum Command {
         /// Daemon token (env SMITH_SERVE_TOKEN; default: the daemon's token file).
         #[arg(long)]
         token: Option<String>,
+        /// The daemon's TLS certificate (PEM file) to pin for an https://
+        /// daemon URL (env SMITH_SERVE_CERT).
+        #[arg(long)]
+        cert: Option<String>,
         /// Lease a fleet worker for a fresh session.
         #[arg(long)]
         worker: Option<String>,
@@ -316,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
             serve,
             url,
             token,
+            cert,
             worker,
             repo,
             git_ref,
@@ -332,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
                 let code = run::run_via_serve(run::ServeRun {
                     url: url.as_deref(),
                     token: token.as_deref(),
+                    cert: cert.as_deref(),
                     task: &task,
                     worker: worker.as_deref(),
                     repo: repo.as_deref(),
@@ -446,6 +456,7 @@ async fn main() -> anyhow::Result<()> {
             id,
             url,
             token,
+            cert,
             worker,
             repo,
             git_ref,
@@ -454,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
             attach::run_attach(
                 url.as_deref(),
                 token.as_deref(),
+                cert.as_deref(),
                 id.as_deref(),
                 worker.as_deref(),
                 repo.as_deref(),
@@ -463,9 +475,13 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Some(Command::Worker { cmd }) => match cmd {
-            WorkerCmd::Issue { name } => attach::worker_issue(None, None, &name).await?,
-            WorkerCmd::List => attach::workers_list(None, None).await?,
-            WorkerCmd::Revoke { name } => attach::worker_revoke(None, None, &name).await?,
+            WorkerCmd::Issue { name } => {
+                attach::worker_issue(None, None, None, &name).await?
+            }
+            WorkerCmd::List => attach::workers_list(None, None, None).await?,
+            WorkerCmd::Revoke { name } => {
+                attach::worker_revoke(None, None, None, &name).await?
+            }
         },
         Some(Command::Sessions) => {
             for (path, meta) in smith_core::list_sessions()? {

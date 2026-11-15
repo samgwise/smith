@@ -11,8 +11,13 @@ use smith_tui::{App, AppParams, RemoteLink};
 const DEFAULT_URL: &str = "127.0.0.1:9240";
 
 /// Resolve the client from explicit flags, falling back to the environment
-/// and finally the defaults.
-pub fn resolve_client(url: Option<&str>, token: Option<&str>) -> anyhow::Result<ServeClient> {
+/// and finally the defaults. `cert` (a PEM file, mirroring
+/// `SMITH_SERVE_CERT`) pins the controller's certificate for https targets.
+pub fn resolve_client(
+    url: Option<&str>,
+    token: Option<&str>,
+    cert: Option<&str>,
+) -> anyhow::Result<ServeClient> {
     let url = url
         .map(str::to_string)
         .or_else(|| std::env::var("SMITH_SERVE_URL").ok())
@@ -26,23 +31,16 @@ pub fn resolve_client(url: Option<&str>, token: Option<&str>) -> anyhow::Result<
                 "no serve token: pass --token, set SMITH_SERVE_TOKEN, or start `smith serve` once",
             )
         })?;
-    let (host, port) = parse_url(&url)?;
-    Ok(ServeClient::new(&host, port, token))
-}
-
-/// Accept `host:port`, bare `host`, or an `http://` prefix (no TLS at this
-/// layer; a reverse proxy terminates it in front of the daemon).
-fn parse_url(url: &str) -> anyhow::Result<(String, u16)> {
-    let url = url.trim().trim_start_matches("http://");
-    let url = url.trim_end_matches('/');
-    match url.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => Ok((
-            host.trim_matches(|c| c == '[' || c == ']').to_string(),
-            port.parse().context("port in the serve URL")?,
-        )),
-        Some(_) => Ok(("127.0.0.1".into(), smith_protocol::DEFAULT_SERVE_PORT)),
-        None => Ok((url.to_string(), smith_protocol::DEFAULT_SERVE_PORT)),
-    }
+    let cert_pem = cert
+        .map(str::to_string)
+        .or_else(|| std::env::var("SMITH_SERVE_CERT").ok())
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            std::fs::read_to_string(&p)
+                .with_context(|| format!("reading the controller certificate {p}"))
+        })
+        .transpose()?;
+    ServeClient::from_target(&url, token, cert_pem)
 }
 
 /// Run the attach flow: health check, find-or-create the session, then the
@@ -51,13 +49,14 @@ fn parse_url(url: &str) -> anyhow::Result<(String, u16)> {
 pub async fn run_attach(
     url: Option<&str>,
     token: Option<&str>,
+    cert: Option<&str>,
     id: Option<&str>,
     worker: Option<&str>,
     repo: Option<&str>,
     git_ref: Option<&str>,
     orchestrate: bool,
 ) -> anyhow::Result<()> {
-    let client = resolve_client(url, token)?;
+    let client = resolve_client(url, token, cert)?;
     client
         .health()
         .await
@@ -142,17 +141,22 @@ pub async fn run_attach(
 pub async fn worker_issue(
     url: Option<&str>,
     token: Option<&str>,
+    cert: Option<&str>,
     name: &str,
 ) -> anyhow::Result<()> {
-    let client = resolve_client(url, token)?;
+    let client = resolve_client(url, token, cert)?;
     let enrolment = client.worker_issue(name).await?;
     println!("enrolment token for `{name}` (single use, hand to the worker):\n{enrolment}");
     Ok(())
 }
 
 /// List registered workers.
-pub async fn workers_list(url: Option<&str>, token: Option<&str>) -> anyhow::Result<()> {
-    let client = resolve_client(url, token)?;
+pub async fn workers_list(
+    url: Option<&str>,
+    token: Option<&str>,
+    cert: Option<&str>,
+) -> anyhow::Result<()> {
+    let client = resolve_client(url, token, cert)?;
     let workers = client.workers().await?;
     if workers.is_empty() {
         println!("no workers enrolled (smith worker issue <name>)");
@@ -186,9 +190,10 @@ pub async fn workers_list(url: Option<&str>, token: Option<&str>) -> anyhow::Res
 pub async fn worker_revoke(
     url: Option<&str>,
     token: Option<&str>,
+    cert: Option<&str>,
     name: &str,
 ) -> anyhow::Result<()> {
-    let client = resolve_client(url, token)?;
+    let client = resolve_client(url, token, cert)?;
     client.worker_revoke(name).await?;
     println!("worker `{name}` revoked");
     Ok(())
@@ -196,25 +201,29 @@ pub async fn worker_revoke(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn parses_serve_urls() {
+        // The URL parser lives in smith-protocol (shared with the worker);
+        // the CLI's contract is that its targets pass through it.
         assert_eq!(
-            parse_url("127.0.0.1:9240").unwrap(),
-            ("127.0.0.1".into(), 9240)
+            smith_protocol::parse_serve_url("127.0.0.1:9240").unwrap(),
+            (false, "127.0.0.1".into(), 9240)
         );
         assert_eq!(
-            parse_url("http://10.0.0.5:9250").unwrap(),
-            ("10.0.0.5".into(), 9250)
+            smith_protocol::parse_serve_url("http://10.0.0.5:9250").unwrap(),
+            (false, "10.0.0.5".into(), 9250)
         );
         assert_eq!(
-            parse_url("gpu-box").unwrap(),
-            ("gpu-box".into(), smith_protocol::DEFAULT_SERVE_PORT)
+            smith_protocol::parse_serve_url("gpu-box").unwrap(),
+            (
+                false,
+                "gpu-box".into(),
+                smith_protocol::DEFAULT_SERVE_PORT
+            )
         );
         assert_eq!(
-            parse_url("localhost:9999").unwrap(),
-            ("localhost".into(), 9999)
+            smith_protocol::parse_serve_url("localhost:9999").unwrap(),
+            (false, "localhost".into(), 9999)
         );
     }
 }

@@ -35,11 +35,11 @@ Status: 0 of 44 closed.
   - Fix: a connection semaphore, hyper's header-read timeout, and a per-frame upload timeout (tower-http `RequestBodyTimeoutLayer`). Phase 0 finding: hyper's header timeout also closes idle keep-alive connections, so no separate idle knob is needed.
   - Verify: `s04_idle_connection_is_bounded_and_cap_refuses_extras` in `crates/smith-server/tests/serve_integration.rs` and the api tests in `crates/smith-server/tests/api_integration.rs` (green as of Phase 1, against the new server; the legacy loop the daemon still runs is fixed by the same code at the cutover).
 
-- [ ] **S-05 · Plaintext transport; TLS verification documented but not built** (Phases 1, 5)
-  - Where: `crates/smith-protocol/src/client.rs:74-82` (raw TCP), `crates/smith-worker/src/main.rs:55-65` (strips `http://`, no TLS), `docs/WORKER_MESH.md:18-20` and `crates/smith-server/src/workers.rs:1-7` (say the worker verifies the controller's certificate), `crates/smith-server/src/config.rs:150-152` (any bind address accepted)
-  - Problem: enrolment tokens, worker credentials, per-session forge tokens, and command streams cross the network in cleartext. The documented TLS-proxy deployment can't work for workers, because the worker client can't speak TLS.
-  - Fix: TLS in the controller, certificate pinning in the worker and clients (decision D-2 in the plan), and refusal of non-loopback binds unless TLS is configured or plaintext is explicitly allowed.
-  - Verify: a worker refuses a controller whose certificate doesn't match the pin.
+- [ ] **S-05 · Plaintext transport; TLS verification documented but not built** (server + clients built, Phases 1 and 5; the production daemon still serves the legacy loop until the Phase 6 cutover)
+  - Where: the legacy `crates/smith-protocol/src/client.rs` (rewritten on reqwest/rustls in Phase 5), `crates/smith-worker/src/main.rs` (the credential carries the pinned cert), `docs/WORKER_MESH.md:18-20`, `crates/smith-server/src/config.rs`
+  - Problem: enrolment tokens, worker credentials, per-session forge tokens, and command streams crossed the network in cleartext, and the documented TLS verification was never built.
+  - Fix: TLS on the api server (tokio-rustls/ring); reqwest clients with scheme-aware targets (`https://` selects TLS) and certificate pinning — the controller's PEM is the sole trust anchor (`--cert` / `SMITH_SERVE_CERT` for the CLI, `--cert` at worker enrolment, stored in the credential). Non-loopback binds need TLS or an explicit `allow_plaintext_remote` (Phase 1).
+  - Verify: `serve_client_over_pinned_tls` in `crates/smith-server/tests/api_integration.rs` (health and SSE over a pinned self-signed cert; a mismatched pin is refused).
 
 - [ ] **S-06 · Agent can write files that run on the host, without approval** (Independent)
   - Where: `crates/smith-core/src/tools.rs:98-100, 154-156, 188-190` (read, write, and list need no approval), `crates/smith-sandbox/src/executor.rs:157-167`
@@ -168,10 +168,10 @@ Status: 0 of 44 closed.
   - Fix: `serde_json` for every error body, and `get(..n)` for slices. Done in `crates/smith-server/src/api.rs` (`error_response`/`json_response`, and the checkpoint notice slices with `get(..n)`).
   - Verify: a git error containing quotes or backslashes produces valid JSON (Phase 4).
 
-- [ ] **S-25 · Worker and client URL parsing breaks IPv6 literals** (Phase 5)
-  - Where: `crates/smith-worker/src/main.rs:55-65` and `:183-194`
-  - Fix: one URL parser, shared by the worker and `ServeClient`.
-  - Verify: `[::1]:9240` parses for the worker and for clients.
+- [x] **S-25 · Worker and client URL parsing breaks IPv6 literals** (fixed, Phase 5)
+  - Where: `crates/smith-protocol/src/client.rs` (`parse_serve_url`, shared by `ServeClient` and the worker)
+  - Fix: one scheme-aware URL parser handling `[::1]:port` literals, ports, and paths.
+  - Verify: the `serve_url_parsing` unit test in `crates/smith-protocol/src/client.rs` (bracketed IPv6 with and without ports, schemes, and error cases).
 
 - [ ] **S-26 · MCP `command = "npx"` doesn't resolve on Windows** (Independent)
   - Where: `crates/smith-mcp/src/manager.rs:133-154`, `README.md:228-236`

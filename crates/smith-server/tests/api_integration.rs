@@ -254,6 +254,55 @@ async fn tls_serves_health_with_a_pinned_certificate() {
     assert!(refused, "a mismatched certificate pin must be refused");
 }
 
+/// S-05 / D-2: the real thin client (ServeClient, reqwest + rustls) over a
+/// pinned TLS controller: RPC round-trips, the SSE stream decodes through
+/// eventsource-stream, and a mismatched pin is refused.
+#[tokio::test]
+async fn serve_client_over_pinned_tls() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("leaf.pem");
+    let key_path = dir.path().join("leaf.key");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    let acceptor = smith_server::api::load_tls_acceptor(&cert_path, &key_path).unwrap();
+    let (port, ws, _c) = api_harness(
+        smith_server::api::ApiOptions {
+            tls: Some(acceptor),
+            ..Default::default()
+        },
+        vec![],
+    )
+    .await;
+    let target = format!("https://localhost:{port}");
+
+    let pinned = ServeClient::from_target(&target, TOKEN.to_string(), Some(cert.cert.pem()))
+        .expect("client with the right pin");
+    pinned.health().await.expect("health over pinned TLS");
+
+    // The SSE stream decodes through eventsource-stream: the status replay.
+    let id = pinned
+        .create_session(ws.path().to_str().unwrap(), None, None)
+        .await
+        .unwrap();
+    let mut events = pinned.events(&id, 0).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("status envelope over pinned TLS")
+        .expect("stream error")
+        .expect("stream ended");
+    assert_eq!(first.seq, 1);
+
+    // A mismatched pin: refused (connection or handshake error).
+    let decoy = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let wrong = ServeClient::from_target(&target, TOKEN.to_string(), Some(decoy.cert.pem()))
+        .expect("client with the wrong pin builds");
+    assert!(
+        wrong.health().await.is_err(),
+        "a mismatched certificate pin must be refused"
+    );
+}
+
 fn pinned_client(pem: &[u8]) -> anyhow::Result<tokio_rustls::TlsConnector> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;

@@ -30,6 +30,10 @@ struct Credential {
     controller_url: String,
     worker_id: String,
     worker_token: String,
+    /// The controller's TLS certificate (PEM) when the URL is https — the
+    /// client's sole trust anchor (D-2 certificate pinning).
+    #[serde(default)]
+    ca_cert_pem: Option<String>,
 }
 
 fn credential_path() -> anyhow::Result<PathBuf> {
@@ -53,15 +57,12 @@ fn load_credential() -> anyhow::Result<Credential> {
 }
 
 fn controller_client(cred: &Credential) -> smith_protocol::ServeClient {
-    let url = cred.controller_url.trim_start_matches("http://");
-    let (host, port) = match url.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse().unwrap_or(smith_protocol::DEFAULT_SERVE_PORT),
-        ),
-        _ => (url.to_string(), smith_protocol::DEFAULT_SERVE_PORT),
-    };
-    smith_protocol::ServeClient::new(&host, port, cred.worker_token.clone())
+    smith_protocol::ServeClient::from_target(
+        &cred.controller_url,
+        cred.worker_token.clone(),
+        cred.ca_cert_pem.clone(),
+    )
+    .expect("credential controller URL and pin are valid")
 }
 
 #[derive(Parser)]
@@ -80,8 +81,8 @@ enum Cmd {
     /// Enrol with a controller using a one-time token (minted with
     /// `smith worker issue <name>`).
     Enrol {
-        /// Controller address, e.g. 127.0.0.1:9240 (TLS via reverse proxy
-        /// when remote; the server's certificate is the worker's trust anchor).
+        /// Controller address, e.g. 127.0.0.1:9240, or an http(s):// URL
+        /// (https serves TLS; pin the controller's certificate with --cert).
         #[arg(long)]
         url: String,
         /// The one-time enrolment token.
@@ -90,6 +91,10 @@ enum Cmd {
         /// This worker's name.
         #[arg(long)]
         name: String,
+        /// The controller's TLS certificate (PEM file) to pin. Required for
+        /// https:// URLs; the leaf certificate becomes the sole trust anchor.
+        #[arg(long)]
+        cert: Option<PathBuf>,
     },
     /// Run the worker: command stream, heartbeats, op execution.
     Run {
@@ -121,12 +126,29 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Enrol { url, token, name } => {
-            let url = url.trim_start_matches("http://").to_string();
+        Cmd::Enrol {
+            url,
+            token,
+            name,
+            cert,
+        } => {
+            let (tls, _, _) = smith_protocol::parse_serve_url(&url)?;
+            let ca_cert_pem = match &cert {
+                Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+                    format!("reading the controller certificate {}", path.display())
+                })?),
+                None => {
+                    anyhow::ensure!(
+                        !tls,
+                        "an https:// controller needs --cert (the controller's TLS certificate to pin)"
+                    );
+                    None
+                }
+            };
             // The one-time token authenticates (bearer and body); the reply
             // holds the long-lived worker credential.
             let client =
-                smith_protocol::ServeClient::new(&url_host(&url), url_port(&url), token.clone());
+                smith_protocol::ServeClient::from_target(&url, token.clone(), ca_cert_pem.clone())?;
             let reply = client
                 .worker_enrol(&EnrolRequest {
                     name: name.clone(),
@@ -138,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
                 controller_url: url,
                 worker_id: reply.worker_id,
                 worker_token: reply.worker_token,
+                ca_cert_pem,
             };
             let path = credential_path()?;
             std::fs::write(&path, serde_json::to_string_pretty(&cred)?)
@@ -178,19 +201,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-fn url_host(url: &str) -> String {
-    match url.rsplit_once(':') {
-        Some((h, _)) if !h.is_empty() => h.to_string(),
-        _ => url.to_string(),
-    }
-}
-
-fn url_port(url: &str) -> u16 {
-    url.rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(smith_protocol::DEFAULT_SERVE_PORT)
 }
 
 /// Worker state shared across the mesh tasks.

@@ -11,7 +11,9 @@ pub mod http;
 pub mod metrics;
 pub mod workers;
 
-pub use client::{EventStream, ServeClient, decision_word, read_token_file, token_file};
+pub use client::{
+    EventStream, ServeClient, decision_word, parse_serve_url, read_token_file, token_file,
+};
 pub use events::{
     ApprovalPost, ChildState, ChildSummary, ClearancePost, CreateReply, CreateSession,
     DEFAULT_SERVE_PORT, DiffReply, Envelope, OrchestrationKind, PROTOCOL_VERSION, ProviderPost,

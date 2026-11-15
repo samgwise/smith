@@ -1,18 +1,22 @@
-//! Client for the `smith serve` control API: raw HTTP over loopback TCP
-//! (matching the daemon's hand-rolled server), plus the SSE [`EventStream`]
-//! that decodes envelopes.
+//! Client for the `smith serve` control API: reqwest over rustls with
+//! optional certificate pinning, plus the SSE [`EventStream`] that decodes
+//! envelopes.
+//!
+//! Targets: `host`, `host:port`, `[::1]:port`, or with an explicit
+//! `http://` / `https://` scheme (https selects TLS). When pinning, the
+//! controller's certificate (PEM) is the client's sole trust anchor —
+//! see the D-2 decision in the migration plan.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
-use anyhow::Context;
-use tokio::net::TcpStream;
+use anyhow::Context as _;
+use eventsource_stream::Eventsource as _;
+use futures::StreamExt as _;
 
 use crate::events::{
     ApprovalPost, ClearancePost, CreateReply, CreateSession, DiffReply, Envelope, ProviderPost,
     ResumePost, ResumeReply, SessionStatus, SessionSummary, StartTurn,
 };
-use crate::http::{open_chunked_response, raw_request};
 
 /// Connect timeout for RPC-style calls.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,63 +26,123 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for `create_session` (image builds on a cold machine).
 const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Parse a controller target: bare `host`, `host:port`, `[::1]:port`, or
+/// with an `http://` / `https://` scheme (https selects TLS). Returns
+/// `(tls, host, port)`. Shared by the thin clients and `smith-worker`.
+pub fn parse_serve_url(url: &str) -> anyhow::Result<(bool, String, u16)> {
+    let url = url.trim();
+    let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        (false, url)
+    };
+    let rest = rest.trim_end_matches('/');
+    // The authority ends at the first '/' (a path suffix is dropped).
+    let authority = rest.split('/').next().unwrap_or(rest);
+    anyhow::ensure!(!authority.is_empty(), "no host in the serve URL `{url}`");
+    // Split host from port, handling IPv6 literals.
+    let (host, port_part) = if let Some(stripped) = authority.strip_prefix('[') {
+        let Some((host, rest)) = stripped.split_once(']') else {
+            anyhow::bail!("unbalanced IPv6 brackets in the serve URL `{url}`");
+        };
+        (host, rest.strip_prefix(':').unwrap_or(""))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() => (h, p),
+            _ => (authority, ""),
+        }
+    };
+    anyhow::ensure!(!host.is_empty(), "no host in the serve URL `{url}`");
+    let port = if port_part.is_empty() {
+        crate::events::DEFAULT_SERVE_PORT
+    } else {
+        port_part
+            .parse()
+            .with_context(|| format!("port in the serve URL `{url}`"))?
+    };
+    Ok((tls, host.to_string(), port))
+}
+
 #[derive(Clone)]
 pub struct ServeClient {
-    host: String,
-    port: u16,
+    /// `http(s)://host:port` — the base for every request path.
+    base_url: String,
     token: String,
+    client: reqwest::Client,
 }
 
 impl ServeClient {
-    /// Client for an explicit target.
+    /// Client for an explicit host and port (plain HTTP — the legacy shape).
+    /// Also accepts a host that already carries an `http(s)://` scheme.
     pub fn new(host: &str, port: u16, token: String) -> Self {
-        Self {
-            host: host.to_string(),
-            port,
-            token,
+        let (tls, host, _) = parse_serve_url(host)
+            .unwrap_or((false, host.trim_matches(|c| c == '[' || c == ']').to_string(), port));
+        let _ = port;
+        Self::from_target(&format!("{}://{host}:{port}", if tls { "https" } else { "http" }), token, None)
+            .expect("reqwest client initialisation")
+    }
+
+    /// Client for a full target with optional certificate pinning: when
+    /// `ca_cert_pem` is set, the controller's leaf certificate is the client's
+    /// sole trust anchor (built-in roots are disabled).
+    pub fn from_target(
+        target: &str,
+        token: String,
+        ca_cert_pem: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let (tls, host, port) = parse_serve_url(target)?;
+        let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+        if tls && ca_cert_pem.is_some() {
+            builder = builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(reqwest::Certificate::from_pem(
+                    ca_cert_pem.expect("pinned checked").as_bytes(),
+                )?);
         }
+        Ok(Self {
+            base_url: format!("{}://{host}:{port}", if tls { "https" } else { "http" }),
+            token,
+            client: builder.build().context("building the HTTP client")?,
+        })
     }
 
     /// Resolve the target from the environment: `SMITH_SERVE_URL`
-    /// (`host` or `host:port`) and `SMITH_SERVE_TOKEN`, falling back to the
-    /// default port and the daemon's token file.
+    /// (`host`, `host:port`, or an `http(s)://` URL), `SMITH_SERVE_TOKEN`,
+    /// and optionally `SMITH_SERVE_CERT` (the controller's PEM for pinning),
+    /// falling back to the default port and the daemon's token file.
     pub fn from_env() -> anyhow::Result<Self> {
         let url = std::env::var("SMITH_SERVE_URL").unwrap_or_default();
-        let (host, port) = match url.rsplit_once(':') {
-            Some((h, p)) if !h.is_empty() => (
-                h.trim_matches(|c| c == '[' || c == ']'),
-                p.parse().context("SMITH_SERVE_URL port")?,
-            ),
-            _ => (
-                url.trim_matches(|c| c == '[' || c == ']'),
-                crate::events::DEFAULT_SERVE_PORT,
-            ),
+        let target = if url.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            url
         };
-        let host = if host.is_empty() { "127.0.0.1" } else { host };
         let token = match std::env::var("SMITH_SERVE_TOKEN") {
             Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
             _ => read_token_file()
                 .context("no serve token: SMITH_SERVE_TOKEN or the daemon's token file")?,
         };
-        Ok(Self::new(host, port, token))
+        let ca_cert_pem = std::env::var("SMITH_SERVE_CERT")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| std::fs::read_to_string(p.trim()))
+            .transpose()
+            .context("reading SMITH_SERVE_CERT")?;
+        Self::from_target(&target, token, ca_cert_pem)
     }
 
-    pub fn host(&self) -> &str {
-        &self.host
+    pub fn host(&self) -> String {
+        parse_serve_url(&self.base_url)
+            .map(|(_, h, _)| h)
+            .unwrap_or_default()
     }
 
     pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    async fn connect(&self) -> anyhow::Result<TcpStream> {
-        tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            TcpStream::connect((self.host.as_str(), self.port)),
-        )
-        .await
-        .context("timed out connecting to the daemon")?
-        .with_context(|| format!("connecting to {}:{}", self.host, self.port))
+        parse_serve_url(&self.base_url)
+            .map(|(_, _, p)| p)
+            .unwrap_or(crate::events::DEFAULT_SERVE_PORT)
     }
 
     async fn call(
@@ -88,19 +152,28 @@ impl ServeClient {
         body: Option<&str>,
         budget: Duration,
     ) -> anyhow::Result<String> {
-        let mut stream = self.connect().await?;
-        let (status, body) = tokio::time::timeout(
-            budget,
-            raw_request(&mut stream, method, path, &self.token, body),
-        )
-        .await
-        .context("timed out waiting for the daemon")??;
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self
+            .client
+            .request(reqwest::Method::from_bytes(method.as_bytes())?, &url)
+            .bearer_auth(&self.token)
+            .timeout(budget);
+        if let Some(b) = body {
+            req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(b.to_string());
+        }
+        let response = req.send().await.with_context(|| format!("connecting to {url}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .with_context(|| format!("reading the response from {url}"))?;
         anyhow::ensure!(
-            status == 200 || status == 202,
-            "daemon returned {status}: {}",
-            body.chars().take(300).collect::<String>()
+            status.as_u16() == 200 || status.as_u16() == 202,
+            "daemon returned {}: {}",
+            status.as_u16(),
+            text.chars().take(300).collect::<String>()
         );
-        Ok(body)
+        Ok(text)
     }
 
     async fn call_json<T: serde::de::DeserializeOwned>(
@@ -279,10 +352,23 @@ impl ServeClient {
     }
 
     /// Open an SSE stream on an arbitrary path (worker mesh command streams).
+    /// No total timeout: streams live as long as both ends do.
     pub async fn stream(&self, path: &str) -> anyhow::Result<EventStream> {
-        let stream = self.connect().await?;
-        let reader = open_chunked_response(stream, "GET", path, &self.token).await?;
-        Ok(EventStream::new(reader))
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .with_context(|| format!("connecting to {url}"))?;
+        let status = response.status();
+        anyhow::ensure!(
+            status.as_u16() == 200,
+            "event stream returned {}",
+            status.as_u16()
+        );
+        Ok(EventStream::new(Box::pin(response.bytes_stream().eventsource())))
     }
 
     /// POST a body to an arbitrary path (worker mesh routes), requiring
@@ -362,75 +448,62 @@ pub fn read_token_file() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Decoded stream over the daemon's SSE response: envelopes for client
-/// event streams, raw payloads for worker command streams.
+/// Decoded SSE stream: envelopes for client event streams, raw payloads for
+/// worker command streams. Comment lines (heartbeats) never surface.
 pub struct EventStream {
-    chunks: crate::http::ChunkedReader<TcpStream>,
-    pending: VecDeque<Envelope>,
-    pending_raw: VecDeque<String>,
-    raw: Vec<u8>,
+    inner: std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = Result<
+                        eventsource_stream::Event,
+                        eventsource_stream::EventStreamError<reqwest::Error>,
+                    >,
+                > + Send,
+        >,
+    >,
     done: bool,
 }
 
 impl EventStream {
-    fn new(chunks: crate::http::ChunkedReader<TcpStream>) -> Self {
-        Self {
-            chunks,
-            pending: VecDeque::new(),
-            pending_raw: VecDeque::new(),
-            raw: Vec::new(),
-            done: false,
-        }
+    fn new(
+        inner: std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<
+                            eventsource_stream::Event,
+                            eventsource_stream::EventStreamError<reqwest::Error>,
+                        >,
+                    > + Send,
+            >,
+        >,
+    ) -> Self {
+        Self { inner, done: false }
     }
 
     /// Next raw SSE data payload; `None` when the daemon ends the stream.
     /// Used by the worker command stream (whose payloads are commands, not
     /// envelopes).
     pub async fn next_raw(&mut self) -> anyhow::Result<Option<String>> {
-        loop {
-            if let Some(payload) = self.pending_raw.pop_front() {
-                return Ok(Some(payload));
-            }
-            if self.done {
-                return Ok(None);
-            }
-            let bytes = self.chunks.next_bytes(8192).await?;
-            match bytes {
-                None => self.done = true,
-                Some(b) => {
-                    self.raw.extend_from_slice(&b);
-                    let (payloads, rest) = crate::http::parse_sse_data(&self.raw);
-                    self.raw = rest;
-                    self.pending_raw.extend(payloads);
-                }
+        if self.done {
+            return Ok(None);
+        }
+        match self.inner.next().await {
+            Some(Ok(event)) => Ok(Some(event.data)),
+            Some(Err(e)) => Err(anyhow::Error::new(e).context("daemon stream error")),
+            None => {
+                self.done = true;
+                Ok(None)
             }
         }
     }
 
     /// Next envelope; `None` when the daemon ends the stream.
     pub async fn next(&mut self) -> anyhow::Result<Option<Envelope>> {
-        loop {
-            if let Some(env) = self.pending.pop_front() {
-                return Ok(Some(env));
-            }
-            if self.done {
-                return Ok(None);
-            }
-            let bytes = self.chunks.next_bytes(8192).await?;
-            match bytes {
-                None => self.done = true,
-                Some(b) => {
-                    self.raw.extend_from_slice(&b);
-                    let (payloads, rest) = crate::http::parse_sse_data(&self.raw);
-                    self.raw = rest;
-                    self.pending_raw.extend(payloads.iter().cloned());
-                    for payload in payloads {
-                        let env: Envelope = serde_json::from_str(&payload)
-                            .context("malformed event in the daemon stream")?;
-                        self.pending.push_back(env);
-                    }
-                }
-            }
+        match self.next_raw().await? {
+            None => Ok(None),
+            Some(payload) => serde_json::from_str(&payload)
+                .context("malformed event in the daemon stream")
+                .map(Some),
         }
     }
 }
@@ -449,14 +522,19 @@ pub fn decision_word(decision: smith_core::ApprovalDecision) -> &'static str {
 /// that hint once rather than a raw socket error.
 pub fn is_connection_error(err: &anyhow::Error) -> bool {
     err.chain()
-        .filter_map(|c| c.downcast_ref::<std::io::Error>())
-        .any(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::NotFound
-            )
+        .any(|cause| {
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::NotFound
+                )
+            } else if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
+                re.is_connect() || re.is_timeout()
+            } else {
+                false
+            }
         })
 }
 
@@ -477,5 +555,45 @@ mod tests {
             "always"
         );
         assert_eq!(decision_word(smith_core::ApprovalDecision::Deny), "deny");
+    }
+
+    #[test]
+    fn serve_url_parsing() {
+        // Bare hosts default to HTTP and the standard port.
+        assert_eq!(
+            parse_serve_url("127.0.0.1").unwrap(),
+            (false, "127.0.0.1".into(), crate::events::DEFAULT_SERVE_PORT)
+        );
+        assert_eq!(
+            parse_serve_url("gpu-box:9250").unwrap(),
+            (false, "gpu-box".into(), 9250)
+        );
+        // Schemes select the transport.
+        assert_eq!(
+            parse_serve_url("http://10.0.0.5:9250").unwrap(),
+            (false, "10.0.0.5".into(), 9250)
+        );
+        assert_eq!(
+            parse_serve_url("https://smith.example.com").unwrap(),
+            (true, "smith.example.com".into(), crate::events::DEFAULT_SERVE_PORT)
+        );
+        // IPv6 literals (S-25).
+        assert_eq!(
+            parse_serve_url("[::1]:9240").unwrap(),
+            (false, "::1".into(), 9240)
+        );
+        assert_eq!(
+            parse_serve_url("https://[2001:db8::1]:9443").unwrap(),
+            (true, "2001:db8::1".into(), 9443)
+        );
+        // Path suffixes are dropped; trailing slashes trimmed.
+        assert_eq!(
+            parse_serve_url("http://host:9240/").unwrap(),
+            (false, "host".into(), 9240)
+        );
+        // Errors.
+        assert!(parse_serve_url("").is_err());
+        assert!(parse_serve_url("http://[::1").is_err()); // unbalanced brackets
+        assert!(parse_serve_url("http://host:notaport").is_err());
     }
 }

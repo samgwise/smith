@@ -222,6 +222,8 @@ pub async fn resume_headless(
 pub struct ServeRun<'a> {
     pub url: Option<&'a str>,
     pub token: Option<&'a str>,
+    /// PEM file pinning the daemon's TLS certificate (https targets).
+    pub cert: Option<&'a str>,
     pub task: &'a str,
     pub worker: Option<&'a str>,
     pub repo: Option<&'a str>,
@@ -238,7 +240,7 @@ pub struct ServeRun<'a> {
 /// daemon (auto-approved, like local headless runs), optionally leased to a
 /// fleet worker with a git-materialised workspace. Returns the exit code.
 pub async fn run_via_serve(opts: ServeRun<'_>) -> anyhow::Result<i32> {
-    let client = crate::attach::resolve_client(opts.url, opts.token)?;
+    let client = crate::attach::resolve_client(opts.url, opts.token, opts.cert)?;
     client
         .health()
         .await
