@@ -33,8 +33,9 @@ pub const EGRESS_NETWORK: &str = "smith-egress";
 pub const EGRESS_SIDECAR: &str = "smith-egress-proxy";
 pub const EGRESS_IMAGE: &str = "localhost/smith-egress:0.1";
 pub const PROXY_PORT: u16 = 3128;
-/// Clearance control API port (published on host loopback only).
-pub const CLEARANCE_PORT: u16 = 9239;
+// The clearance control API port lives in one place:
+// `smith_egress::client::CLEARANCE_CONTROL_PORT` (9239) — used both by the
+// sidecar's publisher and the host-side client (S-09).
 
 impl NetworkMode {
     fn podman_args(&self) -> &'static [&'static str] {
@@ -540,27 +541,9 @@ impl Sandbox {
             self.config.egress_allowlist.join(",")
         };
         tracing::info!("starting egress proxy sidecar");
-        let out = self
-            .run_podman(&[
-                "run",
-                "-d",
-                "--name",
-                EGRESS_SIDECAR,
-                "--network",
-                EGRESS_NETWORK,
-                "--ip",
-                enforce::EGRESS_PROXY_IP,
-                "-p",
-                &format!("127.0.0.1:{PROXY_PORT}:{CLEARANCE_PORT}"),
-                "-e",
-                &format!("EGRESS_ALLOWLIST={allowlist}"),
-                "-e",
-                &format!("EGRESS_CLEARANCE={clearance}"),
-                "-e",
-                &format!("CLEARANCE_TOKEN={token}"),
-                EGRESS_IMAGE,
-            ])
-            .await?;
+        let args = self.sidecar_run_args(&allowlist, &clearance, &token);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run_podman(&arg_refs).await?;
         if !out.status.success() {
             anyhow::bail!(
                 "failed to start the egress proxy sidecar: {}{}",
@@ -569,6 +552,34 @@ impl Sandbox {
             );
         }
         Ok(())
+    }
+
+    /// The `podman run` argument list for the egress proxy sidecar. The
+    /// clearance control API is published on host loopback only.
+    fn sidecar_run_args(&self, allowlist: &str, clearance: &str, token: &str) -> Vec<String> {
+        use smith_egress::client::CLEARANCE_CONTROL_PORT;
+        vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            EGRESS_SIDECAR.into(),
+            "--network".into(),
+            EGRESS_NETWORK.into(),
+            "--ip".into(),
+            enforce::EGRESS_PROXY_IP.into(),
+            "-p".into(),
+            // The clearance control port, published on host loopback: the
+            // host client dials the same port the sidecar listens on (S-09).
+            // Defined in one place: smith_egress.
+            format!("127.0.0.1:{CLEARANCE_CONTROL_PORT}:{CLEARANCE_CONTROL_PORT}"),
+            "-e".into(),
+            format!("EGRESS_ALLOWLIST={allowlist}"),
+            "-e".into(),
+            format!("EGRESS_CLEARANCE={clearance}"),
+            "-e".into(),
+            format!("CLEARANCE_TOKEN={token}"),
+            EGRESS_IMAGE.into(),
+        ]
     }
 
     /// Execute a shell command inside the session container as the non-root user.
@@ -1356,6 +1367,23 @@ mod tests {
         assert!(
             has("--label", "smith.session=1"),
             "the session label backs the sweep filters: {args:?}"
+        );
+    }
+
+    /// S-09 red: the sidecar must publish the clearance control port as
+    /// `9239:9239` — the host client dials 9239.
+    #[test]
+    fn sidecar_publishes_the_clearance_control_port() {
+        let sandbox = Sandbox::new(Default::default());
+        let args = sandbox.sidecar_run_args("a.example.com", "ask", "tok");
+        let published = args
+            .windows(2)
+            .find(|w| w[0] == "-p")
+            .map(|w| w[1].clone())
+            .expect("a published port");
+        assert_eq!(
+            published, "127.0.0.1:9239:9239",
+            "the clearance control port must be published on 9239 (S-09)"
         );
     }
 

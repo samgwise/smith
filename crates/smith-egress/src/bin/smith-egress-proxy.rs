@@ -205,6 +205,22 @@ async fn control_server(state: Arc<ProxyState>) -> anyhow::Result<()> {
     }
 }
 
+/// Constant-time byte-string equality for token comparison (S-18): the
+/// fold has no early exit, so a mismatch's position or common-prefix length
+/// is not observable in timing. Lengths are compared first — a token's
+/// length is not secret.
+fn tokens_equal(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn handle_control(stream: TcpStream, state: Arc<ProxyState>) -> anyhow::Result<()> {
     let mut stream = stream;
     let (head, leftover) = read_head(&mut stream).await?;
@@ -217,7 +233,7 @@ async fn handle_control(stream: TcpStream, state: Arc<ProxyState>) -> anyhow::Re
     let authorised = head.lines().skip(1).any(|line| {
         line.split_once(':').is_some_and(|(k, v)| {
             k.trim().eq_ignore_ascii_case("authorization")
-                && v.trim().trim_start_matches("Bearer ") == expected
+                && tokens_equal(v.trim().trim_start_matches("Bearer "), &expected)
         })
     });
     if !authorised {
@@ -429,4 +445,18 @@ fn rewrite_request_line(head: &str, target: &str) -> anyhow::Result<String> {
     // `rest` holds the header block without its terminating blank line — the
     // upstream request is not complete until we append it.
     Ok(format!("{method} {path} {version}\r\n{rest}\r\n\r\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_comparison_is_constant_time_and_correct() {
+        assert!(tokens_equal("tok-123", "tok-123"));
+        assert!(!tokens_equal("tok-123", "tok-124"));
+        assert!(!tokens_equal("tok-123", "tok-1234"));
+        assert!(!tokens_equal("", "tok"));
+        assert!(tokens_equal("", ""));
+    }
 }

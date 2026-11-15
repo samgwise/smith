@@ -114,10 +114,8 @@ fn api_controller(
     script: Vec<smith_core::testing::MockResponse>,
 ) -> Arc<smith_server::Controller> {
     let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-    let fleet = Arc::new(smith_server::Fleet::new(
-        ws.join("workers.json"),
-        metrics.clone(),
-    ));
+    let fleet =
+        Arc::new(smith_server::Fleet::new(ws.join("workers.json"), metrics.clone()).unwrap());
     smith_server::Controller::with_parts(
         Arc::new(ScriptedFactory { script }),
         Duration::from_secs(60),

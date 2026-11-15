@@ -66,7 +66,8 @@ pub async fn serve(config: &Config, bind_override: Option<String>) -> anyhow::Re
     // explicit allow_plaintext_remote (S-05).
     api::ensure_bind_policy(&bind, tls.is_some(), config.serve.allow_plaintext_remote)?;
     let token = ensure_token()?;
-    let controller = Controller::new(config);
+    // A corrupt worker registry aborts startup loudly (S-19).
+    let controller = Controller::new(config)?;
     // M16: rebuild the session table from the state dir before serving —
     // recovered sessions re-attach transparently (workers never notice).
     let recovered = controller.recover().await;

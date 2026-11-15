@@ -7,7 +7,7 @@ How to use this file:
 - Keep IDs stable. Add new items at the end of their section rather than renumbering.
 - Each item ends with its migration phase (see the migration plan) or "Independent" when it's fixed separately.
 
-Status: 20 of 44 closed. The S-14 ref-policy half is in (its hook path is covered by an extended forge scope test); its token TTL/revocation half remains.
+Status: 26 of 44 closed. The S-14 ref-policy half is in (its hook path is covered by an extended forge scope test); its token TTL/revocation half remains.
 
 ## High
 
@@ -61,11 +61,11 @@ Status: 20 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: add an `input` chain that allows only DNS from the bridge. Document the residual DNS channel.
   - Verify: from a container, a connection to the gateway on a non-DNS port fails.
 
-- [ ] **S-09 · Clearance control port mismatch** (Independent, to verify)
-  - Where: `crates/smith-sandbox/src/lib.rs:498-499` (publishes `127.0.0.1:3128` to container port 9239), `crates/smith-egress/src/client.rs:12` (host client uses 9239), used at `crates/smith-server/src/controller.rs:335` and `crates/smith-server/src/factory.rs:96`
+- [x] **S-09 · Clearance control port mismatch** (fixed, security round 2 batch 4)
+  - Where: `crates/smith-sandbox/src/lib.rs` (`sidecar_run_args`), `crates/smith-egress/src/client.rs:12`
   - Problem: host clearance calls target `127.0.0.1:9239`, which isn't published. Interactive clearance would time out to deny. That fails closed, but the feature doesn't work.
-  - Fix: publish `127.0.0.1:9239:9239`, and define the port in one place.
-  - Verify: `podman port smith-egress-proxy`, then `Test-NetConnection 127.0.0.1 -Port 9239`.
+  - Fix: the sidecar publishes `127.0.0.1:9239:9239`, and the port is defined in one place — `smith_egress::client::CLEARANCE_CONTROL_PORT` (the sandbox's duplicate constant is gone).
+  - Verify: `sidecar_publishes_the_clearance_control_port` in `crates/smith-sandbox/src/lib.rs`; live check via `podman port smith-egress-proxy`.
 
 - [x] **S-10 · Root command injection in remote file reads** (fixed, security round 2 batch 2)
   - Where: `crates/smith-sandbox/src/executor.rs` (`remote_stat_command`, `remote_cat_command`)
@@ -130,21 +130,21 @@ Status: 20 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
 
 ## Low
 
-- [ ] **S-18 · Non-constant-time token comparisons** (server side fixed at the cutover; the egress sidecar remains)
-  - Where: `crates/smith-egress/src/bin/smith-egress-proxy.rs:217-222`
-  - Fix: compare hashes with `subtle::ConstantTimeEq`. Done for the serve api in `crates/smith-server/src/api.rs` (`tokens_match`, SHA-256 digests compared constant time); the egress sidecar still compares directly.
-  - Verify: no `==` comparisons on secret values remain.
+- [x] **S-18 · Non-constant-time token comparisons** (fixed; the serve api at the cutover, the egress sidecar in security round 2 batch 4)
+  - Where: `crates/smith-egress/src/bin/smith-egress-proxy.rs` (`tokens_equal`)
+  - Fix: the egress sidecar compares the bearer token with a no-early-exit XOR fold (no new dependencies in the standalone container build); the serve api compares SHA-256 digests with `subtle::ConstantTimeEq` (`tokens_match` in `crates/smith-server/src/api.rs`).
+  - Verify: `token_comparison_is_constant_time_and_correct` in the sidecar binary; no `==` comparisons on secret values remain.
 
-- [ ] **S-19 · Fleet registry resets silently on a corrupt file; enrolment tokens never expire** (Independent)
-  - Where: `crates/smith-server/src/workers.rs:96-105` (`unwrap_or_default`), `:117-128` (no expiry)
-  - Fix: fail loudly on a parse error and keep the bad file aside. Add expiry to enrolment tokens.
-  - Verify: a corrupt registry stops startup with an error, and the file is kept.
+- [x] **S-19 · Fleet registry resets silently on a corrupt file; enrolment tokens never expire** (fixed, security round 2 batch 4)
+  - Where: `crates/smith-server/src/workers.rs` (`WorkerRegistry::load`, `enrol`)
+  - Fix: a corrupt registry fails `load` with an error (backed up as `<path>.corrupt`), aborting `smith serve` startup loudly; enrolment tokens expire after an hour.
+  - Verify: `corrupt_registry_fails_loudly_and_keeps_the_file` and `enrolment_tokens_expire` in `crates/smith-server/src/workers.rs`.
 
-- [ ] **S-20 · Clearance poller reads the egress token once and never prunes** (Independent)
-  - Where: `crates/smith-server/src/controller.rs:336` (token read at construction), `:1684-1689` (poller exits if the token is missing), `:1690-1703` (`seen` grows forever)
+- [x] **S-20 · Clearance poller reads the egress token once and never prunes** (fixed, security round 2 batch 4)
+  - Where: `crates/smith-server/src/controller.rs` (`spawn_clearance_poller`)
   - Problem: on a fresh install, clearance prompts never reach the daemon.
-  - Fix: re-read the token on each poll, and prune `seen`.
-  - Verify: clearance requests appear after the egress token is created post-start.
+  - Fix: the poller re-reads the token each loop (a token created after the daemon starts still works) and prunes `seen` to a bounded window.
+  - Verify: `s20_clearance_poller_picks_up_a_token_created_after_start` in `crates/smith-server/tests/serve_integration.rs`.
 
 - [ ] **S-21 · No timeouts on MCP startup or provider calls** (Independent)
   - Where: `crates/smith-mcp/src/manager.rs:149-160` (spawn, handshake, tool listing), `crates/smith-providers/src/*.rs` (no HTTP timeouts)
@@ -201,22 +201,22 @@ Status: 20 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: pass secrets through a file or stdin, and offer a `--token-file` option.
   - Verify: the token doesn't appear in the process argument list.
 
-- [ ] **S-31 · Resume can overwrite a turn's in-memory history** (Independent)
-  - Where: `crates/smith-server/src/controller.rs:1225-1269`
+- [x] **S-31 · Resume can overwrite a turn's in-memory history** (fixed, security round 2 batch 4)
+  - Where: `crates/smith-server/src/controller.rs` (`resume`)
   - Problem: the busy check isn't atomic with the history swap, so a turn that starts in between loses its in-memory messages (the JSONL log keeps them).
-  - Fix: claim the busy flag atomically for the whole resume.
-  - Verify: a resume during a turn returns busy, and the turn's history survives.
+  - Fix: `resume` claims the busy flag with `compare_exchange` for the whole operation — a racing turn is refused while the swap happens, and the turn's history survives.
+  - Verify: `s31_resume_during_a_busy_turn_returns_busy` in `crates/smith-server/tests/serve_integration.rs`.
 
 - [x] **S-32 · Credential helper splices the token into a shell snippet** (fixed, security round 2 batch 3)
   - Where: `crates/smith-worker/src/materialise.rs` (`credential_env`)
   - Fix: the helper snippet is a token-free constant reading the token from the `SMITH_CRED_PASSWORD` env var; the token never appears in the snippet or on an argument list.
   - Verify: `credential_snippet_does_not_contain_the_token` in `crates/smith-worker/src/materialise.rs` (a token containing `$(…)` never reaches the snippet).
 
-- [ ] **S-33 · Heartbeats can re-grant released sessions** (Independent, to verify)
-  - Where: `crates/smith-server/src/controller.rs:1340-1367`
+- [x] **S-33 · Heartbeats can re-grant released sessions** (fixed, security round 2 batch 4)
+  - Where: `crates/smith-server/src/controller.rs` (`relearn_leases`)
   - Problem: after a daemon restart, a worker's `live_leases` can re-grant sessions that were already released.
-  - Fix: keep a set of released sessions, or require a lease record before re-learning.
-  - Verify: after a restart, a heartbeat listing a released session doesn't re-grant it.
+  - Fix: re-learning skips sessions whose label state is `Released` — the label is recovered from the journal after a daemon restart, so the guard holds across restarts.
+  - Verify: `relearn_skips_released_sessions` in `crates/smith-server/src/controller.rs`.
 
 - [x] **S-34 · Mount specification built by string concatenation** (fixed, security round 2 batch 2)
   - Where: `crates/smith-sandbox/src/lib.rs` (`build_mount`)

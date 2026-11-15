@@ -247,10 +247,8 @@ fn harness_controller(
     approval_timeout: Duration,
 ) -> Arc<Controller> {
     let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-    let fleet = Arc::new(smith_server::Fleet::new(
-        ws.join("workers.json"),
-        metrics.clone(),
-    ));
+    let fleet =
+        Arc::new(smith_server::Fleet::new(ws.join("workers.json"), metrics.clone()).unwrap());
     Controller::with_parts(
         Arc::new(factory),
         approval_timeout,
@@ -759,6 +757,116 @@ async fn clearance_requests_fan_out_and_decisions_are_forwarded() {
     assert_eq!(body["decision"], "allow");
 }
 
+/// S-20 red: the poller must pick up the egress token even when it is
+/// created after the poller started.
+#[tokio::test]
+async fn s20_clearance_poller_picks_up_a_token_created_after_start() {
+    // Stub sidecar: /pending lists one request, /decide records the body.
+    let stub_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub_listener.local_addr().unwrap().port();
+    let decided: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+    let stub_task = tokio::spawn({
+        let decided = Arc::clone(&decided);
+        async move {
+            loop {
+                let (mut stream, _) = stub_listener.accept().await.unwrap();
+                let (path, body) = stub_read_request(&mut stream).await.unwrap();
+                if path == "/pending" {
+                    stub_write_json(&mut stream, 200, r#"[{"id":7,"host":"example.com"}]"#)
+                        .await
+                        .unwrap();
+                } else if path == "/decide" {
+                    decided
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&body).into_owned());
+                    stub_write_json(&mut stream, 200, r#"{"applied":true}"#)
+                        .await
+                        .unwrap();
+                    return;
+                }
+            }
+        }
+    });
+
+    let ws = tempfile::tempdir().unwrap();
+    let controller = harness_controller(
+        ws.path(),
+        FakeFactory {
+            script: vec![],
+            hang: false,
+            judge_script: vec![],
+        },
+        Duration::from_secs(60),
+    );
+    // No token yet — the poller starts "too early" (the S-20 shape).
+    controller.set_clearance_target(stub_port, None);
+    let listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::api::accept_loop(
+        listener,
+        controller.clone(),
+        TOKEN.to_string(),
+        api_options(),
+    ));
+    let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
+
+    let id = client
+        .create_session(ws.path().to_str().unwrap(), None, None)
+        .await
+        .unwrap();
+    let mut events = client.events(&id, 0).await.unwrap();
+    collect(&mut events, 1).await; // session announcement
+    smith_server::controller::spawn_clearance_poller(controller.clone());
+    // Let the poller run and exit (no token yet) before the token is
+    // created — the S-20 shape, made deterministic.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The egress token is created AFTER the poller started.
+    controller.set_clearance_target(stub_port, Some("stub-token".into()));
+
+    // The poller must still surface the pending destination.
+    collect_until(&mut events, |e| {
+        matches!(&e.event, WireEvent::ClearanceRequested { id: 7, .. })
+    })
+    .await;
+    client
+        .clearance(&id, 7, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stub_task)
+        .await
+        .expect("stub never received the decision")
+        .unwrap();
+}
+
+/// S-31: a resume during a busy turn returns busy.
+#[tokio::test]
+async fn s31_resume_during_a_busy_turn_returns_busy() {
+    let h = harness_custom(
+        FakeFactory {
+            script: vec![],
+            hang: true,
+            judge_script: vec![],
+        },
+        Duration::from_secs(60),
+    )
+    .await;
+    let id = h.new_session().await;
+    let mut events = h.client.events(&id, 0).await.unwrap();
+    collect(&mut events, 1).await; // announcement
+
+    // start_turn claims the busy flag synchronously before returning.
+    h.client.start_turn(&id, "running").await.unwrap();
+    let _ = events; // the stream stays subscribed; nothing more to collect
+
+    let err = h.client.resume(&id, "whatever").await.unwrap_err();
+    assert!(
+        err.to_string().contains("cannot resume"),
+        "resume during a busy turn must be refused: {err}"
+    );
+}
+
 // ---- M15: orchestration over the mesh -------------------------------
 
 /// A fake worker: enrols, dials the command stream and answers commands
@@ -975,10 +1083,9 @@ async fn orchestration_end_to_end_over_the_mesh() {
     // judge model override and short, test-friendly timeouts.
     let controller = {
         let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-        let fleet = Arc::new(smith_server::Fleet::new(
-            ws.path().join("workers2.json"),
-            metrics.clone(),
-        ));
+        let fleet = Arc::new(
+            smith_server::Fleet::new(ws.path().join("workers2.json"), metrics.clone()).unwrap(),
+        );
         smith_server::Controller::with_parts(
             Arc::new(FakeFactory {
                 script: planner_script,
@@ -1173,10 +1280,9 @@ async fn orchestration_end_to_end_over_the_mesh() {
 async fn spawn_caps_are_enforced_and_finish_releases_queued_children() {
     let ws = tempfile::tempdir().unwrap();
     let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-    let fleet = Arc::new(smith_server::Fleet::new(
-        ws.path().join("workers3.json"),
-        metrics.clone(),
-    ));
+    let fleet = Arc::new(
+        smith_server::Fleet::new(ws.path().join("workers3.json"), metrics.clone()).unwrap(),
+    );
     let controller = smith_server::Controller::with_parts(
         Arc::new(FakeFactory {
             script: vec![],
@@ -1300,7 +1406,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
 
     let controller1 = {
         let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()).unwrap());
         smith_server::Controller::with_parts(
             Arc::new(FakeFactory {
                 script: planner_script,
@@ -1394,7 +1500,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
     // ---- the restart: a fresh controller over the same state dir ----
     let controller2 = {
         let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()).unwrap());
         smith_server::Controller::with_parts(
             Arc::new(FakeFactory {
                 script: vec![],
@@ -1544,7 +1650,7 @@ async fn requeued_children_dispatch_after_restart() {
 
     let controller1 = {
         let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()).unwrap());
         smith_server::Controller::with_parts(
             Arc::new(FakeFactory {
                 script: planner_script,
@@ -1618,7 +1724,7 @@ async fn requeued_children_dispatch_after_restart() {
     // Restart before any worker shows up.
     let controller2 = {
         let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()));
+        let fleet = Arc::new(smith_server::Fleet::new(registry.clone(), metrics.clone()).unwrap());
         smith_server::Controller::with_parts(
             Arc::new(FakeFactory {
                 script: vec![],
@@ -1868,10 +1974,8 @@ async fn client_repos(port: &u16) -> Vec<String> {
 /// A controller with a state dir (the forge is live), no public_url.
 fn harness_controller_with_state(ws: &std::path::Path, state: &std::path::Path) -> Arc<Controller> {
     let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-    let fleet = Arc::new(smith_server::Fleet::new(
-        ws.join("workers.json"),
-        metrics.clone(),
-    ));
+    let fleet =
+        Arc::new(smith_server::Fleet::new(ws.join("workers.json"), metrics.clone()).unwrap());
     Controller::with_parts(
         Arc::new(FakeFactory {
             script: vec![],
@@ -1899,10 +2003,9 @@ async fn smith_repo_scheme_mints_session_tokens() {
     let port = listener.local_addr().unwrap().port();
     let controller = {
         let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
-        let fleet = Arc::new(smith_server::Fleet::new(
-            ws.path().join("workers.json"),
-            metrics.clone(),
-        ));
+        let fleet = Arc::new(
+            smith_server::Fleet::new(ws.path().join("workers.json"), metrics.clone()).unwrap(),
+        );
         smith_server::Controller::with_parts(
             Arc::new(FakeFactory {
                 script: vec![],

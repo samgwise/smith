@@ -87,21 +87,43 @@ pub struct WorkerInfo {
 }
 
 /// Persistent registry: enrolment tokens and worker credentials, hashed.
+/// (See [`WorkerRegistry::load`] for the corrupt-file policy.)
 pub struct WorkerRegistry {
     path: PathBuf,
     state: std::sync::Mutex<RegistryFile>,
 }
 
+/// Enrolment tokens expire after this long (S-19).
+const ENROLMENT_TTL_MS: u64 = 60 * 60 * 1000;
+
 impl WorkerRegistry {
-    pub fn load(path: PathBuf) -> Self {
-        let state = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
-        Self {
+    /// Load the registry, failing loudly on a corrupt file: the bad file is
+    /// kept aside as `<path>.corrupt` and the error aborts startup — a
+    /// silent reset would silently forget every revocation (S-19).
+    pub fn load(path: PathBuf) -> anyhow::Result<Self> {
+        let state = match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(state) => state,
+                Err(e) => {
+                    let mut backup = path.clone().into_os_string();
+                    backup.push(".corrupt");
+                    std::fs::rename(&path, &backup).with_context(|| {
+                        format!("backing up the corrupt registry {}", path.display())
+                    })?;
+                    anyhow::bail!(
+                        "corrupt worker registry {}: {e} (kept aside as {})",
+                        path.display(),
+                        Path::new(&backup).display()
+                    );
+                }
+            },
+            // A missing file is a fresh registry.
+            Err(_) => Default::default(),
+        };
+        Ok(Self {
             path,
             state: std::sync::Mutex::new(state),
-        }
+        })
     }
 
     fn persist(&self, state: &RegistryFile) -> anyhow::Result<()> {
@@ -144,6 +166,11 @@ impl WorkerRegistry {
         anyhow::ensure!(
             enrolment.name == name,
             "enrolment token was issued for `{}`, not `{name}`",
+            enrolment.name
+        );
+        anyhow::ensure!(
+            now_ms().saturating_sub(enrolment.created_ms) <= ENROLMENT_TTL_MS,
+            "enrolment token for `{}` has expired",
             enrolment.name
         );
         enrolment.used = true;
@@ -442,14 +469,15 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    pub fn new(registry_path: PathBuf, metrics: Arc<Metrics>) -> Self {
-        Self {
-            registry: WorkerRegistry::load(registry_path),
+    /// Fallible: a corrupt registry aborts startup loudly (S-19).
+    pub fn new(registry_path: PathBuf, metrics: Arc<Metrics>) -> anyhow::Result<Self> {
+        Ok(Self {
+            registry: WorkerRegistry::load(registry_path)?,
             streams: Arc::new(WorkerStreams::new()),
             board: LeaseBoard::default(),
             metrics,
             connected: AtomicBool::new(false),
-        }
+        })
     }
 
     /// Pick a live worker: honour an explicit name prefix, otherwise
@@ -638,7 +666,7 @@ impl smith_core::ToolExecutor for WorkerExecutor {
 /// Helper used by tests: a registry in a temp dir.
 #[allow(dead_code)]
 pub(crate) fn temp_registry(dir: &Path) -> WorkerRegistry {
-    WorkerRegistry::load(dir.join("workers.json"))
+    WorkerRegistry::load(dir.join("workers.json")).unwrap()
 }
 
 #[cfg(test)]
@@ -658,7 +686,7 @@ mod tests {
     #[test]
     fn enrolment_is_single_use_and_revocable() {
         let dir = tempfile::tempdir().unwrap();
-        let registry = WorkerRegistry::load(dir.path().join("workers.json"));
+        let registry = WorkerRegistry::load(dir.path().join("workers.json")).unwrap();
         let token = registry.issue_enrolment("gpu-box").unwrap();
 
         let (id, worker_token) = registry
@@ -682,18 +710,59 @@ mod tests {
         assert_eq!(registry.authenticate(&worker_token), None);
     }
 
+    /// S-19: a corrupt registry file fails startup loudly and is kept
+    /// aside as `<path>.corrupt`.
+    #[test]
+    fn corrupt_registry_fails_loudly_and_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.json");
+        std::fs::write(&path, "{not json at all").unwrap();
+
+        let err = WorkerRegistry::load(path.clone())
+            .err()
+            .expect("a corrupt registry must fail to load");
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        // The bad file is kept aside, not deleted.
+        let backup = std::fs::read_to_string(path.with_extension("json.corrupt")).unwrap();
+        assert!(backup.contains("not json"), "{backup}");
+    }
+
+    /// S-19 red: enrolment tokens expire after an hour.
+    #[test]
+    fn enrolment_tokens_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.json");
+        let record = serde_json::json!({
+            "enrolments": [{
+                "token_hash": token_hash("stale-token"),
+                "name": "box",
+                "used": false,
+                "created_ms": now_ms() - 2 * 60 * 60 * 1000
+            }],
+            "workers": {}
+        });
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        let registry = WorkerRegistry::load(path).unwrap();
+        assert!(
+            registry
+                .enrol("box", "stale-token", &capability("img"))
+                .is_err(),
+            "an expired enrolment token must be refused (S-19)"
+        );
+    }
+
     #[test]
     fn registry_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("workers.json");
         {
-            let registry = WorkerRegistry::load(path.clone());
+            let registry = WorkerRegistry::load(path.clone()).unwrap();
             let token = registry.issue_enrolment("box").unwrap();
             let (_id, worker_token) = registry.enrol("box", &token, &capability("i")).unwrap();
             // The credential must outlive the daemon process.
             std::fs::write(dir.path().join("cred"), worker_token).unwrap();
         }
-        let registry = WorkerRegistry::load(path);
+        let registry = WorkerRegistry::load(path).unwrap();
         let cred = std::fs::read_to_string(dir.path().join("cred")).unwrap();
         assert_eq!(registry.authenticate(cred.trim()).as_deref(), Some("box"));
     }
@@ -701,7 +770,7 @@ mod tests {
     #[test]
     fn least_loaded_worker_wins_and_pinning_filters() {
         let dir = tempfile::tempdir().unwrap();
-        let registry = WorkerRegistry::load(dir.path().join("workers.json"));
+        let registry = WorkerRegistry::load(dir.path().join("workers.json")).unwrap();
         for name in ["a", "b"] {
             let token = registry.issue_enrolment(name).unwrap();
             registry.enrol(name, &token, &capability("img")).unwrap();
@@ -727,7 +796,8 @@ mod tests {
         let fleet = Fleet::new(
             dir.path().join("workers.json"),
             Arc::new(Metrics::default()),
-        );
+        )
+        .unwrap();
         // Not connected → nothing picks.
         assert!(fleet.pick_worker("img", None).is_none());
 
@@ -741,10 +811,13 @@ mod tests {
     #[tokio::test]
     async fn exec_op_correlates_results_and_times_out() {
         let dir = tempfile::tempdir().unwrap();
-        let fleet = Arc::new(Fleet::new(
-            dir.path().join("workers.json"),
-            Arc::new(Metrics::default()),
-        ));
+        let fleet = Arc::new(
+            Fleet::new(
+                dir.path().join("workers.json"),
+                Arc::new(Metrics::default()),
+            )
+            .unwrap(),
+        );
         let token = fleet.registry.issue_enrolment("w").unwrap();
         fleet
             .registry

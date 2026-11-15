@@ -265,13 +265,14 @@ pub struct Controller {
 }
 
 impl Controller {
-    pub fn new(config: &crate::config::Config) -> Arc<Self> {
+    /// Fallible: a corrupt worker registry aborts startup loudly (S-19).
+    pub fn new(config: &crate::config::Config) -> anyhow::Result<Arc<Self>> {
         let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
         let fleet = Arc::new(Fleet::new(
             crate::workers::workers_registry_path()
                 .unwrap_or_else(|_| PathBuf::from("workers.json")),
             metrics.clone(),
-        ));
+        )?);
         let defaults = WorkerDefaults {
             executor: config.worker.executor.clone(),
             repo_url: config.worker.repo_url.clone(),
@@ -293,7 +294,7 @@ impl Controller {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        Self::with_parts(
+        Ok(Self::with_parts(
             Arc::new(ConfigFactory {
                 config: config.clone(),
             }),
@@ -304,7 +305,7 @@ impl Controller {
             config.orchestrate.clone(),
             Some(state_dir),
             public_url,
-        )
+        ))
     }
 
     /// Test constructor: explicit factory, timeout, fleet and defaults.
@@ -1224,16 +1225,30 @@ impl Controller {
 
     /// Load a saved session log into the hosted session (daemon-side
     /// history). Fails when busy, the prefix is ambiguous, or the log
-    /// belongs to a different workspace.
+    /// belongs to a different workspace. The busy flag is claimed ATOMICALLY
+    /// for the whole resume (S-31): a turn racing in can neither start
+    /// between the check and the history swap nor lose its messages.
     pub async fn resume(
         &self,
         id: &str,
         prefix: &str,
     ) -> Result<smith_protocol::ResumeReply, ApiError> {
         let handle = self.get(id)?;
-        if handle.busy() {
-            return Err(ApiError::busy("cannot resume while a turn is running"));
-        }
+        handle
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| ApiError::busy("cannot resume while a turn is running"))?;
+        let result = self.resume_claimed(&handle, prefix).await;
+        handle.busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// The resume proper, under the claimed busy flag.
+    async fn resume_claimed(
+        &self,
+        handle: &Arc<SessionHandle>,
+        prefix: &str,
+    ) -> Result<smith_protocol::ResumeReply, ApiError> {
         if prefix.trim().is_empty() {
             return Err(ApiError::bad_request("resume requires a session id prefix"));
         }
@@ -1353,6 +1368,10 @@ impl Controller {
             };
             match self.fleet.board.lease_of(session_id) {
                 Some(_) => {} // already granted (or lost — sweeper wins)
+                // Explicitly released — the label survives a daemon restart
+                // (recovered from the journal), so the worker's stale
+                // heartbeat cannot re-grant the session (S-33).
+                None if handle.labels().lease_state == Some(LeaseState::Released) => {}
                 None => {
                     self.fleet.board.grant(session_id, worker);
                     self.fleet
@@ -1689,33 +1708,39 @@ fn now_ms() -> u64 {
 }
 
 /// Daemon-side poller for the egress sidecar's pending clearance requests.
-/// Quietly exits when no sidecar token exists (nothing to clear).
+/// The token is re-read each loop — a sidecar (and its token) created after
+/// the daemon started still gets its clearance requests through (S-20) —
+/// and the `seen` set is pruned so it cannot grow forever.
 pub fn spawn_clearance_poller(controller: Arc<Controller>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let (port, token) = controller.clearance_target();
-        let Some(token) = token else {
-            return;
-        };
         let mut seen: Vec<u64> = vec![];
         loop {
-            // Blocking std I/O on the blocking pool: the sidecar client is
-            // sync by design (standalone container build).
-            let pending = tokio::task::spawn_blocking({
-                let token = token.clone();
-                move || smith_egress::client::get_pending(port, &token)
-            })
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("poll join failed: {e}")));
-            if let Ok(pending) = pending {
-                for (id, host) in pending {
-                    if !seen.contains(&id) {
-                        seen.push(id);
-                        tracing::info!("clearance requested: {host} (request {id})");
-                        controller
-                            .broadcast_to_all(WireEvent::ClearanceRequested { id, host })
-                            .await;
+            let (port, token) = controller.clearance_target();
+            if let Some(token) = token {
+                // Blocking std I/O on the blocking pool: the sidecar client
+                // is sync by design (standalone container build).
+                let pending = tokio::task::spawn_blocking({
+                    let token = token.clone();
+                    move || smith_egress::client::get_pending(port, &token)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("poll join failed: {e}")));
+                if let Ok(pending) = pending {
+                    for (id, host) in pending {
+                        if !seen.contains(&id) {
+                            seen.push(id);
+                            tracing::info!("clearance requested: {host} (request {id})");
+                            controller
+                                .broadcast_to_all(WireEvent::ClearanceRequested { id, host })
+                                .await;
+                        }
                     }
                 }
+            }
+            // Prune: the sidecar drops requests once decided, so older ids
+            // can never resurface; keep a bounded recent window.
+            if seen.len() > 256 {
+                seen.drain(..seen.len() - 128);
             }
             tokio::time::sleep(Duration::from_millis(700)).await;
         }
@@ -1738,4 +1763,95 @@ pub fn spawn_fleet_sweeper(controller: Arc<Controller>) -> tokio::task::JoinHand
             controller.refresh_fleet_gauges();
         }
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use smith_core::LlmProvider;
+
+    struct NoopFactory;
+
+    #[async_trait]
+    impl crate::factory::SessionFactory for NoopFactory {
+        async fn create(
+            &self,
+            _workspace: &Path,
+            _provider: Option<&str>,
+            _model: Option<&str>,
+            _gate: Arc<dyn ApprovalGate>,
+        ) -> anyhow::Result<crate::factory::SessionParts> {
+            unreachable!()
+        }
+
+        fn build_provider(
+            &self,
+            _provider: Option<&str>,
+            _model: Option<&str>,
+        ) -> anyhow::Result<Arc<dyn LlmProvider>> {
+            unreachable!()
+        }
+
+        fn mcp_config(&self) -> smith_mcp::McpConfig {
+            Default::default()
+        }
+    }
+
+    fn in_memory_controller() -> Arc<Controller> {
+        let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+        let fleet = Arc::new(
+            Fleet::new(
+                std::env::temp_dir().join("smith-test-registry.json"),
+                metrics.clone(),
+            )
+            .unwrap(),
+        );
+        Controller::with_parts(
+            Arc::new(NoopFactory),
+            Duration::from_secs(60),
+            fleet,
+            metrics,
+            WorkerDefaults::default(),
+            OrchestrateSection::default(),
+            None,
+            None,
+        )
+    }
+
+    /// S-33: a heartbeat re-learn after an explicit release must not
+    /// re-grant the lease (the Released label is what the recovery path
+    /// restores after a daemon restart, so the guard holds there too).
+    #[tokio::test]
+    async fn relearn_skips_released_sessions() {
+        let controller = in_memory_controller();
+        let req = CreateSession {
+            workspace: ".".into(),
+            provider: None,
+            model: None,
+            approval_mode: Default::default(),
+            worker: None,
+            repo: None,
+            git_ref: None,
+            orchestrate: false,
+        };
+        let id = controller
+            .create_queued_child(&req, "relearn-test")
+            .await
+            .unwrap();
+
+        controller.fleet.board.grant(&id, "w");
+        assert_eq!(
+            controller.fleet.board.lease_of(&id).map(|(_, s)| s),
+            Some(LeaseState::Granted)
+        );
+        controller.release_session(&id).unwrap();
+
+        // The worker's heartbeat still lists the session (it may not have
+        // processed the stop yet); the board must not re-grant it.
+        controller.relearn_leases("w", std::slice::from_ref(&id));
+        assert!(
+            controller.fleet.board.lease_of(&id).is_none(),
+            "a released session must not be re-granted by a heartbeat (S-33)"
+        );
+    }
 }
