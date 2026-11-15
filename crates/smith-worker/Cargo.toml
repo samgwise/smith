@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 clap.workspace = true
 dunce.workspace = true
 serde.workspace = true

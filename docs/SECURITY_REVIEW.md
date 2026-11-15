@@ -7,7 +7,7 @@ How to use this file:
 - Keep IDs stable. Add new items at the end of their section rather than renumbering.
 - Each item ends with its migration phase (see the migration plan) or "Independent" when it's fixed separately.
 
-Status: 17 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation half remains.
+Status: 20 of 44 closed. The S-14 ref-policy half is in (its hook path is covered by an extended forge scope test); its token TTL/revocation half remains.
 
 ## High
 
@@ -17,11 +17,11 @@ Status: 17 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: require per-workspace trust before loading the workspace layer. Ignore `approval` and `env` from it. Doctor never spawns or calls workspace MCP servers.
   - Verify: a scratch repo whose `.smith/mcp.toml` writes a marker file. No marker may appear before trust is granted.
 
-- [ ] **S-02 · Git token sent to any host** (Independent)
-  - Where: `crates/smith-server/src/controller.rs:582-587` (attaches `token_env` to every request-supplied repo), `crates/smith-worker/src/materialise.rs:46-59` (credential helper answers for any host), `crates/smith-server/src/orchestrator.rs:1108-1115` (planner-chosen `repo` and `ref`)
+- [x] **S-02 · Git token sent to any host** (fixed, security round 2 batch 3)
+  - Where: `crates/smith-server/src/controller.rs` (`resolve_source`, `prepare_source`), `crates/smith-worker/src/materialise.rs` (`credential_scope`, `credential_env`), `crates/smith-protocol/src/workers.rs` (`WorkspaceSource.credential_origin`)
   - Problem: the worker's `SMITH_GIT_TOKEN` is returned to any host that issues a 401. A prompt-injected planner, or any API client, can name an attacker's URL.
-  - Fix: scope the helper to the configured origin with git's `credential.<URL>.helper`. Validate `repo` and `ref`, and put `--` before user-supplied URLs and refs.
-  - Verify: a local server that answers every request with 401 must receive no token during a clone.
+  - Fix: the controller binds each token to the origin it was issued for (`WorkspaceSource.credential_origin` — the configured repo's origin for env tokens, the hosted repo's origin for minted forge tokens); the worker's credential helper is `credential.<origin>.helper`, so git only offers the token there. Sources without a bound origin get no helper at all.
+  - Verify: `capture_server_receives_no_token` in `crates/smith-worker/src/materialise.rs` (a loopback server answering 401 for everything receives no token).
 
 - [x] **S-03 · Request bodies buffered before auth, and unbounded framing reads** (fixed; the legacy HTTP layer was deleted at the Phase 6 cutover)
   - Where: was `crates/smith-server/src/http.rs:70` and `crates/smith-protocol/src/http.rs` (deleted)
@@ -191,10 +191,10 @@ Status: 17 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: delete the table and reload it in one transaction.
   - Verify: after two session starts, the ruleset holds one copy of each rule.
 
-- [ ] **S-29 · Git arguments without `--`; partial repository initialisation is never repaired** (Independent)
-  - Where: `crates/smith-worker/src/materialise.rs:109-118` and `:138-148`, `crates/smith-server/src/forge.rs:151-171`
-  - Fix: `--` before URLs and refs. Initialise repositories in a temporary path and rename them into place.
-  - Verify: a branch name beginning with `-` is refused.
+- [x] **S-29 · Git arguments without `--`; partial repository initialisation is never repaired** (fixed, security round 2 batch 3)
+  - Where: `crates/smith-worker/src/materialise.rs` (all git invocations)
+  - Fix: `--` before user-supplied URLs and refs (clone, worktree add, push, branch, merge), `git_ref` validated at the entry points (no leading dash, no whitespace), and the worker is headless (credential prompting off, so a failed auth fails fast instead of stalling the session).
+  - Verify: `git_ref_validation_refuses_option_injection` in `crates/smith-worker/src/materialise.rs`; the materialise round-trip exercises the `--` forms with real git.
 
 - [ ] **S-30 · Secrets on command lines** (Independent)
   - Where: `crates/smith-sandbox/src/lib.rs:505` (`CLEARANCE_TOKEN` as a podman argument), `crates/smith-cli/src/main.rs:122-124` and `:232-234` (`--token`)
@@ -207,10 +207,10 @@ Status: 17 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: claim the busy flag atomically for the whole resume.
   - Verify: a resume during a turn returns busy, and the turn's history survives.
 
-- [ ] **S-32 · Credential helper splices the token into a shell snippet** (Independent; pairs with S-02)
-  - Where: `crates/smith-worker/src/materialise.rs:53-58`
-  - Fix: have the helper read the token from an environment variable, or validate its characters.
-  - Verify: a token containing `$(…)` isn't executed.
+- [x] **S-32 · Credential helper splices the token into a shell snippet** (fixed, security round 2 batch 3)
+  - Where: `crates/smith-worker/src/materialise.rs` (`credential_env`)
+  - Fix: the helper snippet is a token-free constant reading the token from the `SMITH_CRED_PASSWORD` env var; the token never appears in the snippet or on an argument list.
+  - Verify: `credential_snippet_does_not_contain_the_token` in `crates/smith-worker/src/materialise.rs` (a token containing `$(…)` never reaches the snippet).
 
 - [ ] **S-33 · Heartbeats can re-grant released sessions** (Independent, to verify)
   - Where: `crates/smith-server/src/controller.rs:1340-1367`

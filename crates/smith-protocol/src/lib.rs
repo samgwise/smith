@@ -21,5 +21,5 @@ pub use workers::{
     ApprovalMode, Capability, CheckpointRequest, EnrolReply, EnrolRequest, ExecEvent,
     ExecEventKind, ExecEventsRequest, ExecOp, ExecResultDto, ExecutorKind, HeartbeatRequest,
     LeaseState, Load, OpResult, OpResultRequest, WorkerCommand, WorkerStatus, WorkerSummary,
-    WorkspaceSource,
+    WorkspaceSource, url_origin,
 };

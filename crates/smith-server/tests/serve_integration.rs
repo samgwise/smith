@@ -2037,6 +2037,23 @@ async fn smith_repo_scheme_mints_session_tokens() {
         !refused.status.success(),
         "session tokens must not update refs outside smith/<session> and smith/integration/*"
     );
+
+    // The ref policy (S-14), hook path: the session token must not update
+    // ANOTHER session's checkpoint branch either.
+    let refused = git(
+        &seed,
+        &[
+            "push",
+            &url,
+            &format!("HEAD:refs/heads/smith/not-{child_id}"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(
+        !refused.status.success(),
+        "session tokens must not update other sessions' checkpoint branches"
+    );
 }
 
 // ---- Phase 4 acceptance: real git clients against the api forge -------

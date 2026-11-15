@@ -369,6 +369,8 @@ impl Controller {
                     ))
                 })?;
             source.git_url = format!("{}/git/{name}.git", base.trim_end_matches('/'));
+            // The minted token is bound to the hosted repo's own origin.
+            source.credential_origin = smith_protocol::url_origin(&source.git_url);
             if mint {
                 let forge = self
                     .forge
@@ -586,6 +588,11 @@ impl Controller {
             git_ref,
             token_env: Some(self.worker_defaults.git_token_env.clone()),
             token: None,
+            // The token belongs to the CONFIGURED repo's origin: the helper
+            // on the worker answers only there, so a request-supplied
+            // (planner-named) URL elsewhere gets no token (S-02).
+            credential_origin: non_empty(self.worker_defaults.repo_url.clone())
+                .and_then(|url| smith_protocol::url_origin(&url)),
         });
         let repo_label = source
             .as_ref()

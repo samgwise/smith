@@ -1,10 +1,11 @@
 //! Worker-side workspace materialisation: bare-clone cache per repo URL,
 //! a git worktree per session, and per-turn checkpoint commits.
 //!
-//! Credential scoping: the token is read from the configured env var and
-//! only ever injected into the git invocation URL (in memory, per process);
-//! the cache's origin URL stays clean and nothing token-shaped is written
-//! to disk.
+//! Credential scoping: the token rides the per-invocation credential-helper
+//! env, scoped with git's `credential.<url>.helper` to the origin the
+//! controller bound it to (`credential_origin`), and the helper snippet reads
+//! it from `SMITH_CRED_PASSWORD` — never spliced into a shell snippet, never
+//! offered to another host, never written to disk.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,21 +42,85 @@ pub fn work_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Git command. The token (if any) reaches git ONLY through a per-invocation
-/// credential-helper env — never in process arguments, never on disk.
-fn git(args: &[String], cwd: Option<&Path>, token: Option<&str>) -> anyhow::Result<String> {
+/// The per-invocation credential env for one origin/token pair. The helper
+/// is scoped to `origin` with git's `credential.<url>.helper` — git only
+/// offers the token there, never to another host that asks (S-02) — and the
+/// helper snippet reads the token from `SMITH_CRED_PASSWORD` so no
+/// token-shaped text is ever spliced into a shell snippet (S-32).
+fn credential_env(origin: &str, token: &str) -> Vec<(String, String)> {
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            format!("credential.{origin}.helper"),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            "!f() { echo \"username=smith-token\"; echo \"password=$SMITH_CRED_PASSWORD\"; }; f"
+                .to_string(),
+        ),
+        ("SMITH_CRED_PASSWORD".to_string(), token.to_string()),
+    ]
+}
+
+/// The credential scope for a source: `(origin, token)` where the origin is
+/// the one the controller bound the token to, falling back to the source
+/// URL's own origin. `None` = no credential helper at all.
+fn credential_scope(source: &WorkspaceSource) -> Option<(String, String)> {
+    let token = source
+        .token
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            source
+                .token_env
+                .as_ref()
+                .and_then(|name| std::env::var(name).ok())
+                .filter(|t| !t.is_empty())
+        })?;
+    let origin = source
+        .credential_origin
+        .clone()
+        .or_else(|| smith_protocol::url_origin(&source.git_url))
+        .filter(|o| !o.is_empty())?;
+    Some((origin, token))
+}
+
+/// A git ref must not start with `-` (option injection) or contain
+/// whitespace (S-29).
+fn validate_git_ref(git_ref: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!git_ref.is_empty(), "empty git ref");
+    anyhow::ensure!(
+        !git_ref.starts_with('-'),
+        "git ref must not start with `-`: {git_ref}"
+    );
+    anyhow::ensure!(
+        !git_ref.chars().any(char::is_whitespace),
+        "git ref must not contain whitespace: {git_ref}"
+    );
+    Ok(())
+}
+
+/// Git command. The token (if any) reaches git ONLY through the scoped
+/// per-invocation credential env — never in process arguments, never on
+/// disk. The worker is headless: credential prompting is off, so a failed
+/// auth fails fast instead of stalling the session.
+fn git(
+    args: &[String],
+    cwd: Option<&Path>,
+    credentials: Option<&(String, String)>,
+) -> anyhow::Result<String> {
     let mut cmd = Command::new("git");
     cmd.args(args);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    if let Some(token) = token {
-        cmd.env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "credential.helper")
-            .env(
-                "GIT_CONFIG_VALUE_0",
-                format!("!f() {{ echo \"username=smith-token\"; echo \"password={token}\"; }}; f"),
-            );
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "echo");
+    if let Some((origin, token)) = credentials {
+        for (key, value) in credential_env(origin, token) {
+            cmd.env(key, value);
+        }
     }
     let out = cmd
         .output()
@@ -80,19 +145,18 @@ pub fn materialise(session_id: &str, source: &Option<WorkspaceSource>) -> anyhow
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         return Ok(dir);
     };
+    validate_git_ref(&source.git_ref)?;
 
     let base = work_dir()?;
     let cache = base.join(format!("cache-{}", fnv64(&source.git_url)));
 
-    // The token for THIS invocation: from the env var named in the source.
-    let token = source
-        .token_env
-        .as_ref()
-        .and_then(|name| std::env::var(name).ok())
-        .filter(|t| !t.is_empty());
+    // The credential scope for THIS invocation: the token plus the origin
+    // it is bound to (S-02).
+    let credentials = credential_scope(source);
 
     // Bare clone cache: clone once, fetch afterwards. The token rides the
-    // per-invocation credential-helper env; the cache keeps a clean URL.
+    // per-invocation scoped credential-helper env; the cache keeps a clean
+    // URL.
     if cache.exists() {
         git(
             &[
@@ -103,18 +167,19 @@ pub fn materialise(session_id: &str, source: &Option<WorkspaceSource>) -> anyhow
                 "+refs/tags/*:refs/tags/*".into(),
             ],
             Some(&cache),
-            token.as_deref(),
+            credentials.as_ref(),
         )?;
     } else {
         git(
             &[
                 "clone".into(),
                 "--bare".into(),
+                "--".into(),
                 source.git_url.clone(),
                 cache.display().to_string(),
             ],
             None,
-            token.as_deref(),
+            credentials.as_ref(),
         )?;
     }
 
@@ -140,6 +205,7 @@ pub fn materialise(session_id: &str, source: &Option<WorkspaceSource>) -> anyhow
             "worktree".into(),
             "add".into(),
             "--detach".into(),
+            "--".into(),
             worktree.display().to_string(),
             source.git_ref.clone(),
         ],
@@ -186,21 +252,17 @@ pub fn checkpoint(
     let Some(source) = source else {
         return Ok((commit, false)); // scratch workspace: nothing to push
     };
-    let token = source
-        .token_env
-        .as_ref()
-        .and_then(|name| std::env::var(name).ok())
-        .filter(|t| !t.is_empty());
     // The worktree is detached: push HEAD to the checkpoint branch ref
     // (which we never need to materialise locally).
     let pushed = git(
         &[
             "push".into(),
             "origin".into(),
+            "--".into(),
             format!("HEAD:refs/heads/{branch}"),
         ],
         Some(worktree),
-        token.as_deref(),
+        credential_scope(source).as_ref(),
     )
     .is_ok();
     Ok((commit, pushed))
@@ -235,21 +297,6 @@ pub fn cache_dir(source: &WorkspaceSource) -> anyhow::Result<PathBuf> {
     Ok(work_dir()?.join(format!("cache-{}", fnv64(&source.git_url))))
 }
 
-/// The token for THIS invocation: a delivered forge token (M17) wins;
-/// otherwise the env var named in the source.
-fn token_of(source: &WorkspaceSource) -> Option<String> {
-    if let Some(t) = &source.token
-        && !t.trim().is_empty()
-    {
-        return Some(t.clone());
-    }
-    source
-        .token_env
-        .as_ref()
-        .and_then(|name| std::env::var(name).ok())
-        .filter(|t| !t.is_empty())
-}
-
 /// Merge the session's checkpoint branch into the integration branch.
 ///
 /// The cache is fetched first (the checkpoint push and other workers'
@@ -267,8 +314,9 @@ pub fn merge_for_gate(
             "merge gate needs a git-backed workspace (scratch sessions have no branches)"
         );
     };
+    validate_git_ref(&source.git_ref)?;
     let cache = cache_dir(source)?;
-    let token = token_of(source);
+    let credentials = credential_scope(source);
     git(
         &[
             "fetch".into(),
@@ -277,7 +325,7 @@ pub fn merge_for_gate(
             "+refs/heads/*:refs/heads/*".into(),
         ],
         Some(&cache),
-        token.as_deref(),
+        credentials.as_ref(),
     )?;
 
     let child_branch = format!("smith/{session_id}");
@@ -311,6 +359,7 @@ pub fn merge_for_gate(
         git(
             &[
                 "branch".into(),
+                "--".into(),
                 integration_ref.into(),
                 source.git_ref.clone(),
             ],
@@ -341,6 +390,7 @@ pub fn merge_for_gate(
         &[
             "worktree".into(),
             "add".into(),
+            "--".into(),
             gate_wt.display().to_string(),
             integration_ref.into(),
         ],
@@ -359,6 +409,7 @@ pub fn merge_for_gate(
             "--no-ff".into(),
             "-m".into(),
             merge_msg,
+            "--".into(),
             child_branch,
         ],
         Some(&gate_wt),
@@ -403,10 +454,11 @@ pub fn commit_gate(
             &[
                 "push".into(),
                 "origin".into(),
+                "--".into(),
                 format!("{integration_ref}:refs/heads/{integration_ref}"),
             ],
             Some(&gate.worktree),
-            token_of(source).as_deref(),
+            credential_scope(source).as_ref(),
         )
         .is_ok(),
         None => false,
@@ -430,10 +482,11 @@ pub fn push_branch(
         &[
             "push".into(),
             "origin".into(),
+            "--".into(),
             format!("{from_ref}:refs/heads/{to_ref}"),
         ],
         Some(&cache),
-        token_of(source).as_deref(),
+        credential_scope(source).as_ref(),
     )
 }
 
@@ -478,6 +531,132 @@ fn remove_gate_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// S-32 red: a token containing shell metacharacters must never be
+    /// spliced into the helper snippet — the helper reads it from an env var.
+    #[test]
+    fn credential_snippet_does_not_contain_the_token() {
+        let token = "sekrit-$(pwned)-tok";
+        let env = credential_env("https://git.example.com", token);
+        let value = &env
+            .iter()
+            .find(|(k, _)| k == "GIT_CONFIG_VALUE_0")
+            .expect("helper config value")
+            .1;
+        assert!(
+            !value.contains(token),
+            "the token must not be spliced into the helper snippet: {value}"
+        );
+        assert!(
+            value.contains("$SMITH_CRED_PASSWORD"),
+            "the helper must read the token from SMITH_CRED_PASSWORD"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SMITH_CRED_PASSWORD" && v == token),
+            "the token rides in its own env var"
+        );
+    }
+
+    /// S-02 red: a capture server answering 401 for everything must receive
+    /// NO token during a clone — the credential helper only answers the
+    /// origin the token is bound to, not every host that asks.
+    #[tokio::test]
+    async fn capture_server_receives_no_token() {
+        const TOKEN: &str = "sekrit-capture-token";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = std::thread::spawn({
+            let seen = seen.clone();
+            let stop = stop.clone();
+            move || {
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut stream = stream.unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .ok();
+                    let mut got = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match std::io::Read::read(&mut stream, &mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                got.extend_from_slice(&chunk[..n]);
+                                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&got);
+                    for line in text.lines() {
+                        if line.to_ascii_lowercase().starts_with("authorization:") {
+                            seen.lock().unwrap().push(line.to_string());
+                        }
+                    }
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 401 Unauthorized\r\n\
+                          WWW-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\n\r\n",
+                    );
+                }
+            }
+        });
+
+        // Scratch the work dir so the test never touches ~/.smith-worker.
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("SMITH_WORKER_WORK_DIR", tmp.path().join("work"));
+            // The worker's configured git token, as the real env var.
+            std::env::set_var("SMITH_TEST_CAPTURE_TOKEN", TOKEN);
+        }
+        // An attacker-named repo URL carrying the controller's token_env —
+        // the S-02 shape. The token is bound to a DIFFERENT origin (the
+        // controller's configured one).
+        let source = WorkspaceSource {
+            git_url: format!("http://127.0.0.1:{port}/evil.git"),
+            git_ref: "main".into(),
+            token_env: Some("SMITH_TEST_CAPTURE_TOKEN".into()),
+            token: None,
+            credential_origin: Some("https://git.example.com".into()),
+        };
+        // The clone itself fails (401 forever); the assertion is on what the
+        // capture server saw.
+        let _ = materialise("capture-test", &Some(source));
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        server.join().unwrap();
+
+        let expected =
+            base64::engine::general_purpose::STANDARD.encode(format!("smith-token:{TOKEN}"));
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|h| h.contains(&expected) || h.contains(TOKEN)),
+            "the token must not reach a foreign host; captured: {seen:?}"
+        );
+    }
+
+    /// S-29: a git ref beginning with `-` (or containing whitespace) is
+    /// refused before git runs.
+    #[test]
+    fn git_ref_validation_refuses_option_injection() {
+        assert!(validate_git_ref("main").is_ok());
+        assert!(validate_git_ref("smith/integration/p1").is_ok());
+        assert!(validate_git_ref("-spam").is_err());
+        assert!(validate_git_ref("main -oUnknown").is_err());
+        assert!(validate_git_ref("").is_err());
+    }
 
     #[test]
     fn scratch_and_checkpoint_round_trip() {
@@ -522,6 +701,7 @@ mod tests {
             git_ref: "main".into(),
             token_env: None,
             token: None,
+            credential_origin: None,
         };
 
         // Bare-clone cache + worktree under the work dir.

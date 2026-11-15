@@ -182,6 +182,23 @@ pub struct WorkspaceSource {
     /// token scoped to this repo. Preferred over the `token_env` lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// The origin (`scheme://host[:port]`) the credential is valid for (S-02).
+    /// The worker's credential helper only answers this origin — a
+    /// request-supplied repo URL elsewhere gets no token. The controller sets
+    /// it to the origin of the repo the token was issued for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_origin: Option<String>,
+}
+
+/// The `scheme://host[:port]` origin of a git URL; `None` when the URL has no
+/// remote scheme (`file://`, local paths) or authority.
+pub fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
 }
 
 /// Whether a hosted session asks its viewers for approvals or auto-allows
@@ -473,6 +490,7 @@ mod tests {
                 git_ref: "main".into(),
                 token_env: Some("SMITH_GIT_TOKEN".into()),
                 token: None,
+                credential_origin: Some("https://git.example.com".into()),
             }),
         };
         // A delivered forge token rides the source (M17) and survives the
@@ -485,6 +503,7 @@ mod tests {
                 git_ref: "main".into(),
                 token_env: None,
                 token: Some("s3cret".into()),
+                credential_origin: Some("https://controller".into()),
             }),
         };
         let json = serde_json::to_string(&brokered).unwrap();
