@@ -147,8 +147,9 @@ pub struct SandboxSection {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ServeSection {
-    /// Bind address. Loopback by default: M13 is colocated; put a TLS
-    /// reverse proxy in front when the daemon leaves the box.
+    /// Bind address. Loopback by default; a non-loopback bind needs TLS
+    /// (`tls_cert` + `tls_key`) or an explicit
+    /// `allow_plaintext_remote = true`.
     pub bind: String,
     /// Seconds before an unanswered approval auto-denies.
     pub approval_timeout_secs: u64,
@@ -159,6 +160,14 @@ pub struct ServeSection {
     /// controller's forge (`smith:<name>` repo references resolve against
     /// it). Empty = the forge's `smith:` scheme is unavailable.
     pub public_url: Option<String>,
+    /// PEM certificate chain for TLS on the serve API. Both this and
+    /// `tls_key` must be set for TLS to be served.
+    pub tls_cert: Option<String>,
+    /// PEM private key matching `tls_cert`.
+    pub tls_key: Option<String>,
+    /// Explicitly accept a non-loopback bind without TLS (plaintext on the
+    /// wire). Off by default: refusing is the safe behaviour.
+    pub allow_plaintext_remote: bool,
 }
 
 impl Default for ServeSection {
@@ -168,6 +177,9 @@ impl Default for ServeSection {
             approval_timeout_secs: 300,
             state_dir: None,  // ~/.smith/serve
             public_url: None, // e.g. https://smith.example.com
+            tls_cert: None,
+            tls_key: None,
+            allow_plaintext_remote: false,
         }
     }
 }
@@ -351,6 +363,10 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              approval_timeout_secs = 300  # unanswered approvals auto-deny\n\
              # state_dir = \"~/.smith/serve\"  # durable journals + sessions (M16)\n\
              # public_url = \"https://smith.example.com\"  # the forge's advertised URL (M17)\n\
+             # TLS on the serve API (required for a non-loopback bind):\n\
+             # tls_cert = \"/etc/smith/serve.pem\"\n\
+             # tls_key = \"/etc/smith/serve.key\"\n\
+             # allow_plaintext_remote = false  # explicit opt-in to remote plaintext\n\
              \n\
              [worker]\n\
              # fleet execution (smith-worker; see docs/WORKER_MESH.md)\n\

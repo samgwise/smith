@@ -29,11 +29,11 @@ Status: 0 of 44 closed.
   - Fix: authenticate in middleware before any body is read, and let hyper handle framing with its own limits.
   - Verify: `red_s03_unauthenticated_body_is_not_read` in `crates/smith-server/tests/serve_integration.rs` (added 15 November 2026; fails today as expected — no response within 3 s while the server waits for the declared body).
 
-- [ ] **S-04 · No connection cap and no request deadline** (Phase 1)
+- [ ] **S-04 · No connection cap and no request deadline** (fixed in the new api, Phase 1; closes at the Phase 4 cutover while the legacy loop still serves)
   - Where: `crates/smith-server/src/http.rs:38-53` (one task per connection, no limit), `crates/smith-protocol/src/http.rs:22` (timeouts apply per read, not per request)
   - Problem: any number of connections can be opened, and each can stall by sending bytes just often enough to beat the per-read timeout.
   - Fix: a connection semaphore, hyper's header-read timeout, and a per-frame upload timeout (tower-http `RequestBodyTimeoutLayer`). Phase 0 finding: hyper's header timeout also closes idle keep-alive connections, so no separate idle knob is needed.
-  - Verify: `red_s04_idle_connection_is_bounded_and_cap_refuses_extras` in `crates/smith-server/tests/serve_integration.rs` (added 15 November 2026; fails today as expected — an idle connection was still open after 15 s).
+  - Verify: `s04_idle_connection_is_bounded_and_cap_refuses_extras` in `crates/smith-server/tests/serve_integration.rs` and the api tests in `crates/smith-server/tests/api_integration.rs` (green as of Phase 1, against the new server; the legacy loop the daemon still runs is fixed by the same code at the cutover).
 
 - [ ] **S-05 · Plaintext transport; TLS verification documented but not built** (Phases 1, 5)
   - Where: `crates/smith-protocol/src/client.rs:74-82` (raw TCP), `crates/smith-worker/src/main.rs:55-65` (strips `http://`, no TLS), `docs/WORKER_MESH.md:18-20` and `crates/smith-server/src/workers.rs:1-7` (say the worker verifies the controller's certificate), `crates/smith-server/src/config.rs:150-152` (any bind address accepted)
@@ -129,9 +129,9 @@ Status: 0 of 44 closed.
 
 ## Low
 
-- [ ] **S-18 · Non-constant-time token comparisons** (Phase 1)
+- [ ] **S-18 · Non-constant-time token comparisons** (new api done in Phase 1; legacy server and sidecar at cutover / Independent)
   - Where: `crates/smith-server/src/http.rs:78` and `:453`, `crates/smith-egress/src/bin/smith-egress-proxy.rs:217-222`
-  - Fix: compare hashes with `subtle::ConstantTimeEq`.
+  - Fix: compare hashes with `subtle::ConstantTimeEq`. Done in `crates/smith-server/src/api.rs` (`tokens_match`, SHA-256 digests compared constant time); the legacy loop and the egress sidecar keep their direct comparisons until cutover / their own fix.
   - Verify: no `==` comparisons on secret values remain.
 
 - [ ] **S-19 · Fleet registry resets silently on a corrupt file; enrolment tokens never expire** (Independent)

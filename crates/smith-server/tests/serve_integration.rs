@@ -1951,7 +1951,9 @@ async fn smith_repo_scheme_mints_session_tokens() {
 // with:
 //   cargo test -p smith-server --test serve_integration -- --ignored
 // Each goes green in the phase noted in its ignore reason; remove the
-// attribute then.
+// attribute then. s04_* has already moved to the axum api (Phase 1) and runs
+// in the default suite; the rest still target the legacy server and turn
+// green as their phases port the routes.
 
 use smith_protocol::http::raw_request;
 
@@ -2068,25 +2070,42 @@ async fn red_s03_unauthenticated_body_is_not_read() {
     assert!(text.starts_with("HTTP/1.1 401"), "{text}");
 }
 
-/// RED (S-04, green in Phase 1): the server must bound connection resources.
-/// Part 1: an idle connection that never sends a head is closed well within
-/// the 10 s header-read budget (today it lingers for the 30 s read timeout).
-/// Part 2: connections beyond the cap are closed promptly (today nothing
-/// ever closes idle connections early).
+/// GREEN (S-04, Phase 1): the axum api bounds connection resources. Part 1:
+/// an idle connection that never sends a head is closed within the header
+/// read budget. Part 2: connections beyond the cap are closed promptly.
+/// This replaces the legacy-server red test of the same number.
 #[tokio::test]
-#[ignore = "red test (S-04): goes green in Phase 1 (connection limits + timeouts)"]
-async fn red_s04_idle_connection_is_bounded_and_cap_refuses_extras() {
-    let (_controller, port, _ws, _state) = forge_harness().await;
+async fn s04_idle_connection_is_bounded_and_cap_refuses_extras() {
+    let ws = tempfile::tempdir().unwrap();
+    let controller = harness_controller(
+        ws.path(),
+        FakeFactory {
+            script: vec![],
+            hang: false,
+            judge_script: vec![],
+        },
+        Duration::from_secs(60),
+    );
+    let listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::api::accept_loop(
+        listener,
+        controller,
+        TOKEN.to_string(),
+        smith_server::api::ApiOptions {
+            header_read_timeout: Duration::from_secs(1),
+            ..Default::default()
+        },
+    ));
 
     // Part 1: header-read timeout. A silent client is disconnected.
-    let idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let mut idle = idle;
+    let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();
-    let closed = tokio::time::timeout(Duration::from_secs(15), idle.read_to_end(&mut buf)).await;
+    let closed = tokio::time::timeout(Duration::from_secs(5), idle.read_to_end(&mut buf)).await;
     assert!(
-        matches!(closed, Ok(Ok(_))),
-        "an idle connection was still open after 15s — no header-read deadline (S-04)"
+        matches!(closed, Ok(Ok(0))),
+        "an idle connection was still open after 5s with a 1s header-read deadline (S-04)"
     );
 
     // Part 2: the connection cap. Over-cap connections are closed promptly.

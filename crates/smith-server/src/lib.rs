@@ -6,6 +6,7 @@
 //! `~/.smith/serve-token`, every request audited via tracing. Model keys
 //! live only in the daemon's environment.
 
+pub mod api;
 pub mod config;
 pub mod controller;
 pub mod factory;
@@ -25,6 +26,8 @@ pub use factory::{
 pub use gate::{GateSlot, WireGate};
 pub use journal::Journal;
 pub use workers::{Fleet, WorkerExecutor, WorkerRegistry, workers_registry_path};
+
+use std::path::Path;
 
 use anyhow::Context;
 use smith_protocol::client::token_file;
@@ -49,6 +52,21 @@ pub fn ensure_token() -> anyhow::Result<String> {
 /// exit; `smith clean` reaps them).
 pub async fn serve(config: &Config, bind_override: Option<String>) -> anyhow::Result<()> {
     let bind = bind_override.unwrap_or_else(|| config.serve.bind.clone());
+    // Validate the TLS pair eagerly (fail fast on bad files). The axum api
+    // serves TLS from the Phase 4 cutover; until then the legacy loop here
+    // cannot speak TLS, so `tls_served` is false and a non-loopback bind
+    // needs an explicit allow_plaintext_remote (S-05).
+    let tls = match (&config.serve.tls_cert, &config.serve.tls_key) {
+        (Some(cert), Some(key)) => {
+            let acceptor = api::load_tls_acceptor(Path::new(cert), Path::new(key))?;
+            tracing::info!("TLS configured (served by the axum api at the migration cutover)");
+            Some(acceptor)
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("serve.tls_cert and serve.tls_key must be set together"),
+    };
+    drop(tls); // honoured by the api accept loop at cutover
+    api::ensure_bind_policy(&bind, false, config.serve.allow_plaintext_remote)?;
     let token = ensure_token()?;
     let controller = Controller::new(config);
     // M16: rebuild the session table from the state dir before serving —
