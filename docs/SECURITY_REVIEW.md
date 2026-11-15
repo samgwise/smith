@@ -7,7 +7,7 @@ How to use this file:
 - Keep IDs stable. Add new items at the end of their section rather than renumbering.
 - Each item ends with its migration phase (see the migration plan) or "Independent" when it's fixed separately.
 
-Status: 11 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation half remains.
+Status: 17 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation half remains.
 
 ## High
 
@@ -47,11 +47,11 @@ Status: 11 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: `needs_approval` receives the call's path; writes to host-executing config (`.git/hooks/*`, `.git/config`, `.git/modules/*/config`, `.gitattributes`, `.envrc`) always demand approval. Approval-gated writes (not a read-only `.git` mount — the agent legitimately commits in-container).
   - Verify: `write_file_to_git_hooks_demands_approval` and `sensitive_write_paths` in `crates/smith-core/src/tools.rs`.
 
-- [ ] **S-07 · Symlink escape on write, for local and worker file operations** (Independent)
-  - Where: `crates/smith-sandbox/src/executor.rs:55-96` (`resolve` only canonicalises existing paths), `:157-167` (the write follows the link), `crates/smith-worker/src/main.rs:769-773` (worker writes use the same code)
+- [x] **S-07 · Symlink escape on write, for local and worker file operations** (fixed, security round 2 batch 2)
+  - Where: `crates/smith-sandbox/src/executor.rs` (`resolve`, `write_file`)
   - Problem: for a dangling symlink, `exists()` is false, so `resolve` accepts the link path and `std::fs::write` follows it outside the workspace, with no approval. This applies to Linux and macOS hosts, where symlinks are supported.
-  - Fix: confine file operations with `cap-std` directory handles, or reject links using `symlink_metadata` and create files with `create_new`.
-  - Verify: a workspace symlink to a missing file outside the workspace. `write_file` must refuse.
+  - Fix: `resolve` walks the candidate path with `symlink_metadata` and refuses any symlink component. The worker's file ops route through the same `LocalExecutor`, so the fix covers the worker too.
+  - Verify: `write_file_refuses_a_dangling_symlink_escape` in `crates/smith-sandbox/src/executor.rs` (`#[cfg(unix)]`).
 
 ## Medium
 
@@ -67,11 +67,11 @@ Status: 11 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: publish `127.0.0.1:9239:9239`, and define the port in one place.
   - Verify: `podman port smith-egress-proxy`, then `Test-NetConnection 127.0.0.1 -Port 9239`.
 
-- [ ] **S-10 · Root command injection in remote file reads** (Independent)
-  - Where: `crates/smith-sandbox/src/executor.rs:231-254` (`stat` runs as root and `cat` as `dev`; the path is interpolated inside single quotes), `:204-221` (rejects only `..`)
+- [x] **S-10 · Root command injection in remote file reads** (fixed, security round 2 batch 2)
+  - Where: `crates/smith-sandbox/src/executor.rs` (`remote_stat_command`, `remote_cat_command`)
   - Problem: a path containing `'` breaks out of the quoting and runs commands in the container as root. The model controls the path.
-  - Fix: use the `shell_quote` helper the write path already uses, or pass argv directly.
-  - Verify: `read_file` with a path containing `'; id; '` must not run `id`.
+  - Fix: the remote `stat` and `cat` commands go through the `shell_quote` helper the write path already uses.
+  - Verify: `remote_read_commands_quote_the_path` in `crates/smith-sandbox/src/executor.rs` (a path containing `'; id; '` cannot break out).
 
 - [x] **S-11 · Approval checks can be bypassed with compound commands and prefixes** (fixed, security round 2 batch 1)
   - Where: `crates/smith-core/src/agent.rs` (the risky list and the approval cache)
@@ -104,17 +104,17 @@ Status: 11 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: create files with owner-only permissions and write them through `tempfile`'s `persist`. On Windows, confirm the resulting ACLs.
   - Verify: `stat` on Linux shows mode 0600 for each file.
 
-- [ ] **S-16 · `smith clean` removes unrelated containers** (Independent)
-  - Where: `crates/smith-sandbox/src/lib.rs:1018-1039` (`clean_all`), `:207-229` (`reap_stopped_sessions`)
+- [x] **S-16 · `smith clean` removes unrelated containers** (fixed, security round 2 batch 2)
+  - Where: `crates/smith-sandbox/src/lib.rs` (`session_container_filters`, shared by `clean_all` and `reap_stopped_sessions`)
   - Problem: the `name=smith-` filter is an unanchored regex, so any container with "smith-" anywhere in its name is force-removed.
-  - Fix: anchor the name (`^smith-`) and filter on a label that smith sets.
-  - Verify: a container named `legacy-smith-dev` survives `smith clean`.
+  - Fix: the name filter is anchored (`^smith-`) and the `smith.session=1` label — set on every session container at `podman run` — is required.
+  - Verify: `session_container_filters_are_anchored_and_labelled` in `crates/smith-sandbox/src/lib.rs`.
 
-- [ ] **S-17 · Workspace denylist is name-based** (Independent)
-  - Where: `crates/smith-sandbox/src/lib.rs:1050-1067`
+- [x] **S-17 · Workspace denylist is name-based** (fixed, security round 2 batch 2)
+  - Where: `crates/smith-sandbox/src/lib.rs` (`refuse_sensitive_workspace`)
   - Problem: only the exact home directory and paths with components named `.ssh`, `.aws` and similar are refused. Mounting `C:\Users` or `C:\` is allowed, which exposes `samgw\.ssh` inside the container.
-  - Fix: restrict workspaces to configured roots, and refuse any ancestor of the home directory.
-  - Verify: `C:\Users` is refused as a workspace.
+  - Fix: any ancestor of the home directory is refused (the home's `Path::starts_with` on the canonicalised workspace), on top of the existing sensitive-component check.
+  - Verify: `workspace_refusal_refuses_ancestors_of_the_home_directory` in `crates/smith-sandbox/src/lib.rs`.
 
 - [x] **C-01 · Worker results above 1 MiB are silently dropped** (fixed at the Phase 6 cutover; the worker-side output caps are S-13)
   - Where: was the 1 MiB cap on `/v1/worker/op-result` in the legacy HTTP layer
@@ -179,11 +179,11 @@ Status: 11 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: resolve program names with the `which` crate, which honours PATHEXT.
   - Verify: `npx` resolves through `which` and starts.
 
-- [ ] **S-27 · Container hardening** (Independent)
-  - Where: `crates/smith-sandbox/src/lib.rs:303-345`
+- [x] **S-27 · Container hardening** (fixed, security round 2 batch 2)
+  - Where: `crates/smith-sandbox/src/lib.rs` (`run_args`)
   - Problem: no `--cap-drop=ALL` and no `no-new-privileges`, and the boot script runs as root.
-  - Fix: drop capabilities, set `no-new-privileges`, and keep root only for the boot step.
-  - Verify: `podman inspect` shows the dropped capabilities.
+  - Fix: `--cap-drop=ALL`, then `--cap-add` of exactly the five caps the root boot step needs (CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID — useradd + apt), and `--security-opt no-new-privileges` so the agent user cannot regain any of it.
+  - Verify: `run_args_harden_the_container` in `crates/smith-sandbox/src/lib.rs`; live check via `podman inspect`.
 
 - [ ] **S-28 · Re-applying the nftables ruleset appends rules** (Independent, to verify)
   - Where: `crates/smith-sandbox/src/lib.rs:979-981`, `crates/smith-sandbox/src/enforce.rs:82-89` (the test comment says `nft -f` replaces the table)
@@ -218,11 +218,11 @@ Status: 11 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocatio
   - Fix: keep a set of released sessions, or require a lease record before re-learning.
   - Verify: after a restart, a heartbeat listing a released session doesn't re-grant it.
 
-- [ ] **S-34 · Mount specification built by string concatenation** (Independent)
-  - Where: `crates/smith-sandbox/src/lib.rs:292-301`
+- [x] **S-34 · Mount specification built by string concatenation** (fixed, security round 2 batch 2)
+  - Where: `crates/smith-sandbox/src/lib.rs` (`build_mount`)
   - Problem: a colon in the workspace path changes the meaning of the mount.
-  - Fix: pass the mount as separate arguments, or reject paths containing colons.
-  - Verify: a workspace path containing `:` mounts the intended directory or is refused.
+  - Fix: the mount builder refuses any `:` in the source beyond the Windows drive-letter prefix (which podman expects in the source).
+  - Verify: `mount_spec_refuses_colons_in_the_source` in `crates/smith-sandbox/src/lib.rs`.
 
 ## Documentation to correct
 

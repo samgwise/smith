@@ -21,6 +21,17 @@ const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
+
+/// The root-run `stat` that sizes a remote read. The path is
+/// single-quote-escaped so a `'` in it cannot break out (S-10).
+fn remote_stat_command(container_path: &str) -> String {
+    format!("stat -c %s {}", shell_quote(container_path))
+}
+
+/// The dev-run `cat` that streams a remote read (quoting as above).
+fn remote_cat_command(container_path: &str) -> String {
+    format!("cat {}", shell_quote(container_path))
+}
 /// Lines returned per page when `limit` is not given.
 const DEFAULT_PAGE_LINES: u64 = 2000;
 
@@ -74,6 +85,19 @@ impl LocalExecutor {
         }
 
         let joined = self.root.join(candidate);
+        // Refuse any symlink component: a dangling link fails `exists()` yet
+        // `std::fs::write` would still follow it outside the workspace (S-07).
+        let mut probe = self.root.clone();
+        for component in candidate.components() {
+            probe.push(component);
+            match std::fs::symlink_metadata(&probe) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    bail!("refusing a symlinked path: {raw}")
+                }
+                Ok(_) => {}
+                Err(_) => break, // nothing exists beyond here yet
+            }
+        }
         // For not-yet-existing files, canonicalise the parent.
         let resolved = if joined.exists() {
             dunce::canonicalize(&joined)?
@@ -234,7 +258,7 @@ impl LocalExecutor {
             .exec_as(
                 &self.session,
                 Some("root"),
-                &format!("stat -c %s '{container_path}'"),
+                &remote_stat_command(&container_path),
                 None,
             )
             .await?;
@@ -248,7 +272,7 @@ impl LocalExecutor {
             .exec_as(
                 &self.session,
                 None,
-                &format!("cat '{container_path}'"),
+                &remote_cat_command(&container_path),
                 None,
             )
             .await?;
@@ -412,5 +436,45 @@ mod tests {
         let exec: &dyn ToolExecutor = &exec;
         assert!(exec.read_file("../outside.txt", None, None).await.is_err());
         assert!(exec.read_file("/etc/hosts", None, None).await.is_err());
+    }
+
+    /// S-07 red: a dangling symlink passes `resolve` (`exists()` is false)
+    /// and `std::fs::write` follows the link outside the workspace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_refuses_a_dangling_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        symlink(&victim, tmp.path().join("escape.txt")).unwrap();
+        let exec = executor_for(tmp.path());
+        let exec: &dyn ToolExecutor = &exec;
+
+        assert!(
+            exec.write_file("escape.txt", "pwned").await.is_err(),
+            "a symlinked path must be refused"
+        );
+        assert!(!victim.exists(), "the write must not follow the link");
+
+        // A link to an EXISTING file outside is refused as well.
+        std::fs::write(&victim, "secret").unwrap();
+        symlink(&victim, tmp.path().join("peek.txt")).unwrap();
+        assert!(exec.read_file("peek.txt", None, None).await.is_err());
+    }
+
+    /// S-10 red: the remote read commands embed the path in single quotes;
+    /// a `'` in the path must not break out.
+    #[test]
+    fn remote_read_commands_quote_the_path() {
+        let quoted = "'/workspace/a'\\''; id; '\\''b'";
+        assert_eq!(
+            remote_stat_command("/workspace/a'; id; 'b"),
+            format!("stat -c %s {quoted}")
+        );
+        assert_eq!(
+            remote_cat_command("/workspace/a'; id; 'b"),
+            format!("cat {quoted}")
+        );
     }
 }

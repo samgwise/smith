@@ -202,20 +202,36 @@ impl Sandbox {
         bail!("podman machine started but `podman info` still failing")
     }
 
+    /// `podman ps` filter arguments matching smith session containers. The
+    /// name filter is anchored and the `smith.session` label (set at
+    /// `podman run`) is required, so a container named `legacy-smith-dev` is
+    /// never swept (S-16).
+    fn session_container_filters(exited_only: bool) -> Vec<String> {
+        let mut filters = vec![
+            "name=^smith-".to_string(),
+            "label=smith.session=1".to_string(),
+        ];
+        if exited_only {
+            filters.push("status=exited".to_string());
+        }
+        filters
+    }
+
     /// Remove containers left behind by previous smith sessions that are no
     /// longer running. Called at session start so debris does not accumulate.
     pub async fn reap_stopped_sessions(&self) -> anyhow::Result<usize> {
+        let mut ps_args: Vec<String> = vec![
+            "ps".into(),
+            "-a".into(),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ];
+        for filter in Self::session_container_filters(true) {
+            ps_args.push("--filter".into());
+            ps_args.push(filter);
+        }
         let out = self
-            .run_podman(&[
-                "ps",
-                "-a",
-                "--filter",
-                "name=smith-",
-                "--filter",
-                "status=exited",
-                "--format",
-                "{{.Names}}",
-            ])
+            .run_podman(&ps_args.iter().map(String::as_str).collect::<Vec<_>>())
             .await?;
         let names = String::from_utf8_lossy(&out.stdout);
         let mut count = 0;
@@ -288,7 +304,6 @@ impl Sandbox {
         }
 
         let name = format!("smith-{}", uuid::Uuid::new_v4().simple());
-        let pids_limit = self.config.pids_limit.to_string();
         let host_mount = if remote {
             // A path on the remote host: already POSIX, no translation.
             canon.display().to_string()
@@ -298,8 +313,46 @@ impl Sandbox {
             // Use the plain (non-UNC) Windows path; podman handles drive-letter mounts.
             dunce::simplified(&canon).display().to_string()
         };
-        let mount = format!("{host_mount}:/workspace");
+        let mount = Self::build_mount(&host_mount)?;
 
+        let args = self.run_args(&name, &mount, &proxy_env);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run_podman(&arg_refs).await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "failed to start sandbox container: {}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+
+        Ok(Session {
+            name,
+            workspace_host: canon,
+            workspace_container: "/workspace",
+        })
+    }
+
+    /// The `-v` mount specification for the workspace. A colon in the source
+    /// would change the mount's meaning, so it is refused — except the
+    /// Windows drive-letter prefix, which podman expects in the source (S-34).
+    fn build_mount(host_mount: &str) -> anyhow::Result<String> {
+        let bytes = host_mount.as_bytes();
+        let body = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            &host_mount[2..]
+        } else {
+            host_mount
+        };
+        anyhow::ensure!(
+            !body.contains(':'),
+            "refusing a workspace path containing `:`: {host_mount}"
+        );
+        Ok(format!("{host_mount}:/workspace"))
+    }
+
+    /// The `podman run` argument list for a session container. `proxy_env`
+    /// carries the proxy-mode environment pairs (empty otherwise).
+    fn run_args(&self, name: &str, mount: &str, proxy_env: &[(String, String)]) -> Vec<String> {
         // Create the non-root `dev` user, then idle forever. In the
         // background (as root, via the allowlisted ubuntu mirrors) install
         // curl + git + CAs — the base image has none of them and the agent
@@ -308,25 +361,42 @@ impl Sandbox {
             (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
              curl git ca-certificates) >/dev/null 2>&1 & \
             exec sleep infinity";
+        let pids_limit = self.config.pids_limit.to_string();
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
             "--name".into(),
-            name.clone(),
+            name.into(),
             "-v".into(),
-            mount,
+            mount.into(),
             "--memory".into(),
             self.config.memory.clone(),
             "--cpus".into(),
             self.config.cpus.clone(),
             "--pids-limit".into(),
             pids_limit,
+            // Hardening (S-27): drop every capability, then give back only
+            // what the root boot step needs (useradd + apt);
+            // no-new-privileges stops the agent user regaining any of it.
+            "--cap-drop".into(),
+            "ALL".into(),
         ];
+        for cap in ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"] {
+            args.push("--cap-add".into());
+            args.push(cap.into());
+        }
+        args.extend([
+            "--security-opt".into(),
+            "no-new-privileges".into(),
+            // The session label backs the anchored sweep filters (S-16).
+            "--label".into(),
+            "smith.session=1".into(),
+        ]);
         match self.config.network {
             NetworkMode::Proxy => {
                 args.push("--network".into());
                 args.push(EGRESS_NETWORK.into());
-                for (k, v) in &proxy_env {
+                for (k, v) in proxy_env {
                     args.push("-e".into());
                     args.push(format!("{k}={v}"));
                 }
@@ -343,22 +413,7 @@ impl Sandbox {
             "-c".into(),
             boot.into(),
         ]);
-
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.run_podman(&arg_refs).await?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "failed to start sandbox container: {}{}",
-                String::from_utf8_lossy(&out.stderr),
-                String::from_utf8_lossy(&out.stdout)
-            );
-        }
-
-        Ok(Session {
-            name,
-            workspace_host: canon,
-            workspace_container: "/workspace",
-        })
+        args
     }
 
     /// Create the dedicated egress network with the pinned subnet if it does
@@ -1023,15 +1078,18 @@ impl Sandbox {
     /// Remove every container from every smith session (running or not),
     /// plus the proxy sidecar and its enforcement table.
     pub async fn clean_all(&self) -> anyhow::Result<usize> {
+        let mut ps_args: Vec<String> = vec![
+            "ps".into(),
+            "-a".into(),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ];
+        for filter in Self::session_container_filters(false) {
+            ps_args.push("--filter".into());
+            ps_args.push(filter);
+        }
         let out = self
-            .run_podman(&[
-                "ps",
-                "-a",
-                "--filter",
-                "name=smith-",
-                "--format",
-                "{{.Names}}",
-            ])
+            .run_podman(&ps_args.iter().map(String::as_str).collect::<Vec<_>>())
             .await?;
         let names = String::from_utf8_lossy(&out.stdout);
         let mut count = 0;
@@ -1054,12 +1112,13 @@ impl Sandbox {
         Ok(canon)
     }
 
-    /// Refuse workspaces that are the home directory or well-known sensitive paths.
+    /// Refuse workspaces that are the home directory (or any of its
+    /// ancestors), or well-known sensitive paths.
     fn refuse_sensitive_workspace(&self, canon: &Path) -> anyhow::Result<()> {
         if let Some(home) = dirs::home_dir()
-            && canon == home
+            && (canon == home || home.starts_with(canon))
         {
-            bail!("refusing to mount the home directory as a workspace");
+            bail!("refusing to mount the home directory (or its ancestor) as a workspace");
         }
         const SENSITIVE: [&str; 5] = [".ssh", ".aws", ".gnupg", ".kube", ".docker"];
         for part in canon.components() {
@@ -1234,6 +1293,90 @@ mod tests {
         );
         assert!(out.contains("truncated"), "truncation notice missing");
         assert!(out.contains("SMITH-TAIL-MARKER"), "tail not kept");
+    }
+
+    /// S-16 red: the sweep filters must anchor the name and require a smith
+    /// label, so a container named `legacy-smith-dev` survives `smith clean`.
+    #[test]
+    fn session_container_filters_are_anchored_and_labelled() {
+        let filters = Sandbox::session_container_filters(false);
+        assert!(
+            filters.iter().any(|f| f == "name=^smith-"),
+            "the name filter must be anchored: {filters:?}"
+        );
+        assert!(
+            filters
+                .iter()
+                .any(|f| f.starts_with("label=smith.session=")),
+            "the smith.session label must be required: {filters:?}"
+        );
+    }
+
+    /// S-17 red: any ancestor of the home directory is refused, not just the
+    /// home directory itself (`C:\Users` exposes `samgw\.ssh`).
+    #[test]
+    fn workspace_refusal_refuses_ancestors_of_the_home_directory() {
+        let sandbox = Sandbox::new(Default::default());
+        let home = dirs::home_dir().expect("home directory");
+        assert!(sandbox.refuse_sensitive_workspace(&home).is_err());
+        if let Some(parent) = home.parent() {
+            assert!(
+                sandbox.refuse_sensitive_workspace(parent).is_err(),
+                "home ancestor `{}` must be refused",
+                parent.display()
+            );
+        }
+        // A normal workspace below the home stays allowed.
+        assert!(
+            sandbox
+                .refuse_sensitive_workspace(&home.join("projects"))
+                .is_ok()
+        );
+    }
+
+    /// S-27 red: session containers must drop every capability, keep only
+    /// what the root boot step needs, and set no-new-privileges.
+    #[test]
+    fn run_args_harden_the_container() {
+        let sandbox = Sandbox::new(SandboxConfig {
+            network: NetworkMode::Disabled,
+            ..Default::default()
+        });
+        let args = sandbox.run_args("smith-probe", "/host/ws", &[]);
+        let has = |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
+        assert!(has("--cap-drop", "ALL"), "caps must be dropped: {args:?}");
+        assert!(
+            has("--security-opt", "no-new-privileges"),
+            "no-new-privileges must be set: {args:?}"
+        );
+        // The root boot step keeps exactly the caps it needs.
+        for cap in ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"] {
+            assert!(has("--cap-add", cap), "boot cap {cap} missing: {args:?}");
+        }
+        assert!(
+            has("--label", "smith.session=1"),
+            "the session label backs the sweep filters: {args:?}"
+        );
+    }
+
+    /// S-34 red: a colon in the source changes the mount's meaning; only the
+    /// Windows drive-letter prefix may contain one.
+    #[test]
+    fn mount_spec_refuses_colons_in_the_source() {
+        assert_eq!(
+            Sandbox::build_mount(r"C:\Users\samgw\proj").unwrap(),
+            r"C:\Users\samgw\proj:/workspace",
+            "the drive-letter colon is expected"
+        );
+        assert_eq!(
+            Sandbox::build_mount("/home/samgw/proj").unwrap(),
+            "/home/samgw/proj:/workspace"
+        );
+        assert!(
+            Sandbox::build_mount(r"C:\weird:dir").is_err(),
+            "a second colon changes the mount meaning"
+        );
+        assert!(Sandbox::build_mount("/home/sa:gw").is_err());
     }
 
     /// Live egress test: allowed host tunnels, non-allowlisted host is
