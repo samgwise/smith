@@ -18,6 +18,16 @@ use tempfile::TempDir;
 
 const TOKEN: &str = "test-token";
 
+/// Deterministic api server options: no comment heartbeats, so byte-level
+/// assertions never race a keep-alive. (The dedicated heartbeat test turns
+/// them on deliberately.)
+fn api_options() -> smith_server::api::ApiOptions {
+    smith_server::api::ApiOptions {
+        sse_heartbeat: None,
+        ..Default::default()
+    }
+}
+
 // ---- fakes (a scripted provider so turns complete) ---------------------
 
 struct ScriptedFactory {
@@ -531,4 +541,205 @@ async fn s03_unauthenticated_body_is_not_read() {
         ),
     };
     assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+}
+
+// ---- Phase 3 (SSE) -----------------------------------------------------
+
+use smith_protocol::Envelope;
+
+/// The golden-bytes guarantee: both servers serve the same journal, and the
+/// SSE payloads are identical envelope JSON, replay and live. (Chunk framing
+/// differs by transport and is not part of the frozen contract.)
+#[tokio::test]
+async fn sse_payloads_are_identical_across_legacy_and_api() {
+    let ws = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(smith_protocol::metrics::Metrics::default());
+    let fleet = Arc::new(smith_server::Fleet::new(ws.path().join("workers.json"), metrics.clone()));
+    let controller = smith_server::Controller::with_parts(
+        Arc::new(ScriptedFactory { script: vec![] }),
+        Duration::from_secs(60),
+        fleet,
+        metrics,
+        smith_server::WorkerDefaults::default(),
+        smith_server::OrchestrateSection::default(),
+        None,
+        None,
+    );
+
+    // The legacy server on one port, the api server on another — one journal.
+    let legacy_listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
+    let legacy_port = legacy_listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::http::accept_loop(
+        legacy_listener,
+        controller.clone(),
+        TOKEN.to_string(),
+    ));
+    let api_listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
+    let api_port = api_listener.local_addr().unwrap().port();
+    tokio::spawn(smith_server::api::accept_loop(
+        api_listener,
+        controller.clone(),
+        TOKEN.to_string(),
+        api_options(),
+    ));
+
+    let legacy = ServeClient::new("127.0.0.1", legacy_port, TOKEN.to_string());
+    let api = ServeClient::new("127.0.0.1", api_port, TOKEN.to_string());
+    let id = legacy
+        .create_session(ws.path().to_str().unwrap(), None, None)
+        .await
+        .unwrap();
+    let handle = controller.get(&id).unwrap();
+
+    // Replay path: two notices journalled before anyone connects.
+    handle
+        .journal
+        .publish_core(smith_core::CoreEvent::Notice { text: "one".into() });
+    handle
+        .journal
+        .publish_core(smith_core::CoreEvent::Notice { text: "two".into() });
+
+    let mut legacy_stream = legacy.events(&id, 0).await.unwrap();
+    let mut api_stream = api.events(&id, 0).await.unwrap();
+
+    // Live path: more events while both streams are attached.
+    handle
+        .journal
+        .publish_core(smith_core::CoreEvent::Notice { text: "live-1".into() });
+    handle
+        .journal
+        .publish_core(smith_core::CoreEvent::Notice { text: "live-2".into() });
+
+    let mut legacy_json = Vec::new();
+    let mut api_json = Vec::new();
+    for _ in 0..5 {
+        // Status(create) + notice1 + notice2 (replay) + live-1 + live-2.
+        let l: Envelope = tokio::time::timeout(Duration::from_secs(5), legacy_stream.next())
+            .await
+            .expect("legacy stream event")
+            .expect("legacy stream error")
+            .expect("legacy stream ended");
+        let a: Envelope = tokio::time::timeout(Duration::from_secs(5), api_stream.next())
+            .await
+            .expect("api stream event")
+            .expect("api stream error")
+            .expect("api stream ended");
+        legacy_json.push(serde_json::to_string(&l).unwrap());
+        api_json.push(serde_json::to_string(&a).unwrap());
+    }
+    assert_eq!(legacy_json, api_json, "the two servers must emit identical bytes");
+    assert!(legacy_json.iter().any(|j| j.contains("\"one\"")), "{legacy_json:?}");
+    assert!(legacy_json.iter().any(|j| j.contains("\"live-2\"")), "{legacy_json:?}");
+}
+
+/// Heartbeats: comment frames appear on an idle stream (raw bytes) and are
+/// skipped by the client-side SSE parser (no phantom payloads).
+#[tokio::test]
+async fn sse_heartbeats_are_comments_the_client_ignores() {
+    let (port, ws, _controller) = api_harness(
+        smith_server::api::ApiOptions {
+            sse_heartbeat: Some(Duration::from_millis(100)),
+            ..Default::default()
+        },
+        vec![],
+    )
+    .await;
+    let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
+    let id = client
+        .create_session(ws.path().to_str().unwrap(), None, None)
+        .await
+        .unwrap();
+
+    // (a) Raw socket: the comment frames are on the wire while idle.
+    let mut raw_sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    use tokio::io::AsyncWriteExt;
+    raw_sock
+        .write_all(
+            format!(
+                "GET /v1/sessions/{id}/events HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(600), raw_sock.read_to_end(&mut raw)).await;
+    let raw_text = String::from_utf8_lossy(&raw);
+    assert!(raw_text.contains("text/event-stream"), "{raw_text}");
+    assert!(
+        raw_text.contains(": keep-alive\n\n"),
+        "expected comment heartbeats on the wire: {raw_text}"
+    );
+
+    // (b) The client parser sees envelopes only — comments never surface as
+    // payloads. A fresh connection from since=1 has an empty replay and
+    // nothing live: only heartbeats flow, which are not payloads.
+    let mut quiet_stream = client.events(&id, 1).await.unwrap();
+    let quiet = tokio::time::timeout(Duration::from_millis(400), quiet_stream.next_raw()).await;
+    match quiet {
+        Err(_) => {} // quiet window: no payload surfaced from the comments
+        Ok(Ok(None)) => {} // stream ended: also fine
+        Ok(Ok(Some(payload))) => panic!("a comment leaked as a payload: {payload}"),
+        Ok(Err(e)) => panic!("stream error: {e}"),
+    }
+
+    // And the normal client path still parses the heartbeating stream: the
+    // status replay arrives as the first envelope.
+    let mut stream = client.events(&id, 0).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("status envelope")
+        .expect("stream error")
+        .expect("stream ended");
+    assert_eq!(first.seq, 1);
+}
+
+/// A subscriber that overflows its broadcast queue (4096) is refilled from
+/// the journal ring: every envelope arrives, exactly once, in order.
+#[tokio::test]
+async fn lagged_sse_subscribers_refill_from_the_ring() {
+    let (port, _ws, controller) = api_harness(
+        smith_server::api::ApiOptions {
+            sse_heartbeat: None,
+            ..Default::default()
+        },
+        vec![],
+    )
+    .await;
+    let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
+    let id = client
+        .create_session(
+            tempfile::tempdir()
+                .unwrap()
+                .path()
+                .to_str()
+                .unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let handle = controller.get(&id).unwrap();
+
+    let mut stream = client.events(&id, 0).await.unwrap();
+    // The broadcast queue (4096) overflows while nothing polls the stream.
+    for i in 0..4200 {
+        handle
+            .journal
+            .publish_core(smith_core::CoreEvent::Notice { text: format!("n{i}") });
+    }
+
+    // Everything: status(seq 1) + 4200 notices, in order, no dups.
+    let mut last = 0;
+    for _ in 0..4201 {
+        let env = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("stream error")
+            .expect("stream ended early");
+        assert!(env.seq > last, "sequence went backwards: {} after {}", env.seq, last);
+        last = env.seq;
+    }
+    assert_eq!(last, 4201);
 }

@@ -26,14 +26,17 @@ use hyper_util::service::TowerToHyperService;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+use futures::Stream;
 use smith_core::CoreEvent;
 use smith_protocol::{
     ApprovalPost, CheckpointRequest, ClearancePost, CreateSession, EnrolReply, EnrolRequest,
-    ExecEventKind, ExecEventsRequest, HeartbeatRequest, OpResultRequest, ProviderPost, ResumePost,
-    StartTurn, WireEvent, WorkerSummary, PROTOCOL_VERSION,
+    Envelope, ExecEventKind, ExecEventsRequest, HeartbeatRequest, OpResultRequest, ProviderPost,
+    ResumePost, StartTurn, WireEvent, WorkerCommand, WorkerSummary, PROTOCOL_VERSION,
 };
 
 use crate::controller::{ApiError, Controller};
+use crate::journal::Journal;
+use crate::workers::WorkerStreams;
 
 /// Request head budget (D-5). hyper errors out oversized heads with 431.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -106,6 +109,9 @@ pub struct ApiOptions {
     pub header_read_timeout: Duration,
     /// Concurrent connection cap; extras are closed on accept.
     pub max_connections: usize,
+    /// SSE comment heartbeats on idle streams (keeps NAT/proxy state alive
+    /// and detects dead peers). Comments are skipped by every SSE parser.
+    pub sse_heartbeat: Option<Duration>,
     /// Cancel to stop accepting and let in-flight connections finish.
     pub shutdown: CancellationToken,
 }
@@ -116,6 +122,7 @@ impl Default for ApiOptions {
             tls: None,
             header_read_timeout: HEADER_READ_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
+            sse_heartbeat: Some(Duration::from_secs(15)),
             shutdown: CancellationToken::new(),
         }
     }
@@ -129,6 +136,9 @@ pub(crate) struct ApiState {
     #[allow(dead_code)]
     pub controller: Arc<Controller>,
     pub token: Arc<String>,
+    /// SSE comment heartbeat cadence (None = none; tests use None for
+    /// exact-byte checks).
+    pub sse_heartbeat: Option<Duration>,
 }
 
 /// Bind the serve API (split from [`accept_loop`] so tests can bind port 0
@@ -153,6 +163,7 @@ pub async fn accept_loop(
     let state = ApiState {
         controller,
         token: Arc::new(token),
+        sse_heartbeat: options.sse_heartbeat,
     };
     let router = Arc::new(build_router(state));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(options.max_connections));
@@ -249,6 +260,7 @@ pub(crate) fn build_router(state: ApiState) -> Router {
         )
         .route("/v1/sessions/{id}/diff", get(session_diff))
         .route("/v1/sessions/{id}/status", get(session_status))
+        .route("/v1/sessions/{id}/events", get(session_events))
         .route(
             "/v1/workers",
             get(workers_list)
@@ -278,6 +290,7 @@ pub(crate) fn build_router(state: ApiState) -> Router {
             "/v1/worker/checkpoint",
             post(worker_checkpoint).layer(DefaultBodyLimit::max(META_BODY_LIMIT)),
         )
+        .route("/v1/worker/events", get(worker_events))
         .layer(
             axum::middleware::from_fn_with_state(state.clone(), worker_auth),
         );
@@ -719,6 +732,244 @@ async fn worker_checkpoint(
         });
     }
     json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+// ---- SSE (Phase 3) ------------------------------------------------------
+//
+// The framing is written by hand rather than via axum's Sse type so the
+// bytes stay exactly what the frozen contract (and the current client
+// parser) expect: one `data: <json>\n\n` frame per envelope. hyper adds the
+// chunked transfer encoding on top; chunk boundaries are not part of the
+// contract and clients parse the decoded body.
+
+/// One envelope's exact wire frame.
+fn sse_frame_of(env: &Envelope) -> Bytes {
+    let json = serde_json::to_string(env).expect("envelope serialisation");
+    Bytes::from(format!("data: {json}\n\n"))
+}
+
+/// An SSE comment frame (heartbeat); every SSE parser skips comment lines.
+fn sse_comment_frame(text: &str) -> Bytes {
+    Bytes::from(format!(": {text}\n\n"))
+}
+
+fn sse_response<S>(stream: S) -> Response
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .expect("static SSE response parts are valid")
+}
+
+fn heartbeat_interval(state: &ApiState) -> Option<tokio::time::Interval> {
+    // The first tick of `interval` is immediate; delay it by one period so a
+    // fresh stream starts silent.
+    state.sse_heartbeat.map(|period| {
+        tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+    })
+}
+
+/// `?since=` from the raw query (legacy semantics: absent or unparseable → 0;
+/// no URL decoding — smith's params are numbers).
+fn since_param(query: Option<&str>) -> u64 {
+    query
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("since="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `GET /v1/sessions/{id}/events`: replay after `since`, then live, with
+/// dedupe by sequence and lag recovery from the ring.
+async fn session_events(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let handle = match state.controller.get(&id) {
+        Ok(h) => h,
+        Err(e) => return api_error(&e),
+    };
+    let since = since_param(query.as_deref());
+    sse_response(SessionEvents::new(
+        Arc::clone(&handle.journal),
+        since,
+        state.sse_heartbeat,
+    ))
+}
+
+/// `GET /v1/worker/events`: the controller→worker command stream. The worker
+/// is marked connected for as long as the stream lives; the stream's end
+/// unregisters it — but never a reconnect replacement (generations).
+async fn worker_events(
+    State(state): State<ApiState>,
+    Extension(worker): Extension<WorkerIdentity>,
+) -> Response {
+    let (rx, generation) = state.controller.fleet.streams.connect(&worker.0);
+    let stream = WorkerCommands {
+        streams: Arc::clone(&state.controller.fleet.streams),
+        worker: worker.0,
+        rx,
+        generation,
+        heartbeat: heartbeat_interval(&state),
+    };
+    sse_response(stream)
+}
+
+/// The session's event stream: journal replay, then the live broadcast,
+/// deduplicating by sequence and refilling from the ring on lag.
+///
+/// Built on `unfold` on purpose: the in-flight `recv()` future lives inside
+/// the unfold state across polls, so the broadcast sender's waker stays
+/// registered while the stream idles. (Polling a fresh `recv()` per poll and
+/// dropping it on `Pending` loses the waker — the stream never wakes again.)
+struct SessionEvents {
+    inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+}
+
+impl SessionEvents {
+    fn new(journal: Arc<Journal>, since: u64, heartbeat: Option<Duration>) -> Self {
+        // Subscribe BEFORE snapshotting the replay so nothing is missed; the
+        // dedupe by sequence covers the overlap (frozen semantics).
+        let rx = journal.subscribe();
+        let replay = journal.replay(since);
+        let state = SessionEventState {
+            journal,
+            rx,
+            replay: replay.into_iter(),
+            replaying: true,
+            last_sent: since,
+            heartbeat: heartbeat
+                .map(|period| tokio::time::interval_at(tokio::time::Instant::now() + period, period)),
+        };
+            Self {
+            inner: Box::pin(futures::stream::unfold(state, |mut s| async move {
+                loop {
+                    // Replay first (the subscription predates the snapshot).
+                    if s.replaying {
+                        match s.replay.next() {
+                            Some(env) => {
+                                s.last_sent = s.last_sent.max(env.seq);
+                                return Some((Ok(sse_frame_of(&env)), s));
+                            }
+                            None => s.replaying = false,
+                        }
+                    }
+                    tokio::select! {
+                        res = s.rx.recv() => match res {
+                            Ok(env) => {
+                                // A duplicate (subscribed-before-snapshot
+                                // overlap) is skipped.
+                                if env.seq > s.last_sent {
+                                    s.last_sent = env.seq;
+                                    return Some((Ok(sse_frame_of(&env)), s));
+                                }
+                            }
+                            // Overflowed queue: refill from the ring (it is
+                            // larger).
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                s.replay = s.journal.replay(s.last_sent).into_iter();
+                                s.replaying = true;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        },
+                        // Idle long enough: a comment heartbeat. (Both arms
+                        // are cancel-safe; recv is re-created by the select.)
+                        _ = heartbeat_tick(&mut s.heartbeat) => {
+                            return Some((Ok(sse_comment_frame("keep-alive")), s));
+                        }
+                    }
+                }
+            })),
+        }
+    }
+}
+
+/// Await the next heartbeat tick; with no heartbeat configured, never
+/// resolves (the select arm stays permanently out of the race).
+async fn heartbeat_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval.as_mut() {
+        Some(iv) => {
+            iv.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+impl Stream for SessionEvents {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+struct SessionEventState {
+    journal: Arc<Journal>,
+    rx: tokio::sync::broadcast::Receiver<Envelope>,
+    replay: std::vec::IntoIter<Envelope>,
+    replaying: bool,
+    last_sent: u64,
+    heartbeat: Option<tokio::time::Interval>,
+}
+
+/// The worker's command stream: the registry's queue, framed as SSE. Ending
+/// the stream (worker disconnected or replaced) unregisters the connection
+/// for this generation only.
+struct WorkerCommands {
+    streams: Arc<WorkerStreams>,
+    worker: String,
+    rx: tokio::sync::mpsc::UnboundedReceiver<WorkerCommand>,
+    generation: u64,
+    heartbeat: Option<tokio::time::Interval>,
+}
+
+impl Stream for WorkerCommands {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            match self.rx.poll_recv(cx) {
+                std::task::Poll::Ready(Some(cmd)) => {
+                    let json = serde_json::to_string(&cmd).expect("command serialisation");
+                    return std::task::Poll::Ready(Some(Ok(Bytes::from(format!(
+                        "data: {json}\n\n"
+                    )))));
+                }
+                // The registry dropped this stream's sender (worker replaced
+                // or revoked): the stream ends.
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Pending => {
+                    if let Some(interval) = self.heartbeat.as_mut() {
+                        if interval.poll_tick(cx).is_ready() {
+                            return std::task::Poll::Ready(Some(Ok(sse_comment_frame(
+                                "keep-alive",
+                            ))));
+                        }
+                    }
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WorkerCommands {
+    fn drop(&mut self) {
+        self.streams
+            .disconnect_generation(&self.worker, self.generation);
+    }
 }
 
 /// Load the TLS acceptor from `[serve].tls_cert` + `tls_key` (PEM).

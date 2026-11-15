@@ -654,7 +654,7 @@ async fn stream_worker_commands(
     worker: &str,
     stream: &mut TcpStream,
 ) -> anyhow::Result<()> {
-    let mut rx = controller.fleet.streams.connect(worker);
+    let (mut rx, _generation) = controller.fleet.streams.connect(worker);
     write_sse_head(stream).await.context("worker sse head")?;
     while let Some(cmd) = rx.recv().await {
         write_sse_event(stream, &serde_json::to_string(&cmd)?)

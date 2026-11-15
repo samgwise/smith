@@ -236,8 +236,11 @@ impl WorkerRegistry {
 /// Live command streams + pending op results for connected workers.
 #[derive(Default)]
 pub struct WorkerStreams {
-    /// Worker name → its command queue (drained by its SSE handler).
-    streams: std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<WorkerCommand>>>,
+    /// Worker name → its command queue (drained by its SSE handler) plus the
+    /// generation counter of that connection. Reconnects bump the generation;
+    /// a stale stream ending must not unregister its replacement.
+    streams: std::sync::Mutex<HashMap<String, (mpsc::UnboundedSender<WorkerCommand>, u64)>>,
+    generation: std::sync::atomic::AtomicU64,
     /// exec_id → the waiting requester's oneshot.
     pending: std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<OpResult>>>,
 }
@@ -248,17 +251,34 @@ impl WorkerStreams {
     }
 
     /// Register a connected worker's command queue (replaces any stale one).
-    pub fn connect(&self, name: &str) -> mpsc::UnboundedReceiver<WorkerCommand> {
+    /// Returns the receiver and this connection's generation.
+    pub fn connect(&self, name: &str) -> (mpsc::UnboundedReceiver<WorkerCommand>, u64) {
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.streams
             .lock()
             .expect("streams poisoned")
-            .insert(name.to_string(), tx);
-        rx
+            .insert(name.to_string(), (tx, generation));
+        (rx, generation)
     }
 
+    /// Unregister a worker's stream unconditionally (revocation, teardown).
     pub fn disconnect(&self, name: &str) {
         self.streams.lock().expect("streams poisoned").remove(name);
+    }
+
+    /// Unregister only when `generation` is still the live connection — the
+    /// SSE stream's cleanup, which must not kill a reconnect replacement.
+    pub fn disconnect_generation(&self, name: &str, generation: u64) {
+        let mut streams = self.streams.lock().expect("streams poisoned");
+        if streams
+            .get(name)
+            .is_some_and(|(_, current)| *current == generation)
+        {
+            streams.remove(name);
+        }
     }
 
     pub fn connected(&self, name: &str) -> bool {
@@ -271,7 +291,7 @@ impl WorkerStreams {
     /// Push a command to a connected worker. Errors when the worker is not
     /// connected (callers decide between queueing and failing).
     pub fn send(&self, name: &str, command: WorkerCommand) -> anyhow::Result<()> {
-        let tx = self
+        let (tx, _) = self
             .streams
             .lock()
             .expect("streams poisoned")
@@ -413,7 +433,9 @@ impl LeaseBoard {
 /// Registry + streams + board, with the scheduling policy.
 pub struct Fleet {
     pub registry: WorkerRegistry,
-    pub streams: WorkerStreams,
+    /// Arc'd so a live SSE stream can hold the registry across its lifetime
+    /// (its Drop unregisters the connection).
+    pub streams: Arc<WorkerStreams>,
     pub board: LeaseBoard,
     pub metrics: Arc<Metrics>,
     connected: AtomicBool,
@@ -423,7 +445,7 @@ impl Fleet {
     pub fn new(registry_path: PathBuf, metrics: Arc<Metrics>) -> Self {
         Self {
             registry: WorkerRegistry::load(registry_path),
-            streams: WorkerStreams::new(),
+            streams: Arc::new(WorkerStreams::new()),
             board: LeaseBoard::default(),
             metrics,
             connected: AtomicBool::new(false),
@@ -709,8 +731,8 @@ mod tests {
         // Not connected → nothing picks.
         assert!(fleet.pick_worker("img", None).is_none());
 
-        fleet.streams.connect("a");
-        fleet.streams.connect("b");
+        let _ = fleet.streams.connect("a");
+        let _ = fleet.streams.connect("b");
         assert_eq!(fleet.pick_worker("img", None).as_deref(), Some("b"));
         assert_eq!(fleet.pick_worker("img", Some("a")).as_deref(), Some("a"));
         assert_eq!(fleet.pick_worker("other-image", None), None);
@@ -728,7 +750,7 @@ mod tests {
             .registry
             .enrol("w", &token, &capability("img"))
             .unwrap();
-        let mut rx = fleet.streams.connect("w");
+        let (mut rx, _generation) = fleet.streams.connect("w");
         fleet.board.grant("sess", "w");
 
         // The "worker" side: take the command, deliver the op result back
