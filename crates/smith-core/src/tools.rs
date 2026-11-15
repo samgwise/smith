@@ -18,9 +18,60 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn def(&self) -> ToolDef;
-    /// Whether the user should approve this call before it runs.
-    fn needs_approval(&self, arguments: &str) -> bool;
+    /// Whether the user should approve this call before it runs. File tools
+    /// receive the call's workspace-relative path argument (raw; normalise
+    /// it with [`normalise_workspace_path`] before consulting it); tools
+    /// without a path argument (shell, MCP, orchestration) get `None`.
+    fn needs_approval(&self, arguments: &str, path: Option<&str>) -> bool;
     async fn run(&self, executor: &dyn ToolExecutor, arguments: &str) -> anyhow::Result<String>;
+}
+
+/// Lexically normalise a workspace-relative path into its segments:
+/// `/workspace`-rooted forms are accepted, `\` and `/` are both separators,
+/// and `.`/`..` resolve away. Lexical only — the executor's `resolve` does
+/// the real confinement at execution time.
+pub fn normalise_workspace_path(raw: &str) -> Vec<String> {
+    let unified = raw.trim().replace('\\', "/");
+    let stripped = unified.strip_prefix("/workspace/").unwrap_or(&unified);
+    let mut segments: Vec<String> = vec![];
+    for segment in stripped.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other.to_string()),
+        }
+    }
+    segments
+}
+
+/// Paths whose contents execute on the host (or configure tools that do):
+/// git hooks, git config (`core.fsmonitor` lives there, as do credential
+/// helpers), git submodule config, git attribute filters and direnv. Writes
+/// here always demand approval, even though ordinary workspace writes do
+/// not (S-06).
+fn is_sensitive_write_path(raw: &str) -> bool {
+    let segments = normalise_workspace_path(raw);
+    for idx in 0..segments.len() {
+        let rest = &segments[idx..];
+        match rest.first().map(String::as_str) {
+            Some(".git") => {
+                if rest.len() >= 2 && rest[1] == "hooks" {
+                    return true; // .git/hooks/<hook>
+                }
+                if rest.len() == 2 && rest[1] == "config" {
+                    return true; // .git/config
+                }
+                if rest.len() >= 4 && rest[1] == "modules" && rest[rest.len() - 1] == "config" {
+                    return true; // .git/modules/<name>/config
+                }
+            }
+            Some(".gitattributes") | Some(".envrc") if rest.len() == 1 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Extract a string field from a JSON-arguments string.
@@ -59,7 +110,7 @@ impl Tool for ShellTool {
         }
     }
 
-    fn needs_approval(&self, _arguments: &str) -> bool {
+    fn needs_approval(&self, _arguments: &str, _path: Option<&str>) -> bool {
         true
     }
 
@@ -95,7 +146,7 @@ impl Tool for ReadFileTool {
         }
     }
 
-    fn needs_approval(&self, _arguments: &str) -> bool {
+    fn needs_approval(&self, _arguments: &str, _path: Option<&str>) -> bool {
         false
     }
 
@@ -151,8 +202,10 @@ impl Tool for WriteFileTool {
         }
     }
 
-    fn needs_approval(&self, _arguments: &str) -> bool {
-        false
+    /// Writes are approval-free except to paths whose contents execute on
+    /// the host. An unparseable path fails closed (demands approval).
+    fn needs_approval(&self, _arguments: &str, path: Option<&str>) -> bool {
+        path.map(is_sensitive_write_path).unwrap_or(true)
     }
 
     async fn run(&self, executor: &dyn ToolExecutor, arguments: &str) -> anyhow::Result<String> {
@@ -185,7 +238,7 @@ impl Tool for ListDirTool {
         }
     }
 
-    fn needs_approval(&self, _arguments: &str) -> bool {
+    fn needs_approval(&self, _arguments: &str, _path: Option<&str>) -> bool {
         false
     }
 
@@ -213,4 +266,47 @@ pub fn builtin_tools() -> Vec<Box<dyn Tool>> {
         Box::new(WriteFileTool),
         Box::new(ListDirTool),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S-06: `.git/hooks/*` runs on the host, so a write there must demand
+    /// approval even though ordinary workspace writes do not. The check
+    /// consults the normalised path (separators, `/workspace` prefix and
+    /// `..` segments resolved lexically).
+    #[test]
+    fn write_file_to_git_hooks_demands_approval() {
+        let tool = WriteFileTool;
+        assert!(
+            tool.needs_approval(
+                r#"{"path": ".git/hooks/post-commit", "content": "x"}"#,
+                Some(".git/hooks/post-commit")
+            ),
+            "a git hook write must demand approval"
+        );
+        assert!(
+            tool.needs_approval("{}", Some("/workspace/.git/config")),
+            "/workspace-rooted form normalises to the same path"
+        );
+        assert!(
+            tool.needs_approval("{}", Some("sub/../.git/config")),
+            "`..` segments resolve away before the check"
+        );
+        assert!(
+            !tool.needs_approval("{}", Some("src/lib.rs")),
+            "ordinary writes stay approval-free"
+        );
+    }
+
+    #[test]
+    fn sensitive_write_paths() {
+        assert!(is_sensitive_write_path(".git/hooks/pre-commit"));
+        assert!(is_sensitive_write_path(".git/modules/sub/config"));
+        assert!(is_sensitive_write_path(".gitattributes"));
+        assert!(is_sensitive_write_path("nested/.envrc"));
+        assert!(!is_sensitive_write_path("src/git/hooks/looking.txt"));
+        assert!(!is_sensitive_write_path("README.md"));
+    }
 }

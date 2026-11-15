@@ -43,7 +43,7 @@ impl smith_core::Tool for McpToolBridge {
         }
     }
 
-    fn needs_approval(&self, _arguments: &str) -> bool {
+    fn needs_approval(&self, _arguments: &str, _path: Option<&str>) -> bool {
         // MCP servers run on the host with full user privileges — the sandbox
         // is not a boundary here — so ask-first is the safe default.
         !approved(self.approval)

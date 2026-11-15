@@ -1190,7 +1190,7 @@ macro_rules! orchestrator_tool {
                 }
             }
 
-            fn needs_approval(&self, _arguments: &str) -> bool {
+            fn needs_approval(&self, _arguments: &str, _path: Option<&str>) -> bool {
                 $approval
             }
 

@@ -625,36 +625,43 @@ impl Sandbox {
             })
         });
 
-        let outcome = match timeout(outer, child.wait_with_output()).await {
-            Ok(Ok(output)) => {
-                let code = output.status.code().unwrap_or(-1);
+        // Drain each stream through the capped reader: a noisy command must
+        // not grow host or worker memory without limit (S-13, D-6).
+        let stdout_pipe = child.stdout.take().context("exec stdout pipe")?;
+        let stderr_pipe = child.stderr.take().context("exec stderr pipe")?;
+        let out_task = tokio::spawn(read_capped(stdout_pipe, MAX_STREAM_BYTES, None));
+        let err_task = tokio::spawn(read_capped(stderr_pipe, MAX_STREAM_BYTES, None));
+
+        let outcome = match timeout(outer, child.wait()).await {
+            Ok(Ok(status)) => {
+                let code = status.code().unwrap_or(-1);
                 // 124 = in-container `timeout` fired; 137 = SIGKILL.
                 let timed_out = code == 124 || code == 137;
-                Ok(ExecOutcome {
-                    exit_code: code,
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    timed_out,
-                    duration: started.elapsed(),
-                })
+                Ok((code, timed_out))
             }
             Ok(Err(e)) => Err(anyhow::anyhow!(
                 "failed while waiting for `podman exec`: {e}"
             )),
-            // Outer wall-clock guard fired: the child future was dropped and
-            // kill_on_drop already killed it.
-            Err(_) => Ok(ExecOutcome {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: String::new(),
-                timed_out: true,
-                duration: started.elapsed(),
-            }),
+            // Outer wall-clock guard fired: dropping the child kills it
+            // (kill_on_drop) and the readers reach EOF on their own.
+            Err(_) => {
+                drop(child);
+                Ok((-1, true))
+            }
         };
+        let (exit_code, timed_out) = outcome?;
+        let (stdout, _) = out_task.await.context("exec stdout reader")?;
+        let (stderr, _) = err_task.await.context("exec stderr reader")?;
         if let Some(task) = writer_task {
             let _ = task.await;
         }
-        outcome
+        Ok(ExecOutcome {
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+            duration: started.elapsed(),
+        })
     }
 
     /// Execute a shell command, streaming stdout/stderr deltas as they
@@ -1067,26 +1074,64 @@ impl Sandbox {
     }
 }
 
+/// Per-stream cap on exec output (decision D-6, S-13): a stream larger than
+/// this keeps only its tail, with a truncation notice. Bounds host and
+/// worker memory for noisy commands.
+const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
+
 /// Incrementally read one exec pipe, forwarding `(is_stderr, text)` deltas
 /// and accumulating the full buffer for the buffered result.
 async fn read_piped(
-    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    pipe: impl tokio::io::AsyncRead + Unpin,
     is_stderr: bool,
     deltas: tokio::sync::mpsc::UnboundedSender<(bool, String)>,
 ) -> String {
+    read_capped(pipe, MAX_STREAM_BYTES, Some((&deltas, is_stderr)))
+        .await
+        .0
+}
+
+/// Read one pipe to EOF, forwarding optional `(text)` deltas and keeping at
+/// most `cap` bytes (the tail). Returns the text — prefixed with a
+/// truncation notice when the cap was hit — and whether it was.
+async fn read_capped(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    cap: usize,
+    deltas: Option<(&tokio::sync::mpsc::UnboundedSender<(bool, String)>, bool)>,
+) -> (String, bool) {
     use tokio::io::AsyncReadExt;
-    let mut buf: Vec<u8> = vec![];
+    let mut tail: Vec<u8> = vec![];
     let mut chunk = [0u8; 4096];
+    let mut truncated = false;
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                let _ = deltas.send((is_stderr, String::from_utf8_lossy(&chunk[..n]).into_owned()));
+                if let Some((tx, is_stderr)) = deltas.as_ref() {
+                    let _ = tx.send((
+                        *is_stderr,
+                        String::from_utf8_lossy(&chunk[..n]).into_owned(),
+                    ));
+                }
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > cap {
+                    truncated = true;
+                    let overflow = tail.len() - cap;
+                    tail.drain(..overflow);
+                }
             }
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    let mut out = String::new();
+    if truncated {
+        out.push_str(&format!(
+            "[smith: output truncated — more than {} MiB produced; showing the last {} MiB]\n",
+            cap / (1024 * 1024),
+            cap / (1024 * 1024)
+        ));
+    }
+    out.push_str(&String::from_utf8_lossy(&tail));
+    (out, truncated)
 }
 
 /// Generate (or reuse) the clearance token and write it to
@@ -1140,6 +1185,55 @@ mod tests {
     fn network_mode_args() {
         assert_eq!(NetworkMode::Disabled.podman_args(), &["--network", "none"]);
         assert!(NetworkMode::Open.podman_args().is_empty());
+    }
+
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Feeds `total` bytes of filler with a recognisable tail, without
+    /// holding the whole stream in memory.
+    struct HugeStream {
+        total: u64,
+    }
+    impl tokio::io::AsyncRead for HugeStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            const MARKER: &[u8] = b"SMITH-TAIL-MARKER";
+            let this = self.get_mut();
+            if this.total == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let room = buf.remaining().min(64 * 1024) as u64;
+            if this.total <= MARKER.len() as u64 {
+                let n = this.total.min(room) as usize;
+                buf.put_slice(&MARKER[..n]);
+                this.total -= n as u64;
+            } else {
+                // Filler, but never consume into the marker's reservation.
+                let n = room.min(this.total - MARKER.len() as u64) as usize;
+                buf.put_slice(&vec![b'a'; n]);
+                this.total -= n as u64;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// S-13 / D-6 red: a 200 MB stream must be capped to a 2 MiB tail with
+    /// a truncation notice, not buffered in full.
+    #[tokio::test]
+    async fn read_piped_caps_a_huge_stream_keeping_the_tail() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = read_piped(HugeStream { total: 200_000_000 }, false, tx).await;
+        assert!(
+            out.len() < 3 * 1024 * 1024,
+            "stream was not capped: {} bytes",
+            out.len()
+        );
+        assert!(out.contains("truncated"), "truncation notice missing");
+        assert!(out.contains("SMITH-TAIL-MARKER"), "tail not kept");
     }
 
     /// Live egress test: allowed host tunnels, non-allowlisted host is

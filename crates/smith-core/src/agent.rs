@@ -133,18 +133,21 @@ pub struct Agent {
     /// Front-end-supplied environment notes (e.g. egress mode) injected
     /// into the system prompt.
     pub environment_notes: Option<String>,
-    /// Approvals for the rest of the session: first-word prefixes for normal
-    /// commands, exact normalised commands for risky ones.
+    /// Approvals for the rest of the session: the first word for simple
+    /// non-risky commands, the exact normalised command for risky and
+    /// compound ones.
     allowed_prefixes: Mutex<Vec<String>>,
     /// Total denials this session (drives escalation).
     denials: Mutex<usize>,
 }
 
 /// Commands that must never be covered by a broad allow-always prefix: each
-/// risky call re-prompts, and "always" binds to the exact command.
-const RISKY_PREFIXES: [&str; 8] = [
+/// risky call re-prompts, and "always" binds to the exact command. Matched
+/// against every segment of a command, not just its head.
+const RISKY_PREFIXES: [&str; 9] = [
     "git push",
     "git reset",
+    "git clean",
     "rm",
     "curl",
     "wget",
@@ -166,11 +169,27 @@ fn normalise_command(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Split a shell command into segments at the light set of metacharacters
+/// smith recognises: `&&`, `||`, `;`, `|`, `&`, backticks and the parens of
+/// `$( )`. Deliberately not a shell parser — it may over-split (a quoted
+/// `|`, for instance), which only ever makes the checks below more
+/// conservative (S-11).
+fn shell_segments(command: &str) -> Vec<String> {
+    command
+        .split([';', '|', '&', '`', '(', ')'])
+        .map(normalise_command)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// A command is risky when any of its segments is: `cd x && rm -rf /` is a
+/// risky command even though it starts with `cd`.
 fn is_risky(command: &str) -> bool {
-    let norm = normalise_command(command);
-    RISKY_PREFIXES
-        .iter()
-        .any(|p| norm == *p || norm.starts_with(&format!("{p} ")))
+    shell_segments(command).iter().any(|seg| {
+        RISKY_PREFIXES
+            .iter()
+            .any(|p| seg == *p || seg.starts_with(&format!("{p} ")))
+    })
 }
 
 impl Agent {
@@ -473,7 +492,7 @@ Rules:\n\
             );
         };
 
-        if tool.needs_approval(&call.arguments) {
+        if tool.needs_approval(&call.arguments, tool_path(&call.arguments).as_deref()) {
             let detail = call_detail(call);
             // Already-approved commands run straight through (exact match for
             // risky commands, first-word prefix for normal ones).
@@ -528,29 +547,39 @@ Rules:\n\
             .join(", ")
     }
 
-    /// Whether this command is already covered by a session approval:
-    /// exact match for risky commands, first-word prefix otherwise.
+    /// Whether this command is already covered by a session approval. The
+    /// exact normalised command is covered when it was stored verbatim
+    /// (risky and compound commands store exactly); otherwise every segment
+    /// must be covered — risky segments only by an exact stored command,
+    /// normal segments by a stored first-word prefix (S-11).
     fn approval_cached(&self, command: &str) -> bool {
         let norm = normalise_command(command);
-        let risky = is_risky(&norm);
-        self.allowed_prefixes
+        let prefixes = self
+            .allowed_prefixes
             .lock()
-            .expect("approval mutex poisoned")
-            .iter()
-            .any(|p| {
+            .expect("approval mutex poisoned");
+        if prefixes.contains(&norm) {
+            return true;
+        }
+        shell_segments(command).iter().all(|seg| {
+            let risky = is_risky(seg);
+            prefixes.iter().any(|p| {
                 if risky {
-                    norm == *p
+                    seg == p
                 } else {
-                    norm.starts_with(p.as_str())
+                    seg.starts_with(p.as_str())
                 }
             })
+        })
     }
 
-    /// Remember an always-approved command: the exact command when risky,
-    /// the first word otherwise.
+    /// Remember an always-approved command: the first word for a simple
+    /// non-risky command, the exact normalised command for a risky or
+    /// compound one — segments of a compound are never granted as prefixes,
+    /// only what the user actually saw (S-11).
     fn remember_approval(&self, command: &str) {
         let norm = normalise_command(command);
-        let entry = if is_risky(&norm) {
+        let entry = if is_risky(&norm) || shell_segments(&norm).len() > 1 {
             norm
         } else {
             norm.split_whitespace()
@@ -666,6 +695,16 @@ pub fn utc_date_string(ms: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The raw `path` argument of a file tool call, if any. Passed to
+/// `needs_approval` so write approval can consult the target path (S-06).
+fn tool_path(arguments: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get("path")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Human-readable one-line description of a tool call (used for approvals and
@@ -966,6 +1005,57 @@ mod tests {
         let mut history = vec![Message::system("s")];
         run(&agent, &mut history, "build and test").await;
         assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    /// S-11 red: approving `git status` must not approve `git clean -fdx` —
+    /// the second command is destructive and re-prompts.
+    #[tokio::test]
+    async fn git_status_allow_always_does_not_cover_git_clean() {
+        let counter = Arc::new(Mutex::new(0));
+        let agent = allow_always_agent(
+            vec![
+                vec![tool_call("c1", "git status")],
+                vec![tool_call("c2", "git clean -fdx")],
+            ],
+            Arc::clone(&counter),
+        );
+        let mut history = vec![Message::system("s")];
+        run(&agent, &mut history, "tidy up").await;
+        assert_eq!(*counter.lock().unwrap(), 2);
+    }
+
+    /// S-11 red: a compound command is never covered by a prefix approval
+    /// when another segment of it is risky.
+    #[tokio::test]
+    async fn compound_with_risky_segment_is_never_covered_by_a_prefix_approval() {
+        let counter = Arc::new(Mutex::new(0));
+        let agent = allow_always_agent(
+            vec![
+                vec![tool_call("c1", "cd src && make")],
+                vec![tool_call("c2", "cd x && rm -rf /")],
+            ],
+            Arc::clone(&counter),
+        );
+        let mut history = vec![Message::system("s")];
+        run(&agent, &mut history, "build it").await;
+        assert_eq!(*counter.lock().unwrap(), 2);
+    }
+
+    /// S-11 red: an approved prefix does not extend into a compound command
+    /// with a risky tail.
+    #[tokio::test]
+    async fn prefix_approval_does_not_cover_a_compound_with_a_risky_tail() {
+        let counter = Arc::new(Mutex::new(0));
+        let agent = allow_always_agent(
+            vec![
+                vec![tool_call("c1", "cargo test")],
+                vec![tool_call("c2", "cargo test && rm -rf x")],
+            ],
+            Arc::clone(&counter),
+        );
+        let mut history = vec![Message::system("s")];
+        run(&agent, &mut history, "test it").await;
+        assert_eq!(*counter.lock().unwrap(), 2);
     }
 
     #[tokio::test]

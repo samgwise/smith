@@ -41,7 +41,7 @@ async fn connect_list_and_call_the_mock_server() {
         "schema: {def:?}"
     );
     assert!(
-        tool.needs_approval("{}"),
+        tool.needs_approval("{}", None),
         "ask-mode server must require approval"
     );
 

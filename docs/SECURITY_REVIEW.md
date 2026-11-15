@@ -7,7 +7,7 @@ How to use this file:
 - Keep IDs stable. Add new items at the end of their section rather than renumbering.
 - Each item ends with its migration phase (see the migration plan) or "Independent" when it's fixed separately.
 
-Status: 8 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation half remains.
+Status: 11 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation half remains.
 
 ## High
 
@@ -41,11 +41,11 @@ Status: 8 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation
   - Fix: TLS on the api server (tokio-rustls/ring); reqwest clients with scheme-aware targets (`https://` selects TLS) and certificate pinning — the controller's PEM is the sole trust anchor (`--cert` / `SMITH_SERVE_CERT` for the CLI, `--cert` at worker enrolment, stored in the credential). Non-loopback binds need TLS or an explicit `allow_plaintext_remote`.
   - Verify: `serve_client_over_pinned_tls` in `crates/smith-server/tests/api_integration.rs` (health and SSE over a pinned self-signed cert; a mismatched pin is refused).
 
-- [ ] **S-06 · Agent can write files that run on the host, without approval** (Independent)
-  - Where: `crates/smith-core/src/tools.rs:98-100, 154-156, 188-190` (read, write, and list need no approval), `crates/smith-sandbox/src/executor.rs:157-167`
+- [x] **S-06 · Agent can write files that run on the host, without approval** (fixed, security round 2 batch 1)
+  - Where: `crates/smith-core/src/tools.rs` (read, write, and list need no approval), `crates/smith-sandbox/src/executor.rs:157-167`
   - Problem: the workspace is mounted read-write, so the agent can write `.git/config` (for example `core.fsmonitor`), `.git/hooks/*`, `.envrc`, or package scripts. These run on the host when the user next uses them, which contradicts the README's "arbitrary code only runs in the container".
-  - Fix: require approval for writes to tool-executed config paths, or mount `.git` read-only inside the container.
-  - Verify: a `write_file` to `.git/hooks/post-commit` is refused or prompts for approval.
+  - Fix: `needs_approval` receives the call's path; writes to host-executing config (`.git/hooks/*`, `.git/config`, `.git/modules/*/config`, `.gitattributes`, `.envrc`) always demand approval. Approval-gated writes (not a read-only `.git` mount — the agent legitimately commits in-container).
+  - Verify: `write_file_to_git_hooks_demands_approval` and `sensitive_write_paths` in `crates/smith-core/src/tools.rs`.
 
 - [ ] **S-07 · Symlink escape on write, for local and worker file operations** (Independent)
   - Where: `crates/smith-sandbox/src/executor.rs:55-96` (`resolve` only canonicalises existing paths), `:157-167` (the write follows the link), `crates/smith-worker/src/main.rs:769-773` (worker writes use the same code)
@@ -73,11 +73,11 @@ Status: 8 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation
   - Fix: use the `shell_quote` helper the write path already uses, or pass argv directly.
   - Verify: `read_file` with a path containing `'; id; '` must not run `id`.
 
-- [ ] **S-11 · Approval checks can be bypassed with compound commands and prefixes** (Independent)
-  - Where: `crates/smith-core/src/agent.rs:143-174` (risky list matched against the start of the whole string), `:531-567` (non-risky "always" stores the first word and matches with `starts_with`)
+- [x] **S-11 · Approval checks can be bypassed with compound commands and prefixes** (fixed, security round 2 batch 1)
+  - Where: `crates/smith-core/src/agent.rs` (the risky list and the approval cache)
   - Problem: approving `git status` also approves `git clean -fdx`. Approving `cd src && make` also approves `cd x && rm -rf …`. The README says risky commands always re-prompt and that "always" binds to the exact command.
-  - Fix: split on `&&`, `||`, `;`, `|` and `$()`. Check each segment's argv[0] and subcommand, and store exact commands for "always".
-  - Verify: unit tests for each example above.
+  - Fix: commands split on `&&`, `||`, `;`, `|`, `&`, backticks and `$( )` parens (a light splitter; it may over-split, which only ever fails closed). Every segment is checked; `git clean` joined the risky list; risky and compound commands bind allow-always to the exact normalised command, and a risky segment is only covered by an exact stored command.
+  - Verify: `git_status_allow_always_does_not_cover_git_clean`, `compound_with_risky_segment_is_never_covered_by_a_prefix_approval` and `prefix_approval_does_not_cover_a_compound_with_a_risky_tail` in `crates/smith-core/src/agent.rs`.
 
 - [ ] **S-12 · Approval modal can hide the command; control characters reach the terminal** (Independent)
   - Where: `crates/smith-tui/src/ui.rs:176-198` (fixed 7-row modal, wrapping, no scrolling), `:72-79` (transcript lines aren't sanitised)
@@ -85,11 +85,11 @@ Status: 8 of 44 closed. The S-14 ref-policy half is in; its token TTL/revocation
   - Fix: size or scroll the modal and show the full command. Strip or escape control characters.
   - Verify: a 300-character command shows its tail and the option row.
 
-- [ ] **S-13 · Command output is buffered without limit** (Independent; prerequisite for C-01)
-  - Where: `crates/smith-sandbox/src/lib.rs:628-640` (`wait_with_output`), `:1072-1090` (`read_piped`)
+- [x] **S-13 · Command output is buffered without limit** (fixed; reader caps in security round 2 batch 1, the op-result route cap at the Phase 6 cutover)
+  - Where: `crates/smith-sandbox/src/lib.rs` (`exec_inner` and `exec_streaming`)
   - Problem: a noisy command can exhaust host or worker memory within its timeout. The 12 KB clamp happens only later, in the core.
-  - Fix: cap each stream in the reader, keep the tail, and add a notice. Use the same caps for worker results (decision D-6 in the plan).
-  - Verify: `yes | head -c 200000000` in the sandbox keeps memory bounded.
+  - Fix: each exec stream is capped at 2 MiB in the reader, keeping the tail with a truncation notice (decision D-6). The same reader serves the local and the worker streaming path, so worker results are capped at the source too.
+  - Verify: `read_piped_caps_a_huge_stream_keeping_the_tail` in `crates/smith-sandbox/src/lib.rs` (a 200 MB stream stays bounded).
 
 - [ ] **S-14 · Forge tokens are repo-wide, never expire, and can't be revoked** (ref policy done in Phase 4; TTL and revocation still open)
   - Where: `crates/smith-server/src/forge.rs` (mint/authenticate, no expiry), the api's forge routes
