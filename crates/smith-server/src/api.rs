@@ -46,6 +46,11 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Concurrent connections; extras are refused immediately (D-5).
 pub const MAX_CONNECTIONS: usize = 1024;
+/// Git route body cap: 256 MiB of pack upload (D-5), checked after forge
+/// auth — the unauthenticated pre-auth hole the legacy server had (S-03).
+pub const MAX_GIT_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Concurrent `git http-backend` subprocesses (D-5).
+const MAX_GIT_SUBPROCESSES: usize = 8;
 
 /// Anything we can serve a connection over: plain TCP or a TLS stream.
 enum ConnIo {
@@ -112,6 +117,8 @@ pub struct ApiOptions {
     /// SSE comment heartbeats on idle streams (keeps NAT/proxy state alive
     /// and detects dead peers). Comments are skipped by every SSE parser.
     pub sse_heartbeat: Option<Duration>,
+    /// Git route body cap in bytes (pack uploads; D-5).
+    pub max_git_body_bytes: usize,
     /// Cancel to stop accepting and let in-flight connections finish.
     pub shutdown: CancellationToken,
 }
@@ -123,6 +130,7 @@ impl Default for ApiOptions {
             header_read_timeout: HEADER_READ_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
             sse_heartbeat: Some(Duration::from_secs(15)),
+            max_git_body_bytes: MAX_GIT_BODY_BYTES,
             shutdown: CancellationToken::new(),
         }
     }
@@ -139,6 +147,10 @@ pub(crate) struct ApiState {
     /// SSE comment heartbeat cadence (None = none; tests use None for
     /// exact-byte checks).
     pub sse_heartbeat: Option<Duration>,
+    /// Git route body cap in bytes.
+    pub max_git_body_bytes: usize,
+    /// Bounds concurrent git subprocesses.
+    pub git_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Bind the serve API (split from [`accept_loop`] so tests can bind port 0
@@ -164,6 +176,8 @@ pub async fn accept_loop(
         controller,
         token: Arc::new(token),
         sse_heartbeat: options.sse_heartbeat,
+        max_git_body_bytes: options.max_git_body_bytes,
+        git_slots: Arc::new(tokio::sync::Semaphore::new(MAX_GIT_SUBPROCESSES)),
     };
     let router = Arc::new(build_router(state));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(options.max_connections));
@@ -295,6 +309,16 @@ pub(crate) fn build_router(state: ApiState) -> Router {
             axum::middleware::from_fn_with_state(state.clone(), worker_auth),
         );
 
+    // The forge: git smart HTTP with its own token shape (Basic with the
+    // token as the password, or Bearer), checked before any body is read.
+    let forge = Router::new()
+        .route("/git/{repo}/info/refs", get(git_info_refs))
+        .route("/git/{repo}/git-upload-pack", post(git_upload_pack))
+        .route("/git/{repo}/git-receive-pack", post(git_receive_pack))
+        .layer(
+            axum::middleware::from_fn_with_state(state.clone(), forge_auth),
+        );
+
     // Enrolment authenticates with the one-time token in its body; no
     // bearer applies (the worker has no credential yet).
     let open = Router::new().route(
@@ -304,6 +328,7 @@ pub(crate) fn build_router(state: ApiState) -> Router {
 
     daemon
         .merge(worker)
+        .merge(forge)
         .merge(open)
         .fallback(not_found)
         .with_state(state)
@@ -732,6 +757,378 @@ async fn worker_checkpoint(
         });
     }
     json_response(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+// ---- the forge: git smart HTTP (Phase 4) --------------------------------
+//
+// Git stays the protocol oracle: requests pipe to `git http-backend`, which
+// handles gzip request bodies (HTTP_CONTENT_ENCODING), protocol v2
+// negotiation (HTTP_GIT_PROTOCOL -> GIT_PROTOCOL), and runs the
+// upload-pack/receive-pack services with the update hook enforcing the
+// ref policy (S-14). We do auth, repo scoping, and byte streaming only.
+
+/// The request's git grant (inserted by [`forge_auth`]).
+#[derive(Clone)]
+pub(crate) struct ForgeGrant(pub crate::forge::GitCred);
+
+/// The 401 for git clients: the WWW-Authenticate header is what makes git's
+/// client send credentials.
+fn forge_unauthorised() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"smith forge\"")],
+        "",
+    )
+        .into_response()
+}
+
+/// Forge auth: a session token scoped to its repo, or the daemon token
+/// (full access). Checked BEFORE any body is read (S-03).
+pub(crate) async fn forge_auth(
+    State(state): State<ApiState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let Some(token) = crate::forge::token_from_axum_headers(req.headers()) else {
+        return forge_unauthorised();
+    };
+    let grant = if tokens_match(&token, &state.token) {
+        crate::forge::GitCred {
+            session_id: "daemon".into(),
+            token_hash: String::new(),
+            repo: String::new(),
+            read: true,
+            write: true,
+            write_all: true,
+        }
+    } else {
+        match state
+            .controller
+            .forge
+            .as_ref()
+            .and_then(|f| f.authenticate(&token))
+        {
+            Some(grant) => grant,
+            None => return forge_unauthorised(),
+        }
+    };
+    req.extensions_mut().insert(ForgeGrant(grant));
+    next.run(req).await
+}
+
+/// Strip the `.git` suffix git appends to clone/push URLs (grants are keyed
+/// on the bare name).
+fn repo_name(repo: &str) -> &str {
+    repo.strip_suffix(".git").unwrap_or(repo)
+}
+
+fn forge_forbidden() -> Response {
+    error_response(StatusCode::FORBIDDEN, "token lacks this scope")
+}
+
+/// Whether this grant covers `repo`: the daemon token (write_all, empty
+/// repo) covers everything; session tokens are repo-scoped.
+fn grant_repo_covers(grant: &crate::forge::GitCred, repo: &str) -> bool {
+    grant.write_all || grant.repo == repo
+}
+
+async fn git_info_refs(
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+    Extension(grant): Extension<ForgeGrant>,
+    request: Request,
+) -> Response {
+    let repo = repo_name(&repo);
+    if !grant_repo_covers(&grant.0, repo) {
+        return forge_unauthorised();
+    }
+    let query = request.uri().query().map(str::to_string);
+    let service = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("service=")))
+        .unwrap_or("")
+        .to_string();
+    let needs_write = service == "git-receive-pack";
+    if !matches!(service.as_str(), "git-upload-pack" | "git-receive-pack") {
+        return error_response(StatusCode::BAD_REQUEST, &format!("bad service {service:?}"));
+    }
+    if needs_write && !grant.0.write {
+        return forge_forbidden();
+    }
+    if !needs_write && !grant.0.read {
+        return forge_forbidden();
+    }
+    git_http_backend(
+        &state,
+        repo,
+        "GET",
+        &format!("{repo}.git/info/refs"),
+        Some(format!("service={service}")),
+        None,
+        request.headers().clone(),
+        None,
+        &grant.0,
+    )
+    .await
+}
+
+async fn git_upload_pack(
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+    Extension(grant): Extension<ForgeGrant>,
+    request: Request,
+) -> Response {
+    git_rpc(state, repo, "upload-pack", request, grant).await
+}
+
+async fn git_receive_pack(
+    State(state): State<ApiState>,
+    Path(repo): Path<String>,
+    Extension(grant): Extension<ForgeGrant>,
+    request: Request,
+) -> Response {
+    git_rpc(state, repo, "receive-pack", request, grant).await
+}
+
+async fn git_rpc(
+    state: ApiState,
+    repo: String,
+    service: &str,
+    request: Request,
+    grant: ForgeGrant,
+) -> Response {
+    let repo = repo_name(&repo);
+    if !grant_repo_covers(&grant.0, repo) {
+        return forge_unauthorised();
+    }
+    let needs_write = service == "receive-pack";
+    if needs_write && !grant.0.write {
+        return forge_forbidden();
+    }
+    if !needs_write && !grant.0.read {
+        return forge_forbidden();
+    }
+    let (parts, body) = request.into_parts();
+    git_http_backend(
+        &state,
+        repo,
+        "POST",
+        &format!("{repo}.git/git-{service}"),
+        None,
+        Some(format!("application/x-git-{service}-request")),
+        parts.headers,
+        Some(body),
+        &grant.0,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn git_http_backend(
+    state: &ApiState,
+    repo: &str,
+    method: &str,
+    path_info: &str,
+    query: Option<String>,
+    content_type: Option<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<axum::body::Body>,
+    grant: &crate::forge::GitCred,
+) -> Response {
+    let Some(forge) = &state.controller.forge else {
+        return error_response(StatusCode::NOT_FOUND, "no forge");
+    };
+    // Push-to-create fires on the write paths; reads need an existing repo.
+    let known = match forge.repo_path(repo) {
+        Some(p) => p,
+        None => return error_response(StatusCode::BAD_REQUEST, "invalid repository name"),
+    };
+    if grant.write {
+        if let Err(e) = forge.ensure_repo(repo).await {
+            return error_response(StatusCode::BAD_REQUEST, &format!("{e:#}"));
+        }
+    } else if !known.exists() {
+        return error_response(StatusCode::NOT_FOUND, "no such repo");
+    }
+
+    let _permit = match state.git_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many concurrent git operations",
+            );
+        }
+    };
+
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["http-backend"])
+        .env_clear()
+        .env("GIT_PROJECT_ROOT", forge.repos_dir())
+        .env("PATH_INFO", format!("/{path_info}"))
+        .env("REQUEST_METHOD", method)
+        .env("REMOTE_USER", "smith")
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        // The ref policy rides to the update hook through the environment.
+        .env("SMITH_GIT_SESSION", &grant.session_id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if grant.write_all {
+        cmd.env("SMITH_GIT_WRITE_ALL", "1");
+    }
+    if let Some(q) = &query {
+        cmd.env("QUERY_STRING", q);
+    }
+    if let Some(ct) = &content_type {
+        cmd.env("CONTENT_TYPE", ct);
+    }
+    // git's own env (PATH, GIT_EXEC_PATH, SystemRoot) must survive env_clear.
+    for key in ["PATH", "GIT_EXEC_PATH", "SYSTEMROOT", "SystemRoot"] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+
+    // Resolve the body transport from the request headers: git gzips big
+    // requests (stream raw; git inflates to EOF when CONTENT_LENGTH is
+    // absent), length-framed bodies stream with CONTENT_LENGTH passed
+    // through (pipe_fixed_length), and chunked non-gzip bodies (rare from
+    // git) buffer first because CGI has no chunked framing.
+    let mut body_transport: Option<(axum::body::Body, Option<u64>)> = None;
+    if let Some(body) = body {
+        let encoding = headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let gzipped = encoding
+            .as_deref()
+            .map(|v| v.eq_ignore_ascii_case("gzip") || v.eq_ignore_ascii_case("x-gzip"))
+            .unwrap_or(false);
+        let content_length: Option<u64> = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        if gzipped {
+            // Gzip bodies stream raw; http-backend inflates to EOF when
+            // CONTENT_LENGTH is absent (inflate_request) — the gzip framing
+            // carries the length, so big compressed pushes never buffer here.
+            cmd.env("HTTP_CONTENT_ENCODING", encoding.expect("gzipped checked"));
+            body_transport = Some((body, None));
+        } else if let Some(len) = content_length {
+            // Oversize up front: refuse without reading a byte.
+            if len > state.max_git_body_bytes as u64 {
+                return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the size cap");
+            }
+            body_transport = Some((body, Some(len)));
+        } else {
+            let buffered = match axum::body::to_bytes(body, state.max_git_body_bytes).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the size cap");
+                }
+            };
+            let len = buffered.len() as u64;
+            cmd.env("CONTENT_LENGTH", len.to_string());
+            body_transport = Some((axum::body::Body::from(buffered), Some(len)));
+        }
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("git http-backend failed to start: {e}"),
+            );
+        }
+    };
+
+    // Feed the body: frames stream straight to git's stdin.
+    if let Some((body, length)) = body_transport {
+        use futures::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        let mut stream = body.into_data_stream();
+        let mut written: u64 = 0;
+        let mut too_big = false;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(60), stream.next()).await;
+            let Some(chunk) = next.unwrap_or(None) else { break };
+            let Ok(chunk) = chunk else { break };
+            written += chunk.len() as u64;
+            if written > state.max_git_body_bytes as u64 {
+                too_big = true;
+                break;
+            }
+            if stdin.write_all(&chunk).await.is_err() {
+                break;
+            }
+            if let Some(len) = length
+                && written >= len
+            {
+                break;
+            }
+        }
+        drop(stdin); // EOF: git's stateless RPC answers once input ends
+        if too_big {
+            let _ = child.kill().await;
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the size cap");
+        }
+    }
+
+    let out = match child.wait_with_output().await {
+        Ok(out) => out,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("git http-backend failed: {e}"),
+            );
+        }
+    };
+
+    // CGI response: head (Status:, Content-Type:, caching headers), payload.
+    let stdout = out.stdout;
+    let split = stdout
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(stdout.len());
+    let cgi_head = String::from_utf8_lossy(&stdout[..split]).into_owned();
+    let payload = &stdout[(split + 4).min(stdout.len())..];
+
+    let mut status = "200 OK".to_string();
+    let mut pass_headers: Vec<(header::HeaderName, String)> = Vec::new();
+    for line in cgi_head.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let k = k.trim();
+        let v = v.trim();
+        if k.eq_ignore_ascii_case("status") {
+            status = v.to_string();
+        } else if let Ok(name) = header::HeaderName::from_bytes(k.as_bytes()) {
+            pass_headers.push((name, v.to_string()));
+        }
+    }
+    if !out.status.success() && status.starts_with("200") {
+        // http-backend died mid-service: report failure, not a truncated 200.
+        tracing::warn!(
+            "git http-backend failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        status = "500 Internal Server Error".into();
+    }
+    let code: u16 = status
+        .split(' ')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    for (name, value) in pass_headers {
+        response = response.header(name, value);
+    }
+    response
+        .body(axum::body::Body::from(payload.to_vec()))
+        .unwrap_or_else(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))
 }
 
 // ---- SSE (Phase 3) ------------------------------------------------------

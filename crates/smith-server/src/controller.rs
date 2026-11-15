@@ -374,9 +374,11 @@ impl Controller {
                     .forge
                     .as_ref()
                     .ok_or_else(|| ApiError::unavailable("no forge (no state dir)"))?;
+                // Auto-push (opt-in) lifts the ref policy so the convergence
+                // push_branch can update base refs.
                 source.token = Some(
                     forge
-                        .mint(session_id, &name, true, true)
+                        .mint(session_id, &name, true, true, self.orchestrate.auto_push)
                         .map_err(ApiError::from)?,
                 );
             }

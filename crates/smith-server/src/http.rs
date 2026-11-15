@@ -457,6 +457,7 @@ fn forge_grant(
             repo: repo.to_string(),
             read: true,
             write: true,
+            write_all: true,
         });
     }
     let grant = controller.forge.as_ref()?.authenticate(&token)?;

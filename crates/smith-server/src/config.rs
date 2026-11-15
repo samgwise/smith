@@ -168,6 +168,8 @@ pub struct ServeSection {
     /// Explicitly accept a non-loopback bind without TLS (plaintext on the
     /// wire). Off by default: refusing is the safe behaviour.
     pub allow_plaintext_remote: bool,
+    /// Git route body cap in MiB (pack uploads). Checked after forge auth.
+    pub max_git_body_mb: u32,
 }
 
 impl Default for ServeSection {
@@ -180,6 +182,7 @@ impl Default for ServeSection {
             tls_cert: None,
             tls_key: None,
             allow_plaintext_remote: false,
+            max_git_body_mb: 256,
         }
     }
 }
@@ -367,6 +370,7 @@ pub fn ensure_example_config() -> anyhow::Result<()> {
              # tls_cert = \"/etc/smith/serve.pem\"\n\
              # tls_key = \"/etc/smith/serve.key\"\n\
              # allow_plaintext_remote = false  # explicit opt-in to remote plaintext\n\
+             max_git_body_mb = 256   # git route body cap (pack uploads)\n\
              \n\
              [worker]\n\
              # fleet execution (smith-worker; see docs/WORKER_MESH.md)\n\

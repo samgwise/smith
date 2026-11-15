@@ -35,6 +35,11 @@ pub struct GitCred {
     pub repo: String,
     pub read: bool,
     pub write: bool,
+    /// Opt-in (auto-push): may update any ref in the repo, not just the
+    /// session's own checkpoint and the integration branches. Recovered
+    /// `.gitcred` files from before this field default to false.
+    #[serde(default)]
+    pub write_all: bool,
 }
 
 /// Hosted repos + the token table. Repos live as bare repos under
@@ -60,12 +65,14 @@ impl Forge {
 
     /// Mint a per-session token for `repo`. Hashed at rest; the raw token
     /// is returned once (delivered to the worker in `WorkspaceSource`).
+    /// `write_all` lifts the ref policy (auto-push updates base refs).
     pub fn mint(
         &self,
         session_id: &str,
         repo: &str,
         read: bool,
         write: bool,
+        write_all: bool,
     ) -> anyhow::Result<String> {
         let token = uuid::Uuid::new_v4().simple().to_string();
         let cred = GitCred {
@@ -74,6 +81,7 @@ impl Forge {
             repo: repo.to_string(),
             read,
             write,
+            write_all,
         };
         let path = self.state_dir.join(format!("{session_id}.gitcred"));
         std::fs::write(&path, serde_json::to_string_pretty(&cred)?)
@@ -149,6 +157,8 @@ impl Forge {
     }
 
     /// Push-to-create: `git init --bare` when the repo doesn't exist yet.
+    /// Either way the repo's ref policy is (re)installed: the update hook
+    /// and the receive policies (S-14).
     pub async fn ensure_repo(&self, name: &str) -> anyhow::Result<PathBuf> {
         let path = self.repo_path(name).context("invalid repository name")?;
         if !path.exists() {
@@ -167,7 +177,46 @@ impl Forge {
             );
             tracing::info!("forge: created repo `{name}` (push-to-create)");
         }
+        self.ensure_policy(&path).await?;
         Ok(path)
+    }
+
+    /// Install (idempotently) the update hook and the receive policies.
+    /// Runs on every receive-pack path so repos created before the policy
+    /// existed are retrofitted.
+    async fn ensure_policy(&self, path: &Path) -> anyhow::Result<()> {
+        let hooks = path.join("hooks");
+        std::fs::create_dir_all(&hooks)?;
+        let hook = hooks.join("update");
+        let needs_write = std::fs::read_to_string(&hook)
+            .map(|existing| existing != UPDATE_HOOK)
+            .unwrap_or(true);
+        if needs_write {
+            std::fs::write(&hook, UPDATE_HOOK)
+                .with_context(|| format!("writing {}", hook.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        for (key, value) in [
+            ("receive.denyDeletes", "true"),
+            ("receive.denyNonFastForwards", "true"),
+        ] {
+            let out = Command::new("git")
+                .arg("--git-dir")
+                .arg(path)
+                .args(["config", key, value])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                out.status.success(),
+                "git config {key} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
     }
 
     /// Hosted repo names (the `<name>` of each `<name>.git` directory).
@@ -191,6 +240,46 @@ impl Forge {
         out.sort();
         out
     }
+}
+
+/// The `update` hook installed in every hosted repo. A session token may
+/// update only its own checkpoint branch (`refs/heads/smith/<session>`,
+/// via SMITH_GIT_SESSION) and the shared integration branches; the daemon
+/// token (no session) and `write_all` tokens may update anything.
+const UPDATE_HOOK: &str = "#!/bin/sh\n\
+# smith forge ref policy (installed by smith; do not edit).\n\
+ref=\"$1\"\n\
+if [ -n \"${SMITH_GIT_WRITE_ALL:-}\" ]; then exit 0; fi\n\
+session=\"${SMITH_GIT_SESSION:-}\"\n\
+if [ -z \"$session\" ]; then exit 0; fi\n\
+case \"$ref\" in\n\
+  \"refs/heads/smith/$session\") exit 0 ;;\n\
+  refs/heads/smith/integration/*) exit 0 ;;\n\
+esac\n\
+echo \"smith forge: session tokens may only update refs/heads/smith/<session> \
+and smith/integration/*\" >&2\n\
+exit 1\n";
+
+/// Extract a git token from axum request headers: Bearer, or Basic with the
+/// token as the password (git's shape). The api middleware's version of
+/// [`Forge::token_from_request`].
+pub fn token_from_axum_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
+        let value = v.to_str().ok()?;
+        if let Some(b) = value.strip_prefix("Bearer ") {
+            let b = b.trim();
+            return (!b.is_empty()).then(|| b.to_string());
+        }
+        if let Some(basic) = value.strip_prefix("Basic ") {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(basic.trim())
+                .ok()?;
+            let s = String::from_utf8(decoded).ok()?;
+            let (_user, pass) = s.split_once(':')?;
+            return (!pass.is_empty()).then(|| pass.to_string());
+        }
+    }
+    None
 }
 
 /// Repo names: alphanumeric start, then alphanumerics plus `.`, `_`, `-`.
@@ -306,7 +395,7 @@ mod tests {
     async fn mint_authenticate_and_recover() {
         let tmp = tempfile::tempdir().unwrap();
         let forge = Forge::new(tmp.path());
-        let token = forge.mint("sess-1", "demo", true, true).unwrap();
+        let token = forge.mint("sess-1", "demo", true, true, false).unwrap();
 
         let grant = forge.authenticate(&token).expect("token authenticates");
         assert_eq!(grant.repo, "demo");

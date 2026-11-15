@@ -91,11 +91,12 @@ Status: 0 of 44 closed.
   - Fix: cap each stream in the reader, keep the tail, and add a notice. Use the same caps for worker results (decision D-6 in the plan).
   - Verify: `yes | head -c 200000000` in the sandbox keeps memory bounded.
 
-- [ ] **S-14 · Forge tokens are repo-wide, never expire, and can't be revoked** (Phase 4 for ref policy; Independent for lifetime)
-  - Where: `crates/smith-server/src/forge.rs:63-86` (mint), `:135-141` (authenticate, no expiry), `:151-171` (`ensure_repo` leaves `receive.denyDeletes` and `receive.denyNonFastForwards` unset), `crates/smith-server/src/http.rs:446-464` (scope checks the repo only)
+- [ ] **S-14 · Forge tokens are repo-wide, never expire, and can't be revoked** (ref policy done in Phase 4; TTL and revocation still open)
+  - Where: `crates/smith-server/src/forge.rs` (mint/authenticate, no expiry), the api's forge routes
   - Problem: any session's token can force-push or delete any ref in its repo, including `main` and other sessions' checkpoints. Tokens stay valid until the `.gitcred` file is deleted.
-  - Fix: enforce a ref-prefix policy through an `update` hook that allows only `smith/<session>`, set both receive policies, add a token TTL, and revoke at session end.
-  - Verify: a session token can't update `refs/heads/main`, and an expired token is rejected.
+  - Fix, part 1 (done, Phase 4): an `update` hook installed by `ensure_repo` scopes session tokens to `refs/heads/smith/<session>` and `smith/integration/*` (the daemon token and `write_all` tokens — auto-push opt-in — cover everything); `receive.denyDeletes` and `receive.denyNonFastForwards` are set on every hosted repo.
+  - Fix, part 2 (open): a token TTL and revocation at session end.
+  - Verify, part 1: `smith_repo_scheme_mints_session_tokens` (a `main` push with a session token is hook-declined) in `crates/smith-server/tests/serve_integration.rs`.
 
 - [ ] **S-15 · Secrets and state written with default permissions** (Independent; Phase 1 applies to new TLS key files)
   - Where: `crates/smith-server/src/lib.rs:34-45` (serve-token), `crates/smith-sandbox/src/lib.rs:1095-1110` (egress-token, also racy on first run), `crates/smith-server/src/workers.rs:107-114` (workers.json), `crates/smith-worker/src/main.rs:137-144` (worker credential), `crates/smith-server/src/forge.rs:78-80` (`.gitcred`)
@@ -121,11 +122,11 @@ Status: 0 of 44 closed.
   - Fix: cap results on the worker (S-13, decision D-6) and set the op-result limit above that cap (done: 32 MiB on the api route). Log failed posts (Phase 5, with the reqwest client).
   - Verify: `worker_flow_and_two_mib_op_result` in `crates/smith-server/tests/api_integration.rs` (green as of Phase 2 — a 2 MiB op-result is accepted).
 
-- [ ] **C-02 · Git clients' gzip-compressed requests fail** (Phase 4; reproduced)
+- [ ] **C-02 · Git clients' gzip-compressed requests fail** (fixed in the new api, Phase 4; closes at cutover)
   - Where: `crates/smith-protocol/src/http.rs:155-186` (only `Transfer-Encoding` and `Content-Length` are read), `crates/smith-server/src/http.rs:627` (raw body passed to `upload-pack`)
   - Problem: git gzips RPC request bodies above 1024 bytes (`remote-curl.c:1008`), and `http-backend` inflates them (`http-backend.c:477-485`). Clones or fetches with many refs fail. REPRODUCED 15 November 2026 by `red_c02_gzipped_upload_pack_request_is_decoded` in `crates/smith-server/tests/serve_integration.rs`: a gzipped upload-pack request returns 500 with `bad line length character`.
-  - Fix: handled by the migration (decision D-4 in the plan).
-  - Verify: the red test goes green; `git clone` of a hosted repo with 30 branches succeeds.
+  - Fix: the api streams gzipped bodies raw to `git http-backend` with `HTTP_CONTENT_ENCODING` set and no `CONTENT_LENGTH` — git inflates to EOF (`inflate_request`).
+  - Verify: `red_c02_gzipped_upload_pack_request_is_decoded` (green) and `clone_with_many_branches_goes_through_gzip` (a real 31-ref clone, gzipped by git) in `crates/smith-server/tests/serve_integration.rs`.
 
 ## Low
 

@@ -1655,7 +1655,6 @@ fn expect_ok(out: std::process::Output, what: &str) {
 }
 
 #[tokio::test]
-#[ignore = "git routes land in Phase 4 of the HTTP migration (the api 404s /git/* for now)"]
 async fn forge_push_to_create_clone_and_scopes() {
     let ws = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -1727,7 +1726,7 @@ async fn forge_push_to_create_clone_and_scopes() {
         .forge
         .as_ref()
         .unwrap()
-        .mint("s1", "demo", true, false)
+        .mint("s1", "demo", true, false, false)
         .unwrap();
     let ro_clone = ws.path().join("ro-clone");
     expect_ok(
@@ -1765,7 +1764,7 @@ async fn forge_push_to_create_clone_and_scopes() {
         .forge
         .as_ref()
         .unwrap()
-        .mint("s2", "other", true, true)
+        .mint("s2", "other", true, true, false)
         .unwrap();
     let refused = git(&origin, &["push", &forge_url("demo", &other), "main"])
         .await
@@ -1826,7 +1825,6 @@ fn harness_controller_with_state(ws: &std::path::Path, state: &std::path::Path) 
 /// the controller's forge URL with a minted per-session token — and that
 /// token really pushes (push-to-create) to the hosted repo.
 #[tokio::test]
-#[ignore = "git routes land in Phase 4 of the HTTP migration (the api 404s /git/* for now)"]
 async fn smith_repo_scheme_mints_session_tokens() {
     let ws = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -1929,7 +1927,13 @@ async fn smith_repo_scheme_mints_session_tokens() {
     );
     let token = source.token.clone().expect("minted token delivered");
 
-    // The token really pushes (push-to-create) to the hosted repo.
+    // The token really pushes (push-to-create) to the hosted repo — under
+    // the ref policy, to the session's OWN checkpoint branch.
+    let child_id = orch
+        .child_summaries()
+        .first()
+        .map(|c| c.id.clone())
+        .expect("a spawned child");
     let seed = ws.path().join("seed");
     std::fs::create_dir_all(&seed).unwrap();
     git(&seed, &["init", "-b", "main"]).await.unwrap();
@@ -1949,19 +1953,131 @@ async fn smith_repo_scheme_mints_session_tokens() {
     )
     .await
     .unwrap();
+    let url = format!("http://smith:{token}@127.0.0.1:{port}/git/demo.git");
     expect_ok(
         git(
             &seed,
             &[
                 "push",
-                &format!("http://smith:{token}@127.0.0.1:{port}/git/demo.git"),
-                "main",
+                &url,
+                &format!("HEAD:refs/heads/smith/{child_id}"),
             ],
         )
         .await
         .unwrap(),
-        "session-token push",
+        "session-token checkpoint push",
     );
+
+    // The ref policy (S-14): the session token must NOT update main.
+    let refused = git(&seed, &["push", &url, "main"]).await.unwrap();
+    assert!(
+        !refused.status.success(),
+        "session tokens must not update refs outside smith/<session> and smith/integration/*"
+    );
+}
+
+// ---- Phase 4 acceptance: real git clients against the api forge -------
+
+/// A clone of a repo with 31 refs: the upload-pack request exceeds git's
+/// 1 KiB gzip threshold, so the real client sends a gzipped request body —
+/// streamed raw to http-backend and inflated there.
+#[tokio::test]
+async fn clone_with_many_branches_goes_through_gzip() {
+    let (controller, port, ws, _state) = forge_harness().await;
+    let _ = controller;
+    let origin = ws.path().join("seed");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-b", "main"]).await.unwrap();
+    std::fs::write(origin.join("README.md"), "seed\n").unwrap();
+    git(&origin, &["add", "-A"]).await.unwrap();
+    git(
+        &origin,
+        &[
+            "-c",
+            "user.email=s@x",
+            "-c",
+            "user.name=s",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    )
+    .await
+    .unwrap();
+    for i in 0..30 {
+        git(&origin, &["branch", &format!("br{i}")]).await.unwrap();
+    }
+    let url = format!("http://smith:{TOKEN}@127.0.0.1:{port}/git/demo.git");
+    expect_ok(
+        git(
+            &origin,
+            &["-c", "http.postBuffer=1024", "push", &url, "--all"],
+        )
+        .await
+        .unwrap(),
+        "push --all",
+    );
+    let clone_dir = ws.path().join("clone");
+    expect_ok(
+        git(ws.path(), &["clone", &url, clone_dir.to_str().unwrap()])
+            .await
+            .unwrap(),
+        "clone (the 31-want request is gzipped by git)",
+    );
+    assert!(clone_dir.join("README.md").exists());
+}
+
+/// A 50 MiB push streams through the api without buffering it twice: the
+/// request body pipes into http-backend's stdin as frames arrive.
+#[tokio::test]
+async fn large_push_streams_through_the_api() {
+    let (_controller, port, ws, _state) = forge_harness().await;
+    let origin = ws.path().join("seed");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-b", "main"]).await.unwrap();
+    std::fs::write(origin.join("README.md"), "seed\n").unwrap();
+    git(&origin, &["add", "-A"]).await.unwrap();
+    git(
+        &origin,
+        &[
+            "-c",
+            "user.email=s@x",
+            "-c",
+            "user.name=s",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    )
+    .await
+    .unwrap();
+    let url = format!("http://smith:{TOKEN}@127.0.0.1:{port}/git/demo.git");
+    expect_ok(git(&origin, &["push", &url, "main"]).await.unwrap(), "push-to-create");
+
+    // 50 MiB of incompressible data (LCG — cheap and deterministic).
+    let mut data = Vec::with_capacity(50 * 1024 * 1024);
+    let mut x: u64 = 0x1234_5678_9abc_def0;
+    for _ in 0..50 * 1024 * 1024 {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        data.push((x >> 33) as u8);
+    }
+    std::fs::write(origin.join("big.bin"), &data).unwrap();
+    git(&origin, &["add", "-A"]).await.unwrap();
+    git(
+        &origin,
+        &[
+            "-c",
+            "user.email=s@x",
+            "-c",
+            "user.name=s",
+            "commit",
+            "-m",
+            "big",
+        ],
+    )
+    .await
+    .unwrap();
+    expect_ok(git(&origin, &["push", &url, "main"]).await.unwrap(), "50 MiB push");
 }
 
 // ---- Phase 0 red tests (HTTP migration) --------------------------------
@@ -2076,13 +2192,12 @@ async fn s04_idle_connection_is_bounded_and_cap_refuses_extras() {
     );
 }
 
-/// RED (C-02, green in Phase 4): git compresses upload-pack requests larger
-/// than 1024 bytes with Content-Encoding: gzip (remote-curl.c). The server
-/// must decode before handing the body to upload-pack, which answers a
-/// complete request with a NAK pkt-line. Today the gzipped bytes go to
-/// upload-pack raw and the call fails.
+/// GREEN (C-02, Phase 4): git compresses upload-pack requests larger than
+/// 1024 bytes with Content-Encoding: gzip (remote-curl.c). The api streams
+/// them raw to `git http-backend`, which inflates and answers a complete
+/// request with a NAK pkt-line. (Against the legacy server this was red:
+/// the gzipped bytes reached upload-pack raw.)
 #[tokio::test]
-#[ignore = "red test (C-02): goes green in Phase 4 (git http-backend) or with gzip decoding"]
 async fn red_c02_gzipped_upload_pack_request_is_decoded() {
     let (_controller, port, ws, _state) = forge_harness().await;
     let origin = ws.path().join("seed");
