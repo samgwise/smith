@@ -163,8 +163,11 @@ async fn main() -> anyhow::Result<()> {
                 ca_cert_pem,
             };
             let path = credential_path()?;
-            std::fs::write(&path, serde_json::to_string_pretty(&cred)?)
-                .with_context(|| format!("writing {}", path.display()))?;
+            smith_core::secret::write_private(
+                &path,
+                serde_json::to_string_pretty(&cred)?.as_bytes(),
+            )
+            .with_context(|| format!("writing {}", path.display()))?;
             println!(
                 "worker `{name}` enrolled (id {}); credential written to {}",
                 &cred.worker_id[..8.min(cred.worker_id.len())],

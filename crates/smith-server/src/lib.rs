@@ -42,7 +42,8 @@ pub fn ensure_token() -> anyhow::Result<String> {
         }
     }
     let token = uuid::Uuid::new_v4().simple().to_string();
-    std::fs::write(&path, &token).with_context(|| format!("writing {}", path.display()))?;
+    smith_core::secret::write_private(&path, token.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(token)
 }
 

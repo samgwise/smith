@@ -80,7 +80,7 @@ impl Forge {
             write_all,
         };
         let path = self.state_dir.join(format!("{session_id}.gitcred"));
-        std::fs::write(&path, serde_json::to_string_pretty(&cred)?)
+        smith_core::secret::write_private(&path, serde_json::to_string_pretty(&cred)?.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         self.tokens
             .lock()

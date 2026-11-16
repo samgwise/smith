@@ -127,12 +127,13 @@ impl WorkerRegistry {
     }
 
     fn persist(&self, state: &RegistryFile) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(&self.path, serde_json::to_string_pretty(state)?)
-            .with_context(|| format!("writing {}", self.path.display()))
+        // The registry holds credential hashes only, but it is secret-
+        // adjacent: private mode + atomic replace (S-15).
+        smith_core::secret::write_private(
+            &self.path,
+            serde_json::to_string_pretty(state)?.as_bytes(),
+        )
+        .with_context(|| format!("writing {}", self.path.display()))
     }
 
     /// Mint a single-use enrolment token for `name`.
