@@ -805,6 +805,7 @@ pub(crate) async fn forge_auth(
             read: true,
             write: true,
             write_all: true,
+            expires_ms: 0,
         }
     } else {
         match state

@@ -258,6 +258,7 @@ fn harness_controller(
         smith_server::OrchestrateSection::default(),
         None,
         None,
+        smith_server::forge::DEFAULT_TOKEN_TTL_MS,
     )
 }
 
@@ -1106,6 +1107,7 @@ async fn orchestration_end_to_end_over_the_mesh() {
             },
             None,
             None,
+            smith_server::forge::DEFAULT_TOKEN_TTL_MS,
         )
     };
     let listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
@@ -1299,6 +1301,7 @@ async fn spawn_caps_are_enforced_and_finish_releases_queued_children() {
         },
         None,
         None,
+        smith_server::forge::DEFAULT_TOKEN_TTL_MS,
     );
     let listener = smith_server::api::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1424,6 +1427,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
             },
             Some(state.path().to_path_buf()),
             None,
+            smith_server::forge::DEFAULT_TOKEN_TTL_MS,
         )
     };
     let listener1 = smith_server::api::bind("127.0.0.1:0").await.unwrap();
@@ -1518,6 +1522,7 @@ async fn daemon_restart_recovers_sessions_leases_and_orchestration() {
             },
             Some(state.path().to_path_buf()),
             None,
+            smith_server::forge::DEFAULT_TOKEN_TTL_MS,
         )
     };
     let listener2 = smith_server::api::bind("127.0.0.1:0").await.unwrap();
@@ -1668,6 +1673,7 @@ async fn requeued_children_dispatch_after_restart() {
             },
             Some(state.path().to_path_buf()),
             None,
+            smith_server::forge::DEFAULT_TOKEN_TTL_MS,
         )
     };
     let listener1 = smith_server::api::bind("127.0.0.1:0").await.unwrap();
@@ -1742,6 +1748,7 @@ async fn requeued_children_dispatch_after_restart() {
             },
             Some(state.path().to_path_buf()),
             None,
+            smith_server::forge::DEFAULT_TOKEN_TTL_MS,
         )
     };
     let listener2 = smith_server::api::bind("127.0.0.1:0").await.unwrap();
@@ -1989,6 +1996,7 @@ fn harness_controller_with_state(ws: &std::path::Path, state: &std::path::Path) 
         smith_server::OrchestrateSection::default(),
         Some(state.to_path_buf()),
         None,
+        smith_server::forge::DEFAULT_TOKEN_TTL_MS,
     )
 }
 
@@ -2019,6 +2027,7 @@ async fn smith_repo_scheme_mints_session_tokens() {
             smith_server::OrchestrateSection::default(),
             Some(state.path().to_path_buf()),
             Some(format!("http://127.0.0.1:{port}")),
+            smith_server::forge::DEFAULT_TOKEN_TTL_MS,
         )
     };
     tokio::spawn(smith_server::api::accept_loop(

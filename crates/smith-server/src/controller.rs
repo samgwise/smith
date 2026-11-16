@@ -286,6 +286,7 @@ impl Controller {
             provider: config.provider.clone(),
             model: config.model.clone(),
         };
+        let forge_ttl_ms = config.serve.forge_token_ttl_secs.saturating_mul(1000);
         let state_dir = state_dir_for(config);
         let public_url = config
             .serve
@@ -305,6 +306,7 @@ impl Controller {
             config.orchestrate.clone(),
             Some(state_dir),
             public_url,
+            forge_ttl_ms,
         ))
     }
 
@@ -321,13 +323,16 @@ impl Controller {
         orchestrate: OrchestrateSection,
         state_dir: Option<PathBuf>,
         public_url: Option<String>,
+        forge_token_ttl_ms: u64,
     ) -> Arc<Self> {
         if let Some(dir) = &state_dir
             && let Err(e) = std::fs::create_dir_all(dir)
         {
             tracing::warn!("cannot create state dir {}: {e:#}", dir.display());
         }
-        let forge = state_dir.as_ref().map(|dir| Arc::new(Forge::new(dir)));
+        let forge = state_dir
+            .as_ref()
+            .map(|dir| Arc::new(Forge::with_ttl(dir, forge_token_ttl_ms)));
         Arc::new(Self {
             sessions: std::sync::Mutex::new(HashMap::new()),
             factory,
@@ -993,6 +998,11 @@ impl Controller {
         // A queued child has a label-lease but no board record yet; a
         // granted one has both. Release clears what exists.
         let worker = self.fleet.board.release(id).filter(|w| !w.is_empty());
+        // Session end revokes the session's forge token: the `.gitcred` is
+        // removed so a restart cannot recover it (S-14 part 2).
+        if let Some(forge) = &self.forge {
+            forge.revoke_session(id);
+        }
         if worker.is_some() {
             self.fleet
                 .metrics
@@ -1815,6 +1825,7 @@ mod tests {
             OrchestrateSection::default(),
             None,
             None,
+            crate::forge::DEFAULT_TOKEN_TTL_MS,
         )
     }
 

@@ -170,6 +170,10 @@ pub struct ServeSection {
     pub allow_plaintext_remote: bool,
     /// Git route body cap in MiB (pack uploads). Checked after forge auth.
     pub max_git_body_mb: u32,
+    /// Lifetime of minted forge tokens in seconds (S-14 part 2). 0 disables
+    /// expiry — not recommended; expired tokens stop authenticating and are
+    /// dropped at recovery.
+    pub forge_token_ttl_secs: u64,
 }
 
 impl Default for ServeSection {
@@ -183,6 +187,7 @@ impl Default for ServeSection {
             tls_key: None,
             allow_plaintext_remote: false,
             max_git_body_mb: 256,
+            forge_token_ttl_secs: 7 * 24 * 60 * 60, // one week (S-14 part 2)
         }
     }
 }

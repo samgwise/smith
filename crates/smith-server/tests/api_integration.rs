@@ -125,6 +125,7 @@ fn api_controller(
         smith_server::OrchestrateSection::default(),
         None,
         None,
+        smith_server::forge::DEFAULT_TOKEN_TTL_MS,
     )
 }
 

@@ -36,7 +36,15 @@ pub struct GitCred {
     /// `.gitcred` files from before this field default to false.
     #[serde(default)]
     pub write_all: bool,
+    /// Wall-clock expiry in ms since the epoch; 0 = never (recovered
+    /// `.gitcred` files from before this field default to never). Expired
+    /// grants stop authenticating (S-14 part 2).
+    #[serde(default)]
+    pub expires_ms: u64,
 }
+
+/// Default minted-token lifetime (S-14 part 2): one week.
+pub const DEFAULT_TOKEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Hosted repos + the token table. Repos live as bare repos under
 /// `<state_dir>/repos/<name>.git`; tokens under `<state_dir>/<session>.gitcred`.
@@ -44,15 +52,34 @@ pub struct Forge {
     repos_dir: PathBuf,
     state_dir: PathBuf,
     tokens: Mutex<HashMap<String /* token hash */, GitCred>>,
+    /// Minted-token lifetime in ms; 0 disables expiry.
+    token_ttl_ms: u64,
 }
 
 impl Forge {
     pub fn new(state_dir: &Path) -> Self {
+        Self::with_ttl(state_dir, DEFAULT_TOKEN_TTL_MS)
+    }
+
+    /// A forge whose minted tokens expire after `token_ttl_ms` (0 = never).
+    pub fn with_ttl(state_dir: &Path, token_ttl_ms: u64) -> Self {
         Self {
             repos_dir: state_dir.join("repos"),
             state_dir: state_dir.to_path_buf(),
             tokens: Mutex::new(HashMap::new()),
+            token_ttl_ms,
         }
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn is_expired(cred: &GitCred) -> bool {
+        cred.expires_ms != 0 && Self::now_ms() >= cred.expires_ms
     }
 
     pub fn repos_dir(&self) -> &Path {
@@ -71,6 +98,11 @@ impl Forge {
         write_all: bool,
     ) -> anyhow::Result<String> {
         let token = uuid::Uuid::new_v4().simple().to_string();
+        let expires_ms = if self.token_ttl_ms == 0 {
+            0
+        } else {
+            Self::now_ms() + self.token_ttl_ms
+        };
         let cred = GitCred {
             session_id: session_id.to_string(),
             token_hash: token_hash(&token),
@@ -78,6 +110,7 @@ impl Forge {
             read,
             write,
             write_all,
+            expires_ms,
         };
         let path = self.state_dir.join(format!("{session_id}.gitcred"));
         smith_core::secret::write_private(&path, serde_json::to_string_pretty(&cred)?.as_bytes())
@@ -103,6 +136,14 @@ impl Forge {
                     .and_then(|raw| serde_json::from_str::<GitCred>(&raw).map_err(|e| e.into()))
                 {
                     Ok(cred) => {
+                        if Self::is_expired(&cred) {
+                            tracing::info!(
+                                "expired .gitcred {} not recovered (S-14 part 2)",
+                                path.display()
+                            );
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
                         self.tokens
                             .lock()
                             .expect("forge tokens poisoned")
@@ -116,13 +157,35 @@ impl Forge {
         n
     }
 
-    /// Authenticate a token → its grant.
+    /// Authenticate a token → its grant. Expired grants refuse (S-14 part 2).
     pub fn authenticate(&self, token: &str) -> Option<GitCred> {
-        self.tokens
-            .lock()
-            .expect("forge tokens poisoned")
-            .get(&token_hash(token))
-            .cloned()
+        let tokens = self.tokens.lock().expect("forge tokens poisoned");
+        let cred = tokens.get(&token_hash(token))?;
+        if Self::is_expired(cred) {
+            return None;
+        }
+        Some(cred.clone())
+    }
+
+    /// Revoke every grant for a session (lease release / session end): the
+    /// in-memory grants drop and the `.gitcred` sidecar is removed so a
+    /// restart cannot recover them (S-14 part 2). Returns the removed count.
+    pub fn revoke_session(&self, session_id: &str) -> usize {
+        let mut tokens = self.tokens.lock().expect("forge tokens poisoned");
+        let dead: Vec<String> = tokens
+            .iter()
+            .filter(|(_, c)| c.session_id == session_id)
+            .map(|(h, _)| h.clone())
+            .collect();
+        for h in &dead {
+            tokens.remove(h);
+        }
+        drop(tokens);
+        let sidecar = self.state_dir.join(format!("{session_id}.gitcred"));
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(&sidecar);
+        }
+        dead.len()
     }
 
     /// The path of a hosted repo; `None` when the name is unsafe.
