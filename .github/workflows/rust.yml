@@ -91,7 +91,7 @@ jobs:
         # Single-threaded: the live tests share the sidecar and the session
         # cleanup paths, and each start_session re-applies the nftables
         # ruleset.
-        run: cargo test -p smith-sandbox --lib --ignored -- --test-threads=1
+        run: cargo test -p smith-sandbox --lib -- --test-threads=1 --ignored
       - name: Save the sidecar image for the next run
         if: steps.egress-image.outputs.cache-hit != 'true'
         run: podman save -o egress-image.tar localhost/smith-egress:0.1
