@@ -21,13 +21,29 @@ pub const EGRESS_PROXY_IP: &str = "10.89.100.10";
 pub const EGRESS_TABLE: &str = "smith-egress";
 
 /// Render the complete nft ruleset for `nft -f`.
+///
+/// The payload is an idempotent reload (S-28): the bare `table` line
+/// declares (or merges into) the table, `delete table` removes it, and the
+/// final block recreates it with exactly these rules — all in one `nft -f`
+/// transaction, so stale rules can never accumulate across re-applies.
+/// The `input` chain (S-08) closes the locally-destined gap: from the bridge
+/// only DNS to the gateway is accepted into the machine; every other port
+/// drops. The residual DNS channel to the gateway stays (documented).
 pub fn ruleset(bridge: &str, proxy_ip: &str) -> String {
     format!(
-        "table inet {EGRESS_TABLE} {{\n\
+        "table inet {EGRESS_TABLE}\n\
+         delete table inet {EGRESS_TABLE}\n\
+         table inet {EGRESS_TABLE} {{\n\
          \x20 chain forward {{\n\
          \x20   type filter hook forward priority 0; policy accept;\n\
          \x20   iifname \"{bridge}\" oifname \"{bridge}\" accept\n\
          \x20   iifname \"{bridge}\" ip saddr {proxy_ip} accept\n\
+         \x20   iifname \"{bridge}\" drop\n\
+         \x20 }}\n\
+         \x20 chain input {{\n\
+         \x20   type filter hook input priority 0; policy accept;\n\
+         \x20   iifname \"{bridge}\" ip saddr {EGRESS_GATEWAY} udp dport 53 accept\n\
+         \x20   iifname \"{bridge}\" ip saddr {EGRESS_GATEWAY} tcp dport 53 accept\n\
          \x20   iifname \"{bridge}\" drop\n\
          \x20 }}\n\
          }}\n"
@@ -70,21 +86,46 @@ mod tests {
     #[test]
     fn ruleset_is_exact_and_scoped() {
         let rs = ruleset("podman1", "10.89.100.10");
-        assert!(rs.starts_with("table inet smith-egress {\n"));
+        assert!(rs.contains("table inet smith-egress {"));
         assert!(rs.contains("type filter hook forward priority 0; policy accept;"));
         assert!(rs.contains("iifname \"podman1\" oifname \"podman1\" accept"));
         assert!(rs.contains("iifname \"podman1\" ip saddr 10.89.100.10 accept"));
-        assert!(rs.ends_with("iifname \"podman1\" drop\n  }\n}\n"));
+        assert!(rs.contains("iifname \"podman1\" drop\n  }"));
         // The ruleset mentions no other interface.
         assert!(!rs.contains("eth0"));
     }
 
+    /// S-08: the input chain closes the locally-destined gap — from the
+    /// bridge only DNS (udp/tcp 53) to the gateway enters the machine.
     #[test]
-    fn ruleset_is_idempotent_nft_input() {
-        // Applying twice must be valid: `nft -f` replaces the table.
-        let once = ruleset("podman2", "10.89.100.10");
-        let twice = format!("{once}{once}");
-        assert_eq!(twice.lines().count(), once.lines().count() * 2);
+    fn ruleset_contains_a_dns_only_input_chain() {
+        let rs = ruleset("podman1", "10.89.100.10");
+        assert!(rs.contains("type filter hook input priority 0; policy accept;"));
+        assert!(
+            rs.contains("iifname \"podman1\" ip saddr 10.89.100.1 udp dport 53 accept"),
+            "DNS over UDP must be accepted"
+        );
+        assert!(
+            rs.contains("iifname \"podman1\" ip saddr 10.89.100.1 tcp dport 53 accept"),
+            "DNS over TCP must be accepted"
+        );
+        let input_pos = rs.find("hook input").expect("input chain");
+        let input_section = &rs[input_pos..];
+        assert!(input_section.contains("iifname \"podman1\" drop"));
+    }
+
+    /// S-28: the payload is an idempotent reload — declare, delete, then
+    /// recreate the table inside one `nft -f` transaction, so re-applying
+    /// never appends stale rules.
+    #[test]
+    fn ruleset_reloads_idempotently() {
+        let rs = ruleset("podman1", "10.89.100.10");
+        let lines: Vec<&str> = rs.lines().collect();
+        assert_eq!(lines[0], "table inet smith-egress", "declare first");
+        assert_eq!(lines[1], "delete table inet smith-egress", "then delete");
+        assert_eq!(lines[2], "table inet smith-egress {", "then recreate");
+        // Exactly one full table definition follows the prelude.
+        assert_eq!(rs.matches("table inet smith-egress").count(), 3);
         assert!(delete_command().ends_with("delete table inet smith-egress"));
     }
 

@@ -104,11 +104,18 @@ impl Clearance {
     }
 
     /// Register a pending decision for `host`; returns its id and the
-    /// receiver for the answer.
-    pub fn create_pending(&self, host: &str) -> (u64, oneshot::Receiver<Decision>) {
+    /// receiver for the answer. `None` when the pending set is at the cap
+    /// (S-23): a flood of unclosed requests must not grow memory without
+    /// limit — the caller treats it as a denial.
+    pub fn try_create_pending(&self, host: &str) -> Option<(u64, oneshot::Receiver<Decision>)> {
+        const PENDING_CAP: usize = 64;
+        let mut pending = self.pending.lock().expect("pending mutex poisoned");
+        if pending.len() >= PENDING_CAP {
+            return None;
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("pending mutex poisoned").insert(
+        pending.insert(
             id,
             PendingEntry {
                 host: host.to_string(),
@@ -116,7 +123,7 @@ impl Clearance {
                 reply: tx,
             },
         );
-        (id, rx)
+        Some((id, rx))
     }
 
     /// Answer a pending request; `false` when the id is gone (timed out or
@@ -179,10 +186,33 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// S-23: pending requests are capped — beyond the cap the request is
+    /// refused (the caller denies) instead of growing memory unbounded.
+    #[test]
+    fn pending_requests_are_capped() {
+        let clearance = Clearance::new(ClearanceMode::Ask);
+        let mut ids = Vec::new();
+        for i in 0..64 {
+            let (id, _rx) = clearance
+                .try_create_pending(&format!("host{i}.example.com"))
+                .expect("under the cap");
+            ids.push(id);
+        }
+        assert!(
+            clearance
+                .try_create_pending("one-too-many.example.com")
+                .is_none(),
+            "beyond the cap the request must be refused (S-23)"
+        );
+        // Deciding one frees a slot.
+        clearance.decide(ids[0], Decision::Deny);
+        assert!(clearance.try_create_pending("again.example.com").is_some());
+    }
+
     #[tokio::test]
     async fn pending_create_decide_and_always() {
         let clearance = Clearance::new(ClearanceMode::Ask);
-        let (id, rx) = clearance.create_pending("api.example.com");
+        let (id, rx) = clearance.try_create_pending("api.example.com").unwrap();
         assert_eq!(
             clearance.pending_list(),
             vec![(id, "api.example.com".into())]
@@ -200,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn reaped_requests_close_their_channel() {
         let clearance = Clearance::new(ClearanceMode::Ask);
-        let (_id, rx) = clearance.create_pending("slow.example.com");
+        let (_id, rx) = clearance.try_create_pending("slow.example.com").unwrap();
         // Nothing waits yet; reap with a large budget after the entry is
         // definitely older than it (created_ms is stamped at creation).
         tokio::time::sleep(Duration::from_millis(5)).await;

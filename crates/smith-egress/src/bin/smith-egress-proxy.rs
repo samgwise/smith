@@ -141,10 +141,7 @@ async fn handle_connection(client: TcpStream, state: Arc<ProxyState>) -> anyhow:
             anyhow::bail!("destination not cleared: {host}")
         }
         tracing::info!("http allowed: {host}");
-        let port = target
-            .rsplit_once(':')
-            .and_then(|(_, p)| p.parse::<u16>().ok())
-            .unwrap_or(80);
+        let (_, port) = parse_authority(target);
         let mut upstream = connect_upstream(&format!("{host}:{port}")).await?;
         // Rewrite the absolute URI to a path-form request, replay the head
         // plus whatever body bytes were already buffered, then pipe.
@@ -153,6 +150,20 @@ async fn handle_connection(client: TcpStream, state: Arc<ProxyState>) -> anyhow:
         upstream.write_all(&leftover).await?;
         tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
         Ok(())
+    }
+}
+
+/// Parse a plain-HTTP absolute URI into its `(host, port)`. The port comes
+/// from the URI's authority only — a path may not change it (S-23). No
+/// explicit port → 80.
+fn parse_authority(target: &str) -> (String, u16) {
+    let rest = target.strip_prefix("http://").unwrap_or(target);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.parse::<u16>().is_ok() => {
+            (h.to_string(), p.parse().unwrap())
+        }
+        _ => (authority.to_string(), 80),
     }
 }
 
@@ -172,7 +183,11 @@ async fn decide_destination(state: &ProxyState, host: &str) -> Decision {
             Decision::Deny
         }
         ClearanceMode::Ask => {
-            let (id, rx) = state.clearance.create_pending(host);
+            // At the pending cap the request is refused outright (S-23).
+            let Some((id, rx)) = state.clearance.try_create_pending(host) else {
+                tracing::warn!("clearance pending set full: {host} denied");
+                return Decision::Deny;
+            };
             tracing::info!("clearance requested: {host} (request {id})");
             match tokio::time::timeout(CLEARANCE_WAIT, rx).await {
                 Ok(Ok(decision)) => decision,
@@ -426,6 +441,34 @@ fn plain_http_host(target: &str, head: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S-23: the port comes from the URI's authority — `:8080` before the
+    /// path must not fall back to 80.
+    #[test]
+    fn parse_authority_extracts_scheme_host_and_port() {
+        assert_eq!(
+            parse_authority("http://host:8080/path"),
+            ("host".to_string(), 8080)
+        );
+        assert_eq!(
+            parse_authority("http://host/path"),
+            ("host".to_string(), 80)
+        );
+        assert_eq!(
+            parse_authority("http://host:8080"),
+            ("host".to_string(), 8080)
+        );
+        assert_eq!(parse_authority("host"), ("host".to_string(), 80));
+        assert_eq!(
+            parse_authority("http://192.168.1.1:9999/x?y"),
+            ("192.168.1.1".to_string(), 9999)
+        );
+    }
 }
 
 /// Replace the absolute URI in the request line with path-or-origin form.
