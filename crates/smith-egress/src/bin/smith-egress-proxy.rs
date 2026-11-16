@@ -443,34 +443,6 @@ fn plain_http_host(target: &str, head: &str) -> Option<String> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// S-23: the port comes from the URI's authority — `:8080` before the
-    /// path must not fall back to 80.
-    #[test]
-    fn parse_authority_extracts_scheme_host_and_port() {
-        assert_eq!(
-            parse_authority("http://host:8080/path"),
-            ("host".to_string(), 8080)
-        );
-        assert_eq!(
-            parse_authority("http://host/path"),
-            ("host".to_string(), 80)
-        );
-        assert_eq!(
-            parse_authority("http://host:8080"),
-            ("host".to_string(), 8080)
-        );
-        assert_eq!(parse_authority("host"), ("host".to_string(), 80));
-        assert_eq!(
-            parse_authority("http://192.168.1.1:9999/x?y"),
-            ("192.168.1.1".to_string(), 9999)
-        );
-    }
-}
-
 /// Replace the absolute URI in the request line with path-or-origin form.
 fn rewrite_request_line(head: &str, target: &str) -> anyhow::Result<String> {
     let (first_line, rest) = head.split_once("\r\n").context("malformed head")?;
@@ -501,5 +473,28 @@ mod tests {
         assert!(!tokens_equal("tok-123", "tok-1234"));
         assert!(!tokens_equal("", "tok"));
         assert!(tokens_equal("", ""));
+    }
+
+    /// S-23: the port comes from the URI's authority — `:8080` before the
+    /// path must not fall back to 80.
+    #[test]
+    fn parse_authority_extracts_scheme_host_and_port() {
+        assert_eq!(
+            parse_authority("http://host:8080/path"),
+            ("host".to_string(), 8080)
+        );
+        assert_eq!(
+            parse_authority("http://host/path"),
+            ("host".to_string(), 80)
+        );
+        assert_eq!(
+            parse_authority("http://host:8080"),
+            ("host".to_string(), 8080)
+        );
+        assert_eq!(parse_authority("host"), ("host".to_string(), 80));
+        assert_eq!(
+            parse_authority("http://192.168.1.1:9999/x?y"),
+            ("192.168.1.1".to_string(), 9999)
+        );
     }
 }
