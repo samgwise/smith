@@ -1281,6 +1281,7 @@ mod tests {
         assert!(NetworkMode::Open.podman_args().is_empty());
     }
 
+    use anyhow::Context as _;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -1455,9 +1456,14 @@ mod tests {
     /// denied by the proxy. Requires podman; run with `cargo test --ignored`.
     #[tokio::test]
     #[ignore = "requires podman and network; run with --ignored"]
-    async fn egress_proxy_allows_and_denies() {
+    async fn egress_proxy_allows_and_denies() -> anyhow::Result<()> {
+        // The deny path must be deterministic: run the sidecar in `deny`
+        // mode (in `ask` mode the connection is HELD for a decision no test
+        // answers, and curl times out instead of seeing the proxy's 403).
+        // ensure_sidecar recreates a mismatched sidecar with this mode.
         let sandbox = Sandbox::new(SandboxConfig {
             network: NetworkMode::Proxy,
+            egress_clearance: "deny".to_string(),
             ..Default::default()
         });
         sandbox.ensure_ready().await.unwrap();
@@ -1466,9 +1472,9 @@ mod tests {
 
         // curl is not in the ubuntu base image; the boot script installs it
         // in the background through the proxy (archive.ubuntu.com is on the
-        // default allowlist — itself a check). Wait for that install rather
-        // than racing it for apt's lock; only if it never lands, install
-        // through the proxy explicitly.
+        // default allowlist — itself a check, and unaffected by the mode).
+        // Wait for that install rather than racing it for apt's lock; only
+        // if it never lands, install through the proxy explicitly.
         let install = sandbox
             .exec_as(
                 &session,
@@ -1510,6 +1516,7 @@ mod tests {
 
         sandbox.stop_session(&session).await.unwrap();
         sandbox.stop_egress_sidecar().await.unwrap();
+        Ok(())
     }
 
     /// Live streaming-exec test: deltas arrive while the buffered result is
@@ -1588,8 +1595,10 @@ mod tests {
         );
 
         // S-08: from a container, the gateway answers DNS only — a dial to
-        // any other port hangs until the timeout kills it (the chain DROPS,
-        // it does not reject).
+        // any other port must not connect. On a rootful bridge the nft DROP
+        // hangs the connect until the timeout kills it (exit=124); on a
+        // rootless runner the traffic path differs and the refusal is fast
+        // (exit=1). Either way the port is unreachable — never exit=0.
         let dial = sandbox
             .exec_as(
                 &s1,
@@ -1600,8 +1609,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            dial.stdout.contains("exit=124"),
-            "a gateway dial on a non-DNS port must be dropped: {}",
+            dial.stdout.contains("exit=124") || dial.stdout.contains("exit=1"),
+            "a gateway dial on a non-DNS port must not connect: {}",
             dial.stdout
         );
 

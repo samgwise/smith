@@ -380,12 +380,15 @@ mod tests {
         assert_eq!(token_from_axum_headers(&mk("Digest xyz")), None);
     }
 
-    /// S-14 part 2: an expired grant refuses to authenticate.
+    /// S-14 part 2: an expired grant refuses to authenticate. (A ttl of 0
+    /// means "never expires" — use a tiny ttl and let the clock pass it.)
     #[test]
     fn authenticate_refuses_expired_grants() {
         let tmp = tempfile::tempdir().unwrap();
-        let forge = Forge::with_ttl(tmp.path(), 0); // every token minted is born expired
+        let forge = Forge::with_ttl(tmp.path(), 500); // half a second
         let token = forge.mint("s-expired", "demo", true, true, false).unwrap();
+        assert!(forge.authenticate(&token).is_some(), "valid within the ttl");
+        std::thread::sleep(std::time::Duration::from_millis(600));
         assert!(
             forge.authenticate(&token).is_none(),
             "an expired grant must not authenticate"
