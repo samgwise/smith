@@ -1925,10 +1925,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures",
+ "http",
  "reqwest",
  "serde_json",
  "smith-core",
+ "tokio",
  "tokio-stream",
 ]
 

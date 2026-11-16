@@ -6,15 +6,37 @@
 
 use std::path::Path;
 
+/// An instruction file larger than this is truncated with a visible marker
+/// (S-22): the prompt must not grow without limit from a huge file.
+pub const MAX_INSTRUCTION_BYTES: usize = 256 * 1024;
+
 /// Load project instructions from the workspace root, if present.
-/// `AGENTS.md` wins over `CLAUDE.md`.
+/// `AGENTS.md` wins over `CLAUDE.md`; files over [`MAX_INSTRUCTION_BYTES`]
+/// are truncated with a visible marker (S-22).
 pub fn load_project_instructions(workspace: &Path) -> Option<String> {
     for name in ["AGENTS.md", "CLAUDE.md"] {
         if let Ok(raw) = std::fs::read_to_string(workspace.join(name)) {
             let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+            if trimmed.is_empty() {
+                continue;
             }
+            if trimmed.len() > MAX_INSTRUCTION_BYTES {
+                let mut cut = trimmed
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|i| *i >= MAX_INSTRUCTION_BYTES)
+                    .unwrap_or(trimmed.len());
+                while !trimmed.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                return Some(format!(
+                    "{}\n[smith: truncated — {} exceeds {} KiB]",
+                    &trimmed[..cut],
+                    name,
+                    MAX_INSTRUCTION_BYTES / 1024
+                ));
+            }
+            return Some(trimmed.to_string());
         }
     }
     None
@@ -51,5 +73,21 @@ mod tests {
         assert!(load_project_instructions(tmp.path()).is_none());
         std::fs::write(tmp.path().join("AGENTS.md"), "   \n").unwrap();
         assert!(load_project_instructions(tmp.path()).is_none());
+    }
+
+    /// S-22: an instruction file over the cap is truncated with a visible
+    /// marker instead of growing the prompt without limit.
+    #[test]
+    fn oversized_instructions_are_truncated_with_a_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "x".repeat(MAX_INSTRUCTION_BYTES + 4096);
+        std::fs::write(tmp.path().join("AGENTS.md"), &body).unwrap();
+        let loaded = load_project_instructions(tmp.path()).unwrap();
+        assert!(
+            loaded.len() < MAX_INSTRUCTION_BYTES + 4096,
+            "must be truncated"
+        );
+        assert!(loaded.contains("[smith: truncated]"), "{loaded}");
+        assert!(loaded.starts_with("xxx"), "the head of the file is kept");
     }
 }

@@ -8,8 +8,11 @@ description = "LLM provider clients for Ollama and OpenAI"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 futures.workspace = true
+http.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 smith-core.workspace = true
+tokio.workspace = true
 tokio-stream.workspace = true
