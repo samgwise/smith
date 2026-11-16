@@ -1546,4 +1546,78 @@ mod tests {
 
         sandbox.stop_session(&session).await.unwrap();
     }
+
+    /// Live enforcement test: re-applying the ruleset is idempotent (S-28)
+    /// and the input chain scopes the gateway to DNS (S-08). Requires a
+    /// LINUX podman server with nft (the podman machine or a Linux host);
+    /// run with `cargo test --ignored`.
+    #[tokio::test]
+    #[ignore = "requires podman and a Linux podman server (nft); run with --ignored"]
+    async fn egress_enforcement_is_idempotent_and_the_gateway_is_dns_only() {
+        let sandbox = Sandbox::new(SandboxConfig {
+            network: NetworkMode::Proxy,
+            ..Default::default()
+        });
+        sandbox.ensure_ready().await.unwrap();
+
+        // First session start installs the ruleset.
+        let ws1 = tempfile::tempdir().unwrap();
+        let s1 = sandbox.start_session(ws1.path()).await.unwrap();
+        let list = format!("nft list table inet {}", enforce::EGRESS_TABLE);
+        let first = sandbox.root_shell(&list).await.unwrap();
+        assert!(
+            first.status.success(),
+            "nft list failed: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let rule_count = |text: &str| text.matches("iifname").count();
+        let first_count = rule_count(&String::from_utf8_lossy(&first.stdout));
+        assert!(first_count >= 6, "expected forward+input rules: {first_count}");
+
+        // A second session start re-applies the ruleset: no rule may
+        // duplicate (S-28).
+        let ws2 = tempfile::tempdir().unwrap();
+        let s2 = sandbox.start_session(ws2.path()).await.unwrap();
+        let second = sandbox.root_shell(&list).await.unwrap();
+        assert_eq!(
+            rule_count(&String::from_utf8_lossy(&second.stdout)),
+            first_count,
+            "rules duplicated on re-apply"
+        );
+
+        // S-08: from a container, the gateway answers DNS only — a dial to
+        // any other port hangs until the timeout kills it (the chain DROPS,
+        // it does not reject).
+        let dial = sandbox
+            .exec_as(
+                &s1,
+                None,
+                "timeout 5 bash -c 'exec 3<>/dev/tcp/10.89.100.1/9999'; echo exit=$?",
+                Some(Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            dial.stdout.contains("exit=124"),
+            "a gateway dial on a non-DNS port must be dropped: {}",
+            dial.stdout
+        );
+
+        // DNS through the gateway still works (the documented residual
+        // channel).
+        let dns = sandbox
+            .exec_as(
+                &s1,
+                None,
+                "getent hosts registry.npmjs.org",
+                Some(Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dns.exit_code, 0, "DNS must still resolve: {}", dns.stderr);
+
+        sandbox.stop_session(&s1).await.unwrap();
+        sandbox.stop_session(&s2).await.unwrap();
+        sandbox.stop_egress_sidecar().await.unwrap();
+    }
 }

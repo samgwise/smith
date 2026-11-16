@@ -1,13 +1,13 @@
-# CI: build, lint and test on Linux and Windows.
+# CI: build, lint and test on Linux and Windows, plus a container runner
+# that exercises the podman/nftables stack natively.
 #
-# The unix-only security tests (symlink escape S-07, 0600 permission modes
-# S-15) run in the ubuntu job; the Windows job exercises the Windows-specific
-# paths (drive-letter mounts, PATHEXT command resolution).
-#
-# The podman/nftables egress tests are `#[ignore]`-tagged: they need a real
-# podman machine (and nftables inside it), which GitHub runners cannot
-# provide. Run them manually on a machine with podman:
-#   cargo test --workspace --ignored
+# - The unix-only security tests (symlink escape S-07, 0600 permission modes
+#   S-15) run in the ubuntu job; the Windows job exercises the Windows-specific
+#   paths (drive-letter mounts, PATHEXT command resolution).
+# - The `container` job runs the `#[ignore]`-tagged podman/nftables egress
+#   tests against a native (rootless) podman server on the runner: egress
+#   allow/deny through the sidecar, idempotent nftables reload (S-28), and
+#   the DNS-only gateway input chain (S-08).
 name: Rust
 
 on:
@@ -53,3 +53,30 @@ jobs:
         run: cargo build --workspace --all-targets --verbose
       - name: Run tests
         run: cargo test --workspace --verbose
+
+  # The podman rig: the ubuntu runner runs podman natively (rootless, no
+  # machine), including nftables via passwordless sudo. This is the
+  # container-specific coverage the lint/test jobs can't provide.
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install podman and nftables
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman nftables
+          # Rootless podman needs a subordinate UID range for the runner user.
+          sudo sh -c 'echo runner:100000:65536 >> /etc/subuid; echo runner:100000:65536 >> /etc/subgid'
+      - name: Podman sanity
+        run: |
+          podman --version
+          podman info
+          sudo nft list tables
+      - name: Container tests (the #[ignore] suite)
+        # Single-threaded: the live tests share the sidecar and the session
+        # cleanup paths, and each start_session re-applies the nftables
+        # ruleset.
+        run: cargo test -p smith-sandbox --lib --ignored -- --test-threads=1

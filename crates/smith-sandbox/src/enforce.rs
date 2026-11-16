@@ -42,8 +42,8 @@ pub fn ruleset(bridge: &str, proxy_ip: &str) -> String {
          \x20 }}\n\
          \x20 chain input {{\n\
          \x20   type filter hook input priority 0; policy accept;\n\
-         \x20   iifname \"{bridge}\" ip saddr {EGRESS_GATEWAY} udp dport 53 accept\n\
-         \x20   iifname \"{bridge}\" ip saddr {EGRESS_GATEWAY} tcp dport 53 accept\n\
+         \x20   iifname \"{bridge}\" udp dport 53 accept\n\
+         \x20   iifname \"{bridge}\" tcp dport 53 accept\n\
          \x20   iifname \"{bridge}\" drop\n\
          \x20 }}\n\
          }}\n"
@@ -96,17 +96,18 @@ mod tests {
     }
 
     /// S-08: the input chain closes the locally-destined gap — from the
-    /// bridge only DNS (udp/tcp 53) to the gateway enters the machine.
+    /// bridge only DNS (udp/tcp 53) enters the machine; the source is the
+    /// container (the gateway is the DESTINATION of its DNS queries).
     #[test]
     fn ruleset_contains_a_dns_only_input_chain() {
         let rs = ruleset("podman1", "10.89.100.10");
         assert!(rs.contains("type filter hook input priority 0; policy accept;"));
         assert!(
-            rs.contains("iifname \"podman1\" ip saddr 10.89.100.1 udp dport 53 accept"),
+            rs.contains("iifname \"podman1\" udp dport 53 accept"),
             "DNS over UDP must be accepted"
         );
         assert!(
-            rs.contains("iifname \"podman1\" ip saddr 10.89.100.1 tcp dport 53 accept"),
+            rs.contains("iifname \"podman1\" tcp dport 53 accept"),
             "DNS over TCP must be accepted"
         );
         let input_pos = rs.find("hook input").expect("input chain");
