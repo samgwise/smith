@@ -203,9 +203,12 @@ impl Forge {
         let path = self.repo_path(name).context("invalid repository name")?;
         if !path.exists() {
             std::fs::create_dir_all(&path)?;
+            // Pin the default branch: a bare repo's HEAD follows the host's
+            // `init.defaultBranch` otherwise, so a clone of a repo that only
+            // has `main` can check out nothing (CI runners default to
+            // `master`).
             let out = Command::new("git")
-                .arg("init")
-                .arg("--bare")
+                .args(["init", "--bare", "-b", "main"])
                 .arg(&path)
                 .output()
                 .await

@@ -472,7 +472,7 @@ async fn auth_matrix_routes_by_group() {
 /// without bound (D-5).
 #[tokio::test]
 async fn oversized_bodies_get_413() {
-    let (port, _ws, controller) = api_harness(Default::default(), vec![]).await;
+    let (port, ws, controller) = api_harness(Default::default(), vec![]).await;
     let client = ServeClient::new("127.0.0.1", port, TOKEN.to_string());
 
     // A heartbeat (64 KiB cap) carrying a 100 KiB name. Worker credential:
@@ -506,7 +506,10 @@ async fn oversized_bodies_get_413() {
     assert!(err.contains("413"), "{err}");
 
     // A turn prompt (1 MiB cap) carrying 2 MiB.
-    let id = client.create_session("C:\\", None, None).await.unwrap();
+    let id = client
+        .create_session(ws.path().to_str().unwrap(), None, None)
+        .await
+        .unwrap();
     let err = client
         .start_turn(&id, &"x".repeat(2 * 1024 * 1024))
         .await
