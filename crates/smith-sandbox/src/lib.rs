@@ -542,39 +542,34 @@ impl Sandbox {
         };
         tracing::info!("starting egress proxy sidecar");
         // The clearance token must not appear in the process argument list
-        // (S-30): the environment rides in a private file written where the
-        // podman server lives (`--env-file` resolves server-side), deleted
-        // once the sidecar is up.
-        let env_payload = enforce::encode_payload(&format!(
-            "EGRESS_ALLOWLIST={allowlist}\n\
-             EGRESS_CLEARANCE={clearance}\n\
-             CLEARANCE_TOKEN={token}\n"
-        ));
-        let env_file = format!(
-            "/tmp/smith-egress-env-{}-{}",
+        // (S-30): the environment rides in a private env file (0600, the
+        // current user's) — `podman run --env-file` is read by the podman
+        // CLIENT, so the file must be readable by whoever runs podman. It is
+        // deleted once the sidecar is up.
+        let env_file = std::env::temp_dir().join(format!(
+            "smith-egress-env-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
-        );
-        self.root_shell(&format!(
-            "echo {env_payload} | base64 -d > {env_file} && chmod 600 {env_file}"
-        ))
-        .await?
-        .status
-        .success()
-        .then_some(())
+        ));
+        smith_core::secret::write_private(
+            &env_file,
+            format!(
+                "EGRESS_ALLOWLIST={allowlist}\n\
+                 EGRESS_CLEARANCE={clearance}\n\
+                 CLEARANCE_TOKEN={token}\n"
+            )
+            .as_bytes(),
+        )
         .context("writing the sidecar env file failed")?;
 
-        let args = self.sidecar_run_args(&env_file);
+        let args = self.sidecar_run_args(&env_file.display().to_string());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self.run_podman(&arg_refs).await?;
         // Best-effort: the env file holds the clearance token.
-        let _ = self
-            .root_shell(&format!("rm -f {env_file}"))
-            .await
-            .map(|o| o.status.success());
+        let _ = std::fs::remove_file(&env_file);
         if !out.status.success() {
             anyhow::bail!(
                 "failed to start the egress proxy sidecar: {}{}",
@@ -587,8 +582,8 @@ impl Sandbox {
 
     /// The `podman run` argument list for the egress proxy sidecar. The
     /// clearance control API is published on host loopback only, and the
-    /// environment (including the clearance token) rides an env file written
-    /// server-side — never the argv (S-30).
+    /// environment (including the clearance token) rides a private env file
+    /// read by the podman client — never the argv (S-30).
     fn sidecar_run_args(&self, env_file: &str) -> Vec<String> {
         use smith_egress::client::CLEARANCE_CONTROL_PORT;
         vec![
@@ -1469,21 +1464,25 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let session = sandbox.start_session(ws.path()).await.unwrap();
 
-        // curl is not in the ubuntu base image; install it through the proxy
-        // (archive.ubuntu.com is on the default allowlist — itself a check).
+        // curl is not in the ubuntu base image; the boot script installs it
+        // in the background through the proxy (archive.ubuntu.com is on the
+        // default allowlist — itself a check). Wait for that install rather
+        // than racing it for apt's lock; only if it never lands, install
+        // through the proxy explicitly.
         let install = sandbox
             .exec_as(
                 &session,
                 Some("root"),
-                "apt-get update -qq && apt-get install -y -qq curl",
-                Some(Duration::from_secs(300)),
+                "for i in $(seq 1 60); do command -v curl >/dev/null && exit 0; sleep 5; done; \
+                  apt-get update -qq && apt-get install -y -qq curl",
+                Some(Duration::from_secs(420)),
             )
             .await
             .unwrap();
         assert_eq!(
             install.exit_code, 0,
-            "apt through the proxy: {}",
-            install.stdout
+            "curl install through the proxy: {}{}",
+            install.stdout, install.stderr
         );
 
         let allowed = sandbox
