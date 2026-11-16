@@ -535,6 +535,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// `SMITH_WORKER_WORK_DIR` is process-global: the tests that redirect it
+    /// must not run concurrently, or one test's tempdir (deleted at its end)
+    /// yanks the other's work-dir out from under it.
+    static WORK_DIR_LOCK: Mutex<()> = Mutex::new(());
+
     /// S-32 red: a token containing shell metacharacters must never be
     /// spliced into the helper snippet — the helper reads it from an env var.
     #[test]
@@ -566,6 +571,7 @@ mod tests {
     /// origin the token is bound to, not every host that asks.
     #[tokio::test]
     async fn capture_server_receives_no_token() {
+        let _env_guard = WORK_DIR_LOCK.lock().unwrap();
         const TOKEN: &str = "sekrit-capture-token";
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -660,12 +666,12 @@ mod tests {
 
     #[test]
     fn scratch_and_checkpoint_round_trip() {
+        let _env_guard = WORK_DIR_LOCK.lock().unwrap();
         // A local file:// remote exercises the full materialise/checkpoint
         // flow without a network. The work dir is redirected to the tempdir
         // so the test never touches ~/.smith-worker.
         let tmp = tempfile::tempdir().unwrap();
-        // Edition 2024: set_var is unsafe (process-global). Single-threaded
-        // env use here; the work dir is redirected away from the home dir.
+        // Edition 2024: set_var is unsafe (process-global).
         unsafe {
             std::env::set_var("SMITH_WORKER_WORK_DIR", tmp.path().join("work"));
         }
