@@ -10,20 +10,45 @@ use smith_tui::{App, AppParams, RemoteLink};
 /// Default daemon address when neither `--url` nor `SMITH_SERVE_URL` is set.
 const DEFAULT_URL: &str = "127.0.0.1:9240";
 
+/// Resolve the daemon token from `--token` or `--token-file`. The file form
+/// keeps the token off the process argument list (S-30). An error when both
+/// are given.
+pub fn resolve_token(
+    token: Option<&str>,
+    token_file: Option<&std::path::Path>,
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        token.is_none() || token_file.is_none(),
+        "pass --token or --token-file, not both"
+    );
+    if let Some(t) = token {
+        return Ok(Some(t.to_string()));
+    }
+    if let Some(path) = token_file {
+        return Ok(Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?
+                .trim()
+                .to_string(),
+        ));
+    }
+    Ok(None)
+}
+
 /// Resolve the client from explicit flags, falling back to the environment
 /// and finally the defaults. `cert` (a PEM file, mirroring
 /// `SMITH_SERVE_CERT`) pins the controller's certificate for https targets.
 pub fn resolve_client(
     url: Option<&str>,
     token: Option<&str>,
+    token_file: Option<&std::path::Path>,
     cert: Option<&str>,
 ) -> anyhow::Result<ServeClient> {
     let url = url
         .map(str::to_string)
         .or_else(|| std::env::var("SMITH_SERVE_URL").ok())
         .unwrap_or_else(|| DEFAULT_URL.to_string());
-    let token = token
-        .map(str::to_string)
+    let token = resolve_token(token, token_file)?
         .or_else(|| std::env::var("SMITH_SERVE_TOKEN").ok())
         .map(Ok)
         .unwrap_or_else(|| {
@@ -47,6 +72,8 @@ pub fn resolve_client(
 pub struct AttachOpts<'a> {
     pub url: Option<&'a str>,
     pub token: Option<&'a str>,
+    /// File holding the daemon token — keeps it off the argv (S-30).
+    pub token_file: Option<&'a std::path::Path>,
     /// PEM file pinning the daemon's certificate (https targets).
     pub cert: Option<&'a str>,
     /// Session id (or unique prefix); newest for this workspace when None.
@@ -61,7 +88,7 @@ pub struct AttachOpts<'a> {
 /// TUI over a `RemoteLink`. Worker-mode flags (`--worker/--repo/--ref`)
 /// lease a fleet worker for the session.
 pub async fn run_attach(opts: AttachOpts<'_>) -> anyhow::Result<()> {
-    let client = resolve_client(opts.url, opts.token, opts.cert)?;
+    let client = resolve_client(opts.url, opts.token, opts.token_file, opts.cert)?;
     client
         .health()
         .await
@@ -149,7 +176,7 @@ pub async fn worker_issue(
     cert: Option<&str>,
     name: &str,
 ) -> anyhow::Result<()> {
-    let client = resolve_client(url, token, cert)?;
+    let client = resolve_client(url, token, None, cert)?;
     let enrolment = client.worker_issue(name).await?;
     println!("enrolment token for `{name}` (single use, hand to the worker):\n{enrolment}");
     Ok(())
@@ -161,7 +188,7 @@ pub async fn workers_list(
     token: Option<&str>,
     cert: Option<&str>,
 ) -> anyhow::Result<()> {
-    let client = resolve_client(url, token, cert)?;
+    let client = resolve_client(url, token, None, cert)?;
     let workers = client.workers().await?;
     if workers.is_empty() {
         println!("no workers enrolled (smith worker issue <name>)");
@@ -198,7 +225,7 @@ pub async fn worker_revoke(
     cert: Option<&str>,
     name: &str,
 ) -> anyhow::Result<()> {
-    let client = resolve_client(url, token, cert)?;
+    let client = resolve_client(url, token, None, cert)?;
     client.worker_revoke(name).await?;
     println!("worker `{name}` revoked");
     Ok(())

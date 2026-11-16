@@ -541,9 +541,40 @@ impl Sandbox {
             self.config.egress_allowlist.join(",")
         };
         tracing::info!("starting egress proxy sidecar");
-        let args = self.sidecar_run_args(&allowlist, &clearance, &token);
+        // The clearance token must not appear in the process argument list
+        // (S-30): the environment rides in a private file written where the
+        // podman server lives (`--env-file` resolves server-side), deleted
+        // once the sidecar is up.
+        let env_payload = enforce::encode_payload(&format!(
+            "EGRESS_ALLOWLIST={allowlist}\n\
+             EGRESS_CLEARANCE={clearance}\n\
+             CLEARANCE_TOKEN={token}\n"
+        ));
+        let env_file = format!(
+            "/tmp/smith-egress-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        self.root_shell(&format!(
+            "echo {env_payload} | base64 -d > {env_file} && chmod 600 {env_file}"
+        ))
+        .await?
+        .status
+        .success()
+        .then_some(())
+        .context("writing the sidecar env file failed")?;
+
+        let args = self.sidecar_run_args(&env_file);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self.run_podman(&arg_refs).await?;
+        // Best-effort: the env file holds the clearance token.
+        let _ = self
+            .root_shell(&format!("rm -f {env_file}"))
+            .await
+            .map(|o| o.status.success());
         if !out.status.success() {
             anyhow::bail!(
                 "failed to start the egress proxy sidecar: {}{}",
@@ -555,8 +586,10 @@ impl Sandbox {
     }
 
     /// The `podman run` argument list for the egress proxy sidecar. The
-    /// clearance control API is published on host loopback only.
-    fn sidecar_run_args(&self, allowlist: &str, clearance: &str, token: &str) -> Vec<String> {
+    /// clearance control API is published on host loopback only, and the
+    /// environment (including the clearance token) rides an env file written
+    /// server-side — never the argv (S-30).
+    fn sidecar_run_args(&self, env_file: &str) -> Vec<String> {
         use smith_egress::client::CLEARANCE_CONTROL_PORT;
         vec![
             "run".into(),
@@ -572,16 +605,11 @@ impl Sandbox {
             // host client dials the same port the sidecar listens on (S-09).
             // Defined in one place: smith_egress.
             format!("127.0.0.1:{CLEARANCE_CONTROL_PORT}:{CLEARANCE_CONTROL_PORT}"),
-            "-e".into(),
-            format!("EGRESS_ALLOWLIST={allowlist}"),
-            "-e".into(),
-            format!("EGRESS_CLEARANCE={clearance}"),
-            "-e".into(),
-            format!("CLEARANCE_TOKEN={token}"),
+            "--env-file".into(),
+            env_file.into(),
             EGRESS_IMAGE.into(),
         ]
     }
-
     /// Execute a shell command inside the session container as the non-root user.
     /// Both an in-container `timeout` and a host-side wall-clock guard apply.
     pub async fn exec(
@@ -1371,12 +1399,32 @@ mod tests {
         );
     }
 
-    /// S-09 red: the sidecar must publish the clearance control port as
+    /// S-30: the clearance token must never appear in the process argument
+    /// list — it reaches the sidecar through a server-side env file.
+    #[test]
+    fn sidecar_args_never_carry_the_token() {
+        let sandbox = Sandbox::new(Default::default());
+        let args = sandbox.sidecar_run_args("/tmp/smith-egress-env-test");
+        assert!(
+            !args.iter().any(|a| a.contains("sekrit-token-xyz")),
+            "no token may ride the argv: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--env-file"),
+            "the environment must ride an env file: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("EGRESS_")),
+            "the env file replaces the -e arguments: {args:?}"
+        );
+    }
+
+    /// S-09: the sidecar must publish the clearance control port as
     /// `9239:9239` — the host client dials 9239.
     #[test]
     fn sidecar_publishes_the_clearance_control_port() {
         let sandbox = Sandbox::new(Default::default());
-        let args = sandbox.sidecar_run_args("a.example.com", "ask", "tok");
+        let args = sandbox.sidecar_run_args("/tmp/smith-egress-env-test");
         let published = args
             .windows(2)
             .find(|w| w[0] == "-p")

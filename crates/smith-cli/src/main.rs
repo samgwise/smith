@@ -185,6 +185,10 @@ enum Command {
         /// planner that spawns sub-agents on the fleet.
         #[arg(long)]
         orchestrate: bool,
+        /// File holding the daemon token (with --serve) — keeps the token
+        /// off the process argument list.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
         /// Trust this workspace's `.smith/mcp.toml` (runs HOST commands) for
         /// this and future sessions; remembered in ~/.smith/trust.json.
         #[arg(long)]
@@ -269,6 +273,10 @@ enum Command {
         /// Daemon token (env SMITH_SERVE_TOKEN; default: the daemon's token file).
         #[arg(long)]
         token: Option<String>,
+        /// File holding the daemon token — keeps the token off the process
+        /// argument list (env SMITH_SERVE_TOKEN still applies when omitted).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
         /// The daemon's TLS certificate (PEM file) to pin for an https://
         /// daemon URL (env SMITH_SERVE_CERT).
         #[arg(long)]
@@ -366,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
             serve,
             url,
             token,
+            token_file,
             cert,
             worker,
             repo,
@@ -384,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
                 let code = run::run_via_serve(run::ServeRun {
                     url: url.as_deref(),
                     token: token.as_deref(),
+                    token_file: token_file.as_deref(),
                     cert: cert.as_deref(),
                     task: &task,
                     worker: worker.as_deref(),
@@ -502,6 +512,7 @@ async fn main() -> anyhow::Result<()> {
             id,
             url,
             token,
+            token_file,
             cert,
             worker,
             repo,
@@ -511,6 +522,7 @@ async fn main() -> anyhow::Result<()> {
             attach::run_attach(attach::AttachOpts {
                 url: url.as_deref(),
                 token: token.as_deref(),
+                token_file: token_file.as_deref(),
                 cert: cert.as_deref(),
                 id: id.as_deref(),
                 worker: worker.as_deref(),
