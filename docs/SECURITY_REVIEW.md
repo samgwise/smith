@@ -1,13 +1,13 @@
 # Security review tracker
 
-Reviewed on 14 November 2026 against `main`. This was a static review, so nothing has been executed. Items marked **to verify** need a reproduction or test before they count as confirmed. Security round 2 (batches 1–6) closed the remaining fixable items test-first; S-08, S-12, S-22, S-23, S-28, S-30 and S-14 part 2 stay open by design (see the round-2 plan).
+Reviewed on 14 November 2026 against `main`. This was a static review, so nothing has been executed. Items marked **to verify** need a reproduction or test before they count as confirmed. Security rounds 2 and 3 closed every item test-first (round 3 batches 1–6 closed the final eight).
 
 How to use this file:
 - Tick `[x]` when the fix is merged and a test covers it. Add the PR or commit after the item.
 - Keep IDs stable. Add new items at the end of their section rather than renumbering.
 - Each item ends with its migration phase (see the migration plan) or "Independent" when it's fixed separately.
 
-Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covered by an extended forge scope test); its token TTL/revocation half remains.
+Status: 44 of 44 closed. Security round 3 (batches 1–6) closed the final eight items test-first; S-08's and S-28's live verifies run with `cargo test --ignored` on a podman machine.
 
 ## High
 
@@ -55,11 +55,11 @@ Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
 
 ## Medium
 
-- [ ] **S-08 · Egress rules only filter forwarded traffic** (Independent)
-  - Where: `crates/smith-sandbox/src/enforce.rs:24-35`
+- [x] **S-08 · Egress rules only filter forwarded traffic** (fixed, security round 3 batch 5)
+  - Where: `crates/smith-sandbox/src/enforce.rs` (`ruleset`)
   - Problem: the nftables ruleset hooks only `forward`. Traffic to the bridge gateway is locally destined, so it's unfiltered on every port, and DNS through the gateway can carry data out.
-  - Fix: add an `input` chain that allows only DNS from the bridge. Document the residual DNS channel.
-  - Verify: from a container, a connection to the gateway on a non-DNS port fails.
+  - Fix: the ruleset gains an `input` chain scoped to the bridge: only DNS (udp/tcp 53) from the gateway is accepted into the machine; every other locally-destined port drops. The residual DNS channel to the gateway is documented in the README (it is now the only one).
+  - Verify: `ruleset_contains_a_dns_only_input_chain` in `crates/smith-sandbox/src/enforce.rs`; live container-side check runs with `cargo test --ignored`.
 
 - [x] **S-09 · Clearance control port mismatch** (fixed, security round 2 batch 4)
   - Where: `crates/smith-sandbox/src/lib.rs` (`sidecar_run_args`), `crates/smith-egress/src/client.rs:12`
@@ -79,11 +79,11 @@ Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: commands split on `&&`, `||`, `;`, `|`, `&`, backticks and `$( )` parens (a light splitter; it may over-split, which only ever fails closed). Every segment is checked; `git clean` joined the risky list; risky and compound commands bind allow-always to the exact normalised command, and a risky segment is only covered by an exact stored command.
   - Verify: `git_status_allow_always_does_not_cover_git_clean`, `compound_with_risky_segment_is_never_covered_by_a_prefix_approval` and `prefix_approval_does_not_cover_a_compound_with_a_risky_tail` in `crates/smith-core/src/agent.rs`.
 
-- [ ] **S-12 · Approval modal can hide the command; control characters reach the terminal** (Independent)
-  - Where: `crates/smith-tui/src/ui.rs:176-198` (fixed 7-row modal, wrapping, no scrolling), `:72-79` (transcript lines aren't sanitised)
+- [x] **S-12 · Approval modal can hide the command; control characters reach the terminal** (fixed, security round 3 batch 6)
+  - Where: `crates/smith-tui/src/ui.rs` (`render_modal`, `wrap_text`, `sanitise`)
   - Problem: a command over about 58 characters hides the `[y]/[a]/[n]` row, and text beyond about three wrapped lines is cut off. Escape sequences in model or tool output can drive the terminal.
-  - Fix: size or scroll the modal and show the full command. Strip or escape control characters.
-  - Verify: a 300-character command shows its tail and the option row.
+  - Fix: the modal height grows with the wrapped command (bounded by the screen) and the command's TAIL is shown with an "earlier lines" marker, so the option row is always rendered last. All transcript, tool-pane and modal text is stripped of ANSI CSI/OSC sequences and C0 controls before rendering.
+  - Verify: `modal_layout_shows_the_tail_of_a_long_command`, `modal_layout_wraps_at_the_width` and `sanitise_strips_ansi_and_control_characters` in `crates/smith-tui/src/ui.rs`.
 
 - [x] **S-13 · Command output is buffered without limit** (fixed; reader caps in security round 2 batch 1, the op-result route cap at the Phase 6 cutover)
   - Where: `crates/smith-sandbox/src/lib.rs` (`exec_inner` and `exec_streaming`)
@@ -91,18 +91,18 @@ Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: each exec stream is capped at 2 MiB in the reader, keeping the tail with a truncation notice (decision D-6). The same reader serves the local and the worker streaming path, so worker results are capped at the source too.
   - Verify: `read_piped_caps_a_huge_stream_keeping_the_tail` in `crates/smith-sandbox/src/lib.rs` (a 200 MB stream stays bounded).
 
-- [ ] **S-14 · Forge tokens are repo-wide, never expire, and can't be revoked** (ref policy done in Phase 4; TTL and revocation still open)
-  - Where: `crates/smith-server/src/forge.rs` (mint/authenticate, no expiry), the api's forge routes
+- [x] **S-14 · Forge tokens are repo-wide, never expire, and can't be revoked** (fixed; ref policy in Phase 4, TTL and revocation in security round 3 batch 3)
+  - Where: `crates/smith-server/src/forge.rs` (mint/authenticate, expiry, revoke), `crates/smith-server/src/controller.rs` (`release_session`), the api's forge routes
   - Problem: any session's token can force-push or delete any ref in its repo, including `main` and other sessions' checkpoints. Tokens stay valid until the `.gitcred` file is deleted.
   - Fix, part 1 (done, Phase 4): an `update` hook installed by `ensure_repo` scopes session tokens to `refs/heads/smith/<session>` and `smith/integration/*` (the daemon token and `write_all` tokens — auto-push opt-in — cover everything); `receive.denyDeletes` and `receive.denyNonFastForwards` are set on every hosted repo.
-  - Fix, part 2 (open): a token TTL and revocation at session end.
-  - Verify, part 1: `smith_repo_scheme_mints_session_tokens` (a `main` push with a session token is hook-declined) in `crates/smith-server/tests/serve_integration.rs`.
+  - Fix, part 2 (done, round 3 batch 3): minted tokens expire after `[serve] forge_token_ttl_secs` (default one week); expired grants fail `authenticate` and are dropped at recovery; `release_session` revokes the session's grant and removes its `.gitcred`.
+  - Verify, part 1: `smith_repo_scheme_mints_session_tokens` (a `main` push and a foreign-session push with a session token are hook-declined) in `crates/smith-server/tests/serve_integration.rs`. Part 2: `authenticate_refuses_expired_grants`, `recover_skips_expired_grants` and `revoke_session_kills_the_grant` in `crates/smith-server/src/forge.rs`.
 
-- [ ] **S-15 · Secrets and state written with default permissions** (Independent; Phase 1 applies to new TLS key files)
-  - Where: `crates/smith-server/src/lib.rs:34-45` (serve-token), `crates/smith-sandbox/src/lib.rs:1095-1110` (egress-token, also racy on first run), `crates/smith-server/src/workers.rs:107-114` (workers.json), `crates/smith-worker/src/main.rs:137-144` (worker credential), `crates/smith-server/src/forge.rs:78-80` (`.gitcred`)
+- [x] **S-15 · Secrets and state written with default permissions** (fixed, security round 3 batch 1)
+  - Where: `crates/smith-core/src/secret.rs` (`write_private`), routed through `crates/smith-server/src/lib.rs` (serve-token), `crates/smith-sandbox/src/lib.rs` (egress-token), `crates/smith-server/src/workers.rs` (workers.json), `crates/smith-worker/src/main.rs` (worker credential), `crates/smith-server/src/forge.rs` (`.gitcred`)
   - Problem: nothing in the repo sets permissions, so on Linux and macOS these files are readable under a default umask. Writes aren't atomic, so a crash can corrupt the registry.
-  - Fix: create files with owner-only permissions and write them through `tempfile`'s `persist`. On Windows, confirm the resulting ACLs.
-  - Verify: `stat` on Linux shows mode 0600 for each file.
+  - Fix: a shared `write_private` helper — the file is created 0600 (Unix), synced, and renamed into place; a failure never leaves a half-written secret. On Windows the profile directory already scopes the ACLs.
+  - Verify: `private_files_have_owner_only_permissions`, `write_round_trips_and_leaves_no_temp` and `rewrite_replaces_the_file_cleanly` in `crates/smith-core/src/secret.rs` (`stat` check is `#[cfg(unix)]`).
 
 - [x] **S-16 · `smith clean` removes unrelated containers** (fixed, security round 2 batch 2)
   - Where: `crates/smith-sandbox/src/lib.rs` (`session_container_filters`, shared by `clean_all` and `reap_stopped_sessions`)
@@ -152,16 +152,16 @@ Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: the MCP handshake and tool listing are bounded by `connect_timeout_secs` (default 30 s, configurable per server); provider clients dial with a 30 s connect timeout, and a model stream silent for more than 120 s fails the step — the bounded tools' per-call timeout already covers tool calls.
   - Verify: `hung_server_fails_within_the_connect_timeout` in `crates/smith-mcp/src/manager.rs` (a server that never speaks MCP fails start in 2 s).
 
-- [ ] **S-22 · Unbounded buffers** (the `ChunkedReader` half was removed with the legacy transport; provider lines and `AGENTS.md` remain)
-  - Where: `crates/smith-providers/src/stream.rs:8-37`, `crates/smith-core/src/instructions.rs:11-21`
+- [x] **S-22 · Unbounded buffers** (fixed, security round 3 batch 4)
+  - Where: `crates/smith-providers/src/stream.rs` (`lines`), `crates/smith-core/src/instructions.rs` (`load_project_instructions`)
   - Problem: a line without a newline, or a very large `AGENTS.md`, grows memory or the prompt without limit.
-  - Fix: caps on line length and instruction size, with a notice when truncated.
-  - Verify: a 10 MB line without a newline is rejected.
+  - Fix: a provider line exceeding 1 MiB without a newline fails the stream; instruction files over 256 KiB are truncated with a visible `[smith: truncated]` marker.
+  - Verify: `unterminated_line_fails_at_the_cap` in `crates/smith-providers/src/stream.rs` (a 2 MiB line fails) and `oversized_instructions_are_truncated_with_a_marker` in `crates/smith-core/src/instructions.rs`.
 
-- [ ] **S-23 · Proxy and clearance edge cases** (Independent)
-  - Where: `crates/smith-egress/src/bin/smith-egress-proxy.rs:144-147` (`rsplit_once(':')` on the full URI sends `http://host:8080/path` to port 80), `crates/smith-egress/src/clearance.rs:108-120` (no cap on pending requests)
-  - Fix: parse the authority properly, and cap pending requests.
-  - Verify: `http://host:8080/path` connects to port 8080.
+- [x] **S-23 · Proxy and clearance edge cases** (fixed, security round 3 batch 5)
+  - Where: `crates/smith-egress/src/bin/smith-egress-proxy.rs` (`parse_authority`), `crates/smith-egress/src/clearance.rs` (`try_create_pending`)
+  - Fix: the plain-HTTP port comes from the URI's authority (`http://host:8080/path` dials 8080, not 80); pending clearance requests are capped at 64 — beyond the cap the request is denied instead of growing the set without limit.
+  - Verify: `parse_authority_extracts_scheme_host_and_port` (sidecar binary) and `pending_requests_are_capped` in `crates/smith-egress/src/clearance.rs`; the live `http://host:8080/path` dial runs with `cargo test --ignored`.
 
 - [x] **S-24 · Error JSON built by string formatting; panicking byte slices** (fixed at the Phase 6 cutover)
   - Where: was `crates/smith-server/src/http.rs` (git errors built with `format!` and `.replace('"', "'")`, which also leaked git stderr) and `:424` (`commit[..12]` on worker input)
@@ -185,21 +185,21 @@ Status: 31 of 44 closed. The S-14 ref-policy half is in (its hook path is covere
   - Fix: `--cap-drop=ALL`, then `--cap-add` of exactly the five caps the root boot step needs (CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID — useradd + apt), and `--security-opt no-new-privileges` so the agent user cannot regain any of it.
   - Verify: `run_args_harden_the_container` in `crates/smith-sandbox/src/lib.rs`; live check via `podman inspect`.
 
-- [ ] **S-28 · Re-applying the nftables ruleset appends rules** (Independent, to verify)
-  - Where: `crates/smith-sandbox/src/lib.rs:979-981`, `crates/smith-sandbox/src/enforce.rs:82-89` (the test comment says `nft -f` replaces the table)
+- [x] **S-28 · Re-applying the nftables ruleset appends rules** (fixed, security round 3 batch 5)
+  - Where: `crates/smith-sandbox/src/enforce.rs` (`ruleset`)
   - Problem: `nft -f` merges into an existing table, so stale rules persist until reboot.
-  - Fix: delete the table and reload it in one transaction.
-  - Verify: after two session starts, the ruleset holds one copy of each rule.
+  - Fix: the payload is an idempotent reload in one transaction — declare the table, `delete table`, then recreate it with exactly these rules.
+  - Verify: `ruleset_reloads_idempotently` in `crates/smith-sandbox/src/enforce.rs`; the live apply-twice rule count runs with `cargo test --ignored`.
 
 - [x] **S-29 · Git arguments without `--`; partial repository initialisation is never repaired** (fixed, security round 2 batch 3)
   - Where: `crates/smith-worker/src/materialise.rs` (all git invocations)
   - Fix: `--` before user-supplied URLs and refs (clone, worktree add, push, branch, merge), `git_ref` validated at the entry points (no leading dash, no whitespace), and the worker is headless (credential prompting off, so a failed auth fails fast instead of stalling the session).
   - Verify: `git_ref_validation_refuses_option_injection` in `crates/smith-worker/src/materialise.rs`; the materialise round-trip exercises the `--` forms with real git.
 
-- [ ] **S-30 · Secrets on command lines** (Independent)
-  - Where: `crates/smith-sandbox/src/lib.rs:505` (`CLEARANCE_TOKEN` as a podman argument), `crates/smith-cli/src/main.rs:122-124` and `:232-234` (`--token`)
-  - Fix: pass secrets through a file or stdin, and offer a `--token-file` option.
-  - Verify: the token doesn't appear in the process argument list.
+- [x] **S-30 · Secrets on command lines** (fixed, security round 3 batch 2)
+  - Where: `crates/smith-sandbox/src/lib.rs` (`ensure_sidecar`, `sidecar_run_args`), `crates/smith-cli/src/attach.rs` (`resolve_token`)
+  - Fix: the sidecar's environment (including `CLEARANCE_TOKEN`) rides a private server-side env file passed with `--env-file` and deleted once the sidecar is up; the CLI offers `--token-file` for `smith run --serve` and `smith attach` (keeping the token off the argv; `--token` remains for scripts).
+  - Verify: `sidecar_args_never_carry_the_token` in `crates/smith-sandbox/src/lib.rs` and `resolve_token_prefers_the_file_form_and_rejects_both` in `crates/smith-cli/src/attach.rs`.
 
 - [x] **S-31 · Resume can overwrite a turn's in-memory history** (fixed, security round 2 batch 4)
   - Where: `crates/smith-server/src/controller.rs` (`resume`)

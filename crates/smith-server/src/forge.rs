@@ -380,6 +380,58 @@ mod tests {
         assert_eq!(token_from_axum_headers(&mk("Digest xyz")), None);
     }
 
+    /// S-14 part 2: an expired grant refuses to authenticate.
+    #[test]
+    fn authenticate_refuses_expired_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let forge = Forge::with_ttl(tmp.path(), 0); // every token minted is born expired
+        let token = forge.mint("s-expired", "demo", true, true, false).unwrap();
+        assert!(
+            forge.authenticate(&token).is_none(),
+            "an expired grant must not authenticate"
+        );
+    }
+
+    /// S-14 part 2: recovery drops expired grants instead of trusting them.
+    #[test]
+    fn recover_skips_expired_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A grant minted a week ago with a one-week TTL: expired on arrival.
+        let expired = GitCred {
+            session_id: "s-old".into(),
+            token_hash: token_hash("stale-token"),
+            repo: "demo".into(),
+            read: true,
+            write: true,
+            write_all: false,
+            expires_ms: Forge::now_ms() - 1,
+        };
+        let path = tmp.path().join("s-old.gitcred");
+        std::fs::write(&path, serde_json::to_string_pretty(&expired).unwrap()).unwrap();
+
+        let forge = Forge::new(tmp.path());
+        assert_eq!(forge.recover(), 0, "expired grants must not be recovered");
+        assert!(forge.authenticate("stale-token").is_none());
+        // The dead sidecar was cleaned up.
+        assert!(!path.exists());
+    }
+
+    /// S-14 part 2: revoking a session kills its grant and the `.gitcred`
+    /// sidecar, so a restart cannot recover the token.
+    #[test]
+    fn revoke_session_kills_the_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let forge = Forge::new(tmp.path());
+        let token = forge.mint("s1", "demo", true, true, false).unwrap();
+        assert!(forge.authenticate(&token).is_some());
+
+        assert_eq!(forge.revoke_session("s1"), 1);
+        assert!(forge.authenticate(&token).is_none(), "revoked = no auth");
+        assert!(!tmp.path().join("s1.gitcred").exists(), "sidecar removed");
+        // Revoking again is a no-op.
+        assert_eq!(forge.revoke_session("s1"), 0);
+    }
+
     #[tokio::test]
     async fn mint_authenticate_and_recover() {
         let tmp = tempfile::tempdir().unwrap();

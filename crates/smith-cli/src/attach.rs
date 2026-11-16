@@ -233,6 +233,34 @@ pub async fn worker_revoke(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// S-30: `--token-file` resolves from disk, and passing both token forms
+    /// is an error (no silent precedence).
+    #[test]
+    fn resolve_token_prefers_the_file_form_and_rejects_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon-token");
+        std::fs::write(&path, "file-token\n").unwrap();
+
+        assert_eq!(
+            resolve_token(Some("argv-token"), Some(&path))
+                .unwrap_err()
+                .to_string(),
+            "pass --token or --token-file, not both"
+        );
+        assert_eq!(
+            resolve_token(None, Some(&path)).unwrap().as_deref(),
+            Some("file-token")
+        );
+        assert_eq!(
+            resolve_token(Some("argv-token"), None).unwrap().as_deref(),
+            Some("argv-token")
+        );
+        assert!(resolve_token(None, None).unwrap().is_none());
+        assert!(resolve_token(None, Some(tmp.path().join("missing"))).is_err());
+    }
+
     #[test]
     fn parses_serve_urls() {
         // The URL parser lives in smith-protocol (shared with the worker);
