@@ -87,7 +87,10 @@ mod tests {
             loaded.len() < MAX_INSTRUCTION_BYTES + 4096,
             "must be truncated"
         );
-        assert!(loaded.contains("[smith: truncated]"), "{loaded}");
+        assert!(
+            loaded.contains("[smith: truncated — AGENTS.md exceeds 256 KiB]"),
+            "{loaded}"
+        );
         assert!(loaded.starts_with("xxx"), "the head of the file is kept");
     }
 }

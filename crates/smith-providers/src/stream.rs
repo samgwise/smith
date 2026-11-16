@@ -71,7 +71,6 @@ mod tests {
     /// Build a reqwest::Response over raw bytes (the same shape the
     /// providers hand to `lines`).
     fn response_of(chunks: Vec<Vec<u8>>) -> reqwest::Response {
-        use futures::StreamExt as _;
         let stream = futures::stream::iter(
             chunks
                 .into_iter()
@@ -89,7 +88,7 @@ mod tests {
     #[tokio::test]
     async fn unterminated_line_fails_at_the_cap() {
         let big = vec![b'x'; 2 * MAX_LINE_BYTES];
-        let mut stream = lines(response_of(vec![big]));
+        let stream = lines(response_of(vec![big]));
         tokio::pin!(stream);
         let item = tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
@@ -101,7 +100,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminated_lines_flow_normally() {
-        let mut stream = lines(response_of(vec![
+        let stream = lines(response_of(vec![
             b"line one\n".to_vec(),
             b"line two\n".to_vec(),
         ]));
