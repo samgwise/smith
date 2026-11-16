@@ -258,7 +258,7 @@ mod tests {
             Some("argv-token")
         );
         assert!(resolve_token(None, None).unwrap().is_none());
-        assert!(resolve_token(None, Some(tmp.path().join("missing"))).is_err());
+        assert!(resolve_token(None, Some(&tmp.path().join("missing"))).is_err());
     }
 
     #[test]
