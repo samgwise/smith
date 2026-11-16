@@ -1572,7 +1572,10 @@ mod tests {
         );
         let rule_count = |text: &str| text.matches("iifname").count();
         let first_count = rule_count(&String::from_utf8_lossy(&first.stdout));
-        assert!(first_count >= 6, "expected forward+input rules: {first_count}");
+        assert!(
+            first_count >= 6,
+            "expected forward+input rules: {first_count}"
+        );
 
         // A second session start re-applies the ruleset: no rule may
         // duplicate (S-28).
