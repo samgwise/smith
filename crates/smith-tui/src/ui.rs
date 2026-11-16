@@ -269,9 +269,7 @@ pub fn sanitise(text: &str) -> String {
             }
             continue;
         }
-        if c == '\n' || c == '\t' {
-            out.push(c);
-        } else if !c.is_control() {
+        if c == '\n' || c == '\t' || !c.is_control() {
             out.push(c);
         }
     }
