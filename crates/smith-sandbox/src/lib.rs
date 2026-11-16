@@ -1281,7 +1281,6 @@ mod tests {
         assert!(NetworkMode::Open.podman_args().is_empty());
     }
 
-    use anyhow::Context as _;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
