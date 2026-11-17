@@ -101,10 +101,15 @@ pub fn revoke(workspace_canon: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// `SMITH_TRUST_STORE` is process-global: the tests that redirect it
+    /// must not run concurrently.
+    static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The trust store round-trips per workspace identity, and an
     /// untrusted workspace resolves false.
     #[test]
     fn trust_store_round_trip() {
+        let _store_guard = STORE_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var(
@@ -132,5 +137,28 @@ mod tests {
         // The store on disk is the documented shape (identity → record).
         let raw = std::fs::read_to_string(tmp.path().join("trust.json")).unwrap();
         assert!(raw.contains(&crate::session::workspace_identity(&ws_a)));
+    }
+
+    /// Revocation withdraws the recorded trust (`smith trust --revoke`).
+    #[test]
+    fn revoke_removes_trust() {
+        let _store_guard = STORE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(
+                "SMITH_TRUST_STORE",
+                tmp.path().join("trust.json").display().to_string(),
+            );
+        }
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        remember(&ws).unwrap();
+        assert!(is_trusted(&ws));
+        revoke(&ws).unwrap();
+        assert!(!is_trusted(&ws), "revoked trust must not persist");
+        // Revoking again is a no-op.
+        revoke(&ws).unwrap();
+        assert!(!is_trusted(&ws));
     }
 }

@@ -243,3 +243,42 @@ impl SessionFactory for ConfigFactory {
         self.config.mcp.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S-01: the workspace MCP layer loads ONLY for a trusted workspace. The
+    /// marker server doesn't exist, so a load attempt records a failure —
+    /// the attempt itself is the proof the layer was loaded.
+    #[tokio::test]
+    async fn workspace_mcp_layer_loads_only_when_trusted() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".smith")).unwrap();
+        std::fs::write(
+            ws.path().join(".smith/mcp.toml"),
+            "[servers.marker]\ncommand = \"smith-nonexistent-marker-server\"\n",
+        )
+        .unwrap();
+        let config = Config::default();
+
+        // Untrusted: the workspace layer is not even loaded — no spawn
+        // attempt, nothing reported.
+        let session = connect_mcp(&config, Some(ws.path()), false).await;
+        assert!(
+            session.status_lines().is_empty(),
+            "no workspace server may run untrusted: {:?}",
+            session.status_lines()
+        );
+        session.shutdown().await;
+
+        // Trusted: the layer loads — the spawn attempt is recorded.
+        let session = connect_mcp(&config, Some(ws.path()), true).await;
+        let lines = session.status_lines();
+        assert!(
+            lines.iter().any(|l| l.starts_with("✗ marker")),
+            "the workspace server must be spawned (attempted) when trusted: {lines:?}"
+        );
+        session.shutdown().await;
+    }
+}

@@ -883,6 +883,29 @@ mod tests {
         );
     }
 
+    /// S-01/D-06: the deep MCP check uses the user layer only — a
+    /// workspace's `.smith/mcp.toml` is never merged, so a workspace-only
+    /// server yields "no servers configured" (Skipped), never a spawn.
+    #[tokio::test]
+    async fn deep_mcp_check_ignores_the_workspace_layer() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".smith")).unwrap();
+        std::fs::write(
+            ws.path().join(".smith/mcp.toml"),
+            "[servers.marker]\ncommand = \"smith-nonexistent-marker-server\"\n",
+        )
+        .unwrap();
+        let ctx = CheckCtx {
+            workspace: ws.path().to_path_buf(),
+            deep: true,
+            fix: false,
+            sandbox: SandboxConfig::default(),
+            config: Config::default(),
+        };
+        let result = mcp_deep_check(&ctx).await;
+        assert_eq!(result.status, Status::Skipped, "{result:?}");
+    }
+
     #[test]
     fn render_shows_markers_and_summary() {
         let out = render(&[
