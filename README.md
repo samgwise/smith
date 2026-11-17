@@ -56,15 +56,16 @@ escalate: after three, the agent is told to stop retrying and wait.
 - `open` — unrestricted; `enabled` accepted as an alias.
 
 In `proxy` mode the allowlist is **enforced**, not just cooperative: an
-nftables default-deny ruleset is installed inside the podman machine
-(forward hook scoped to the egress bridge only — the machine's own networking
-is untouched). Forwarded traffic — a program dialling an external IP — only
-leaves via the proxy's pinned IP or the gateway's DNS, so a program that
-ignores the proxy env and dials IP literals is dropped at the packet level.
-Two residual channels remain (known limits, see `docs/SECURITY_REVIEW.md`
-S-08): traffic addressed to the bridge gateway itself is locally destined and
-not filtered, and DNS through the gateway can carry a little data. The rules
-cover the common case; they are not a hermetic seal. Installation is
+nftables default-deny ruleset is installed inside the podman machine, scoped
+to the egress bridge only (the machine's own networking is untouched). Two
+chains apply. The **forward** chain filters container→internet traffic: only
+the proxy's pinned IP may leave the bridge, so a program that ignores the
+proxy env and dials IP literals is dropped at the packet level. The
+**input** chain filters container→machine traffic: only DNS (udp/tcp 53)
+from the bridge is accepted into the machine; every other gateway port is
+dropped. The one residual channel is DNS through the gateway, which can
+carry a little data (by design; see `docs/SECURITY_REVIEW.md` S-08) — the
+rules cover the common case, they are not a hermetic seal. Installation is
 fail-closed: if the ruleset cannot be installed, the session refuses to
 start (escape hatch: `egress_enforce = false`). Machine reboots clear the
 rules; the next session reinstalls them. `smith clean` removes the sidecar
@@ -146,6 +147,8 @@ smith attach
 # Attach to a specific hosted session, or a daemon elsewhere
 smith attach 73bd12a6
 smith attach --url 10.0.0.5:9240 --token <token>
+# ...or keep the token off the process argument list:
+smith attach --url 10.0.0.5:9240 --token-file ~/.smith/serve-token
 
 # Remote daemon over TLS: pin the daemon's certificate (out-of-band)
 smith attach --url https://smith.example.com:9240 --cert smith.pem
@@ -177,6 +180,7 @@ For a remote daemon, serve TLS and pin the certificate on the clients:
 tls_cert = "/etc/smith/serve.pem"   # with tls_key; unlocks remote binds
 allow_plaintext_remote = false       # explicit opt-in to remote plaintext
 max_git_body_mb = 256                # the forge's pack-upload cap
+forge_token_ttl_secs = 604800        # minted forge tokens expire (a week)
 ```
 
 Copy `serve.pem` to clients and pass `--cert` (or `SMITH_SERVE_CERT`);
@@ -240,7 +244,10 @@ auto_push = false       # humans review the integration branch by default
 
 The controller also **hosts git itself** (`smith:` repo references in
 spawns; per-session scoped tokens delivered automatically — no forge to
-stand up, no long-lived credentials on workers). See
+stand up, no long-lived credentials on workers). Minted tokens **expire**
+(`[serve].forge_token_ttl_secs`, default one week) and are **revoked when a
+session's lease is released** — the orchestration finish invalidates the
+child's token and removes its `.gitcred`. See
 [`docs/CLOUD_DEPLOYMENT.md`](docs/CLOUD_DEPLOYMENT.md) and
 [`docs/SERVE_PROTOCOL.md`](docs/SERVE_PROTOCOL.md) (`/git/...`).
 
@@ -341,6 +348,9 @@ smith run --serve --orchestrate --repo https://... "refactor these three modules
 smith run "explain what this project does"
 smith run --workspace C:\path\to\repo --verify "cargo test -q" "fix the failing test"
 
+# Submit to a daemon with the token from a file (off the argv):
+smith run --serve --token-file ~/.smith/serve-token "task"
+
 # Override provider/model for one run
 smith run --provider openai "summarise the diff"
 
@@ -369,13 +379,21 @@ egress_enforce = true     # nftables default-deny in the podman machine
 [serve]
 bind = "127.0.0.1:9240"      # smith serve (token: ~/.smith/serve-token)
 approval_timeout_secs = 300  # unanswered approval modals auto-deny
+forge_token_ttl_secs = 604800  # minted forge tokens expire (0 = never)
 ```
 
 ## Development
 
 ```sh
 cargo build
-cargo test
-cargo clippy -- -D warnings
+cargo test                                   # the default suite
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
+
+# The container/egress tests need a real podman server (and nftables):
+cargo test -p smith-sandbox --lib -- --test-threads=1 --ignored
 ```
+
+CI (`.github/workflows/rust.yml`) runs lint (fmt + clippy) and the test
+suite on ubuntu and windows, plus a `container` job that runs the
+podman/nftables suite against a native rootless podman server on every push.

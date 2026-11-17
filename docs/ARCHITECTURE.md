@@ -70,9 +70,12 @@ Network modes:
 - `proxy` (default): a filtering proxy sidecar (`smith-egress`) on a dedicated
   network. HTTPS is filtered from the `CONNECT` hostname — no TLS
   interception. The allowlist is **enforced** by an nftables default-deny
-  forward chain installed inside the podman machine, scoped to the egress
-  bridge only; only the proxy's pinned IP and the gateway DNS may leave the
-  bridge. Installation is fail-closed (a failed install refuses to start the
+  ruleset installed inside the podman machine, scoped to the egress bridge
+  only: the **forward** chain lets only the proxy's pinned IP leave the
+  bridge, and the **input** chain lets only DNS reach the machine from it
+  (the documented residual channel). The payload is an idempotent
+  declare-delete-reload transaction, so re-applying never appends stale
+  rules. Installation is fail-closed (a failed install refuses to start the
   session) and verified post-install (an empty install must not count as
   success).
 - `none`: `--network=none`. `open`: unrestricted (compatibility posture).
@@ -104,10 +107,16 @@ exact prefixes.
 
 `smith-mcp` bridges stdio MCP servers (via the official `rmcp` SDK) into the
 `Tool` registry as `mcp_<server>_<tool>`. Servers are configured in layers
-(user config + workspace `.smith/mcp.toml`, workspace wins), spawned with only
-their explicitly configured environment (`${VAR}`-expanded; unset references
-drop the entry), and their tool list is fetched once per session to keep the
-request shape cache-stable. A failed server is reported and skipped.
+(user config + workspace `.smith/mcp.toml`, workspace wins) — and the
+workspace layer loads **only for a trusted workspace** (the TUI asks once
+and remembers; headless runs pass `--trust-workspace`; the daemon consults
+`~/.smith/trust.json`), because a repo's config runs host commands. Even
+trusted, the workspace layer's `approval` and `env` are ignored on merge —
+a repo cannot pre-approve its own tools or read host variables. Servers are
+spawned with only their explicitly configured environment (`${VAR}`-expanded;
+unset references drop the entry), connect steps are timeout-bounded, and
+their tool list is fetched once per session to keep the request shape
+cache-stable. A failed server is reported and skipped.
 
 ## The harness plane: `smith serve`
 

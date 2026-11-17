@@ -151,11 +151,13 @@ Full semantics in `docs/WORKER_MESH.md`; the wire shapes:
 
 - `POST /v1/worker/enrol` — body `{name, enrolment_token, capability}`
   (one-time token, body-carried; the bearer is irrelevant here) →
-  `{"worker_id": …, "worker_token": …}`. Single use; failure is `403`.
+  `{"worker_id": …, "worker_token": …}`. Single use, expires after an
+  hour; failure is `403`.
 - `GET /v1/worker/events` — SSE command stream (worker credential as
   bearer). Each event is one `WorkerCommand`:
   `{"cmd":"start_session","session_id":…,"exec_id":…,"source":{git_url,
-  git_ref, token_env?}|absent}` / `{"cmd":"exec","session_id":…,
+  git_ref, token_env?, token?, credential_origin?}|absent}` /
+  `{"cmd":"exec","session_id":…,
   "exec_id":…, op…}` / `{"cmd":"stop_session",…}` / `{"cmd":"checkpoint",…}` /
   (M15) `{"cmd":"merge_gate","session_id":…,"exec_id":…,
   "integration_ref":…,"gate_command":…}` and `{"cmd":"push_branch",…,
@@ -205,8 +207,10 @@ bare, push-to-create on the first push):
 - Auth: Basic (git's shape — the token is the password) or Bearer; tokens
   are **per-session, per-repo, read/write-scoped**, minted at dispatch for
   `smith:<name>` repo references and delivered to the worker in
-  `WorkspaceSource.token`; the daemon token is a full grant. Worker mesh
-  credentials do not authorise git routes.
+  `WorkspaceSource.token`; the daemon token is a full grant. Minted tokens
+  **expire** (`[serve].forge_token_ttl_secs`, default a week) and are
+  **revoked when the session's lease is released** (the `.gitcred` sidecar
+  is removed). Worker mesh credentials do not authorise git routes.
 - Ref policy (S-14): each hosted repo runs an `update` hook — a session
   token may update only `refs/heads/smith/<session>` and
   `refs/heads/smith/integration/*`; `receive.denyDeletes` and

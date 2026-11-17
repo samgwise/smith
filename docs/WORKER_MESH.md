@@ -10,8 +10,8 @@ controller**.
 ## Trust model (the linguine split)
 
 - The **controller mints access keys**: `smith worker issue <name>` prints a
-  single-use enrolment token; `smith-worker enrol` exchanges it once for a
-  long-lived (revocable) worker credential stored at
+  single-use enrolment token (expiring after an hour); `smith-worker enrol`
+  exchanges it once for a long-lived (revocable) worker credential stored at
   `~/.smith-worker/credential.json`. Tokens are random, stored **hashed**
   (SHA-256) in `~/.smith/workers.json` on the controller. No signing —
   server-side revocation is the property we need.
