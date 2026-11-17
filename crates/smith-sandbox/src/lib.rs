@@ -1486,20 +1486,44 @@ mod tests {
             .unwrap();
         assert_eq!(
             install.exit_code, 0,
-            "curl install through the proxy: {}{}",
-            install.stdout, install.stderr
+            "curl install through the proxy: exit={} timed_out={}\nstdout: {}\nstderr: {}",
+            install.exit_code, install.timed_out, install.stdout, install.stderr
         );
 
-        let allowed = sandbox
-            .exec_as(
-                &session,
-                Some("root"),
-                "curl -sSf --max-time 20 https://registry.npmjs.org -o /dev/null && echo ALLOWED",
-                Some(Duration::from_secs(60)),
+        // The sidecar was (re)created moments ago: the container may not
+        // resolve its name (or the forwarder may still be warming) on the
+        // first attempt — retry briefly before calling it a failure.
+        let mut allowed: Option<ExecOutcome> = None;
+        let mut last: Option<ExecOutcome> = None;
+        for attempt in 0..3 {
+            let out = sandbox
+                .exec_as(
+                    &session,
+                    Some("root"),
+                    "curl -sSf --max-time 20 https://registry.npmjs.org -o /dev/null && echo ALLOWED",
+                    Some(Duration::from_secs(60)),
+                )
+                .await
+                .unwrap();
+            if out.stdout.contains("ALLOWED") {
+                allowed = Some(out);
+                break;
+            }
+            tracing::info!(
+                "allowed-curl attempt {attempt} failed: exit={} stderr={}",
+                out.exit_code,
+                out.stderr
+            );
+            last = Some(out);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        let allowed = allowed.unwrap_or_else(|| {
+            let last = last.expect("at least one attempt ran");
+            panic!(
+                "the allowed host must tunnel through the proxy: exit={} timed_out={} stdout={} stderr={}",
+                last.exit_code, last.timed_out, last.stdout, last.stderr
             )
-            .await
-            .unwrap();
-        assert!(allowed.stdout.contains("ALLOWED"), "{}", allowed.stdout);
+        });
 
         let denied = sandbox
             .exec_as(
