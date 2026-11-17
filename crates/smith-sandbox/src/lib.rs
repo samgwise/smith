@@ -1493,8 +1493,8 @@ mod tests {
         // The sidecar was (re)created moments ago: the container may not
         // resolve its name (or the forwarder may still be warming) on the
         // first attempt — retry briefly before calling it a failure.
-        let mut allowed: Option<ExecOutcome> = None;
         let mut last: Option<ExecOutcome> = None;
+        let mut tunnelled = false;
         for attempt in 0..3 {
             let out = sandbox
                 .exec_as(
@@ -1506,7 +1506,7 @@ mod tests {
                 .await
                 .unwrap();
             if out.stdout.contains("ALLOWED") {
-                allowed = Some(out);
+                tunnelled = true;
                 break;
             }
             tracing::info!(
@@ -1517,13 +1517,12 @@ mod tests {
             last = Some(out);
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        let allowed = allowed.unwrap_or_else(|| {
-            let last = last.expect("at least one attempt ran");
-            panic!(
-                "the allowed host must tunnel through the proxy: exit={} timed_out={} stdout={} stderr={}",
-                last.exit_code, last.timed_out, last.stdout, last.stderr
-            )
-        });
+        let last = last.expect("at least one attempt ran");
+        assert!(
+            tunnelled,
+            "the allowed host must tunnel through the proxy: exit={} timed_out={} stdout={} stderr={}",
+            last.exit_code, last.timed_out, last.stdout, last.stderr
+        );
 
         let denied = sandbox
             .exec_as(
