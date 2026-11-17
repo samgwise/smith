@@ -1517,11 +1517,13 @@ mod tests {
             last = Some(out);
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        let last = last.expect("at least one attempt ran");
         assert!(
             tunnelled,
             "the allowed host must tunnel through the proxy: exit={} timed_out={} stdout={} stderr={}",
-            last.exit_code, last.timed_out, last.stdout, last.stderr
+            last.as_ref().map(|o| o.exit_code).unwrap_or(-1),
+            last.as_ref().map(|o| o.timed_out).unwrap_or(false),
+            last.as_ref().map(|o| o.stdout.as_str()).unwrap_or(""),
+            last.as_ref().map(|o| o.stderr.as_str()).unwrap_or(""),
         );
 
         let denied = sandbox
